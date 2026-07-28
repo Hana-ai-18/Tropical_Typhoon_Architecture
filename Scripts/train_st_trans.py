@@ -23,11 +23,6 @@ from Model.paper_baseline_model import (
     HORIZON_STEPS,
 )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
 def move(batch, device):
     out = list(batch)
     for i, x in enumerate(out):
@@ -61,16 +56,9 @@ def _fmt(v) -> str:
     return f"{v:.2f}" if isinstance(v, float) and not np.isnan(v) else "nan"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Evaluation  (ADE + ATE + CTE)
-# ══════════════════════════════════════════════════════════════════════════════
-
 @torch.no_grad()
 def evaluate(model, loader, device) -> dict:
-    """
-    Đánh giá model trên toàn bộ loader.
-    batch_list dùng cùng format với paper_baseline (full multi-modal).
-    """
+   
     model.eval()
 
     all_ade, all_fde = [], []
@@ -81,15 +69,15 @@ def evaluate(model, loader, device) -> dict:
 
     for batch in loader:
         bl         = move(list(batch), device)
-        pred, _, _ = model.sample(bl)           # batch_list đầy đủ
+        pred, _, _ = model.sample(bl)           
         gt         = bl[1]
         T          = min(pred.shape[0], gt.shape[0])
 
         pred_d = _norm_to_deg(pred[:T])
         gt_d   = _norm_to_deg(gt[:T])
-        dist   = haversine_km(pred_d, gt_d)     # [T, B]
+        dist   = haversine_km(pred_d, gt_d)     
 
-        ate, cte = _ate_cte_tensors(pred[:T], gt[:T])   # each [T, B]
+        ate, cte = _ate_cte_tensors(pred[:T], gt[:T])   
 
         all_ade.extend(dist.mean(0).tolist())
         all_fde.extend(dist[-1].tolist())
@@ -119,9 +107,6 @@ def evaluate(model, loader, device) -> dict:
     return result
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Test set evaluation
-# ══════════════════════════════════════════════════════════════════════════════
 
 def run_test_evaluation(model, ckpt_path: str, args, device,
                         collate_fn, csv_path: str):
