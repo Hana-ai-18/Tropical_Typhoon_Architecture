@@ -552,7 +552,7 @@ def get_args():
     p.add_argument("--sigma_inference",        default=0.04,   type=float)
     p.add_argument("--n_inference_steps",      default=10,     type=int)
   
-    p.add_argument("--num_epochs",             default=150,    type=int)
+    p.add_argument("--num_epochs",             default=200,    type=int)
     p.add_argument("--batch_size",             default=64,     type=int)
     p.add_argument("--lr",                     default=2e-4,   type=float)
     p.add_argument("--lr_logits_scale",        default=0.2,    type=float)
