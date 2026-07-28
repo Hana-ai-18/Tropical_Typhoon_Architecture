@@ -1,25 +1,3 @@
-
-"""
-Model/mamba_encoder.py  ── v10-fixed
-======================================
-Mamba (Selective SSM) — pure PyTorch implementation.
-Replaces LSTM in DataEncoder1D.
-
-FIXES vs original:
-  1. nn.RMSNorm requires PyTorch >= 2.4.  Replaced with an explicit
-     RMSNorm module that works on all versions (PyTorch >= 1.9).
-     Original silent fallback to LayerNorm changed behaviour between
-     training and inference environments on Kaggle (P100 = older image).
-  2. selective_scan_parallel: clamped dA to avoid exp() overflow on
-     large positive delta values (clamp delta to [-10, 1] before exp).
-  3. MambaBlock.forward: conv1d causal trim was [:, :, :T] which is
-     correct only when padding = d_conv-1.  Added explicit assert to
-     catch mismatches early rather than producing silently wrong shapes.
-  4. DataEncoder1D_Mamba: added explicit check that feat_3d has expected
-     T dimension — interpolates if FNO returns different T_bot.
-
-Reference: Gu & Dao 2023  arXiv:2312.00752
-"""
 from __future__ import annotations
 
 import math
@@ -28,10 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ── Portable RMSNorm (works on PyTorch >= 1.9) ────────────────────────────────
-
 class RMSNorm(nn.Module):
-    """Root-mean-square layer normalisation (no mean subtraction)."""
 
     def __init__(self, d: int, eps: float = 1e-6):
         super().__init__()
@@ -43,58 +18,41 @@ class RMSNorm(nn.Module):
         return x / norm * self.weight
 
 
-# ── Parallel Selective Scan ────────────────────────────────────────────────────
-
 def selective_scan_parallel(
-    u:     torch.Tensor,   # [B, T, d_inner]
-    delta: torch.Tensor,   # [B, T, d_inner]
-    A:     torch.Tensor,   # [d_inner, d_state]
-    B:     torch.Tensor,   # [B, T, d_state]
-    C:     torch.Tensor,   # [B, T, d_state]
-    D:     torch.Tensor,   # [d_inner]
-) -> torch.Tensor:         # [B, T, d_inner]
-    """
-    Discretised SSM scan (ZOH, sequential over T).
-
-    FIX: delta is clamped to [-10, 1] before exp() to prevent
-    overflow that produced NaN hidden states on rare large inputs.
-    For T=8 the sequential loop is fast; no parallel scan needed.
-    """
+    u:     torch.Tensor,
+    delta: torch.Tensor,
+    A:     torch.Tensor,
+    B:     torch.Tensor,
+    C:     torch.Tensor,
+    D:     torch.Tensor,
+) -> torch.Tensor:
     B_size, T, d_inner = u.shape
     d_state = A.shape[1]
     device  = u.device
 
-    # Clamp delta before exp to keep dA finite  ← FIX
+
     delta_clamped = delta.clamp(-10.0, 1.0)
 
-    # ZOH: Ā = exp(Δ·A),  B̄ = Δ·B
+
     dA = torch.exp(
         torch.einsum("bti,is->btis", delta_clamped, A)
-    )                                                  # [B, T, d_inner, d_state]
-    # dB_u = torch.einsum("bti,bts->btis", delta_clamped * u, B)
-    # # HIỆN TẠI
-    # dB_u = torch.einsum("bti,bts->btis", delta_clamped * u, B_ssm)
-    # # delta_clamped * u nhân u vào delta trước → sai ZOH formula
+    )
 
-    # ZOH đúng: B̄ = Δ·B (không có u), rồi h = Ā·h + B̄·u
-    # Tức: dB_u[t] = Δ[t] ⊗ B[t] * u[t] (u nhân vào sau)
+
     dB_u = torch.einsum("bti,bts->btis", delta_clamped, B) * u.unsqueeze(-1)
-    # shape: [B,T,d_inner,d_state] * [B,T,d_inner,1] → [B,T,d_inner,d_state] ✓
+
     h  = torch.zeros(B_size, d_inner, d_state, device=device)
     ys = []
     for t in range(T):
-        h  = dA[:, t] * h + dB_u[:, t]                # [B, d_inner, d_state]
-        y  = torch.einsum("bis,bs->bi", h, C[:, t])   # [B, d_inner]
+        h  = dA[:, t] * h + dB_u[:, t]
+        y  = torch.einsum("bis,bs->bi", h, C[:, t])
         ys.append(y)
 
-    out = torch.stack(ys, dim=1)                       # [B, T, d_inner]
+    out = torch.stack(ys, dim=1)
     return out + u * D.unsqueeze(0).unsqueeze(0)
 
 
-# ── Single Mamba Block ─────────────────────────────────────────────────────────
-
 class MambaBlock(nn.Module):
-    """One Mamba block: SSM branch + SiLU gate + residual."""
 
     def __init__(
         self,
@@ -117,12 +75,12 @@ class MambaBlock(nn.Module):
 
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
 
-        # Causal depthwise conv — padding = d_conv-1 so output has length >= T
+
         self.conv1d = nn.Conv1d(
             in_channels  = self.d_inner,
             out_channels = self.d_inner,
             kernel_size  = d_conv,
-            padding      = d_conv - 1,   # causal padding
+            padding      = d_conv - 1,
             groups       = self.d_inner,
             bias         = True,
         )
@@ -131,7 +89,7 @@ class MambaBlock(nn.Module):
                                   dt_rank + 2 * d_state, bias=False)
         self.dt_proj = nn.Linear(dt_rank, self.d_inner, bias=True)
 
-        # Init dt bias
+
         dt_init_std = dt_rank ** -0.5
         nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
         dt = torch.exp(
@@ -149,24 +107,23 @@ class MambaBlock(nn.Module):
 
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
-        # FIX: use portable RMSNorm instead of nn.RMSNorm (requires PyTorch>=2.4)
+
         self.norm = RMSNorm(d_model)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, T, d_model] → [B, T, d_model]"""
         residual = x
         x = self.norm(x)
 
         B_sz, T, _ = x.shape
 
-        xz  = self.in_proj(x)                             # [B, T, 2*d_inner]
+        xz  = self.in_proj(x)
         x_s = xz[:, :, :self.d_inner]
         z   = xz[:, :, self.d_inner:]
 
-        # Causal conv — trim the future-padding correctly  ← FIX (explicit)
-        x_conv_out = self.conv1d(x_s.permute(0, 2, 1))    # [B, d_inner, T+pad]
-        x_conv = F.silu(x_conv_out[:, :, :T]).permute(0, 2, 1)  # [B, T, d_inner]
+
+        x_conv_out = self.conv1d(x_s.permute(0, 2, 1))
+        x_conv = F.silu(x_conv_out[:, :, :T]).permute(0, 2, 1)
 
         dt_rank = self.x_proj.out_features - 2 * self.d_state
         x_dbc   = self.x_proj(x_conv)
@@ -184,14 +141,7 @@ class MambaBlock(nn.Module):
         return self.drop(y) + residual
 
 
-# ── MambaEncoder ──────────────────────────────────────────────────────────────
-
 class MambaEncoder(nn.Module):
-    """
-    Mamba-based temporal encoder.
-    Input:  [B, T, input_dim]
-    Output: [B, hidden_dim]
-    """
 
     def __init__(
         self,
@@ -234,19 +184,7 @@ class MambaEncoder(nn.Module):
         return self.out_proj(h_out)
 
 
-# ── DataEncoder1D_Mamba ───────────────────────────────────────────────────────
-
 class DataEncoder1D_Mamba(nn.Module):
-    """
-    1D-Data Encoder with Mamba replacing LSTM.
-
-    Eq.7  e_1d  = MLP(X_1d)                       [B, T, mlp_h]
-    Eq.8  e_En  = MLP_fusion(cat(e_3d, e_1d))     [B, T, mlp_h*2]
-    Eq.9  h_t   = MambaEncoder(e_En)              [B, hidden_dim]
-
-    FIX: if feat_3d has T_bot != obs_T (FNO may vary T by 1 on some
-    inputs), linearly interpolate to align before fusion.
-    """
 
     def __init__(
         self,
@@ -284,19 +222,19 @@ class DataEncoder1D_Mamba(nn.Module):
 
     def forward(
         self,
-        obs_in:  torch.Tensor,   # [B, T, 4]
-        feat_3d: torch.Tensor,   # [B, T_bot, feat_3d_dim]
-    ) -> torch.Tensor:           # [B, lstm_hidden]
+        obs_in:  torch.Tensor,
+        feat_3d: torch.Tensor,
+    ) -> torch.Tensor:
 
         T     = obs_in.shape[1]
         T_bot = feat_3d.shape[1]
 
-        # FIX: align T_bot → T if FNO gave a different temporal length
+
         if T_bot != T:
             feat_3d = F.interpolate(
-                feat_3d.permute(0, 2, 1),        # [B, C, T_bot]
+                feat_3d.permute(0, 2, 1),
                 size=T, mode="linear", align_corners=False,
-            ).permute(0, 2, 1)                   # [B, T, C]
+            ).permute(0, 2, 1)
 
         e_1d  = self.mlp_1d(obs_in)
         e_en  = self.mlp_fusion(torch.cat([feat_3d, e_1d], dim=-1))

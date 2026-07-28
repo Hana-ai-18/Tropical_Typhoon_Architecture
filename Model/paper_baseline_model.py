@@ -1,26 +1,3 @@
-"""
-Model/paper_baseline_model.py  ── PAPER BASELINE
-==================================================
-THUẬT TOÁN GỐC: Rahman et al. (2025)
-"Tropical cyclone track prediction harnessing deep learning algorithms"
-Results in Engineering 26, 105009
-
-CHIẾN LƯỢC:
-  - Giữ nguyên encoder pipeline của bạn (FNO3D + Mamba + Env_net → raw_ctx [B, 512])
-  - Thay toàn bộ prediction head bằng paper algorithm:
-      * LSTM_Model  : LSTMCell stepwise (Algorithm 3)
-      * GRU_Model   : GRUCell  stepwise với dropout=0.2 (Algorithm 4)
-      * RNN_Model   : RNNCell  stepwise (Algorithm 2)
-  - Loss: MSE (paper §2.7: "Mean Squared Error loss function")
-  - Optimizer: Adam lr=0.001 (paper Table 2)
-  - Epochs: 7000 (paper Table 2) → dùng early stopping trong train script
-  - LR Scheduler: ReduceLROnPlateau (paper §2.8)
-
-METRICS:
-  - ADE / FDE / 12h / 24h / 48h / 72h  (haversine km)
-  - ATE (Along-Track Error)  ── thành phần lỗi dọc theo hướng di chuyển bão
-  - CTE (Cross-Track Error)  ── thành phần lỗi vuông góc với hướng di chuyển
-"""
 from __future__ import annotations
 
 import math
@@ -35,27 +12,14 @@ from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
 from Model.env_net_transformer_gphsplit import Env_net
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Normalisation helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
-    """Denormalise từ [0,1]-ish space về degrees."""
     out = arr.clone()
-    out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0   # lon
-    out[..., 1] = (arr[..., 1] * 50.0) / 10.0              # lat
+    out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0
+    out[..., 1] = (arr[..., 1] * 50.0) / 10.0
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Haversine distance
-# ══════════════════════════════════════════════════════════════════════════════
-
 def haversine_km(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-    """
-    Haversine distance [km] giữa p1, p2 dạng degrees.
-    p1, p2: [..., 2] (lon, lat)
-    """
     lon1 = torch.deg2rad(p1[..., 0]);  lat1 = torch.deg2rad(p1[..., 1])
     lon2 = torch.deg2rad(p2[..., 0]);  lat2 = torch.deg2rad(p2[..., 1])
     dlat = lat2 - lat1
@@ -64,82 +28,63 @@ def haversine_km(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
     return 2.0 * 6371.0 * torch.asin(a.clamp(1e-12, 1.0).sqrt())
 
 
-# Horizon steps (6h per step): 12h=step1, 24h=step3, 48h=step7, 72h=step11
 HORIZON_STEPS: Dict[int, int] = {12: 1, 24: 3, 48: 7, 72: 11}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ATE / CTE helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _ate_cte_tensors(
-    pred_norm: torch.Tensor,   # [T, B, 2] normalised
-    gt_norm:   torch.Tensor,   # [T, B, 2] normalised
+    pred_norm: torch.Tensor,
+    gt_norm:   torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Trả về ATE [T, B] và CTE [T, B] theo km (signed).
-
-    ATE (Along-Track Error):  thành phần lỗi dọc theo hướng di chuyển GT của bão.
-        ATE > 0 → dự báo đi xa hơn GT (over-shoot)
-        ATE < 0 → dự báo đi ít hơn GT (under-shoot)
-
-    CTE (Cross-Track Error):  thành phần lỗi vuông góc với hướng di chuyển.
-        CTE > 0 → lệch sang trái hướng di chuyển
-        CTE < 0 → lệch sang phải
-    """
     T = min(pred_norm.shape[0], gt_norm.shape[0])
-    pred_deg = _norm_to_deg(pred_norm[:T])   # [T, B, 2]
-    gt_deg   = _norm_to_deg(gt_norm[:T])     # [T, B, 2]
+    pred_deg = _norm_to_deg(pred_norm[:T])
+    gt_deg   = _norm_to_deg(gt_norm[:T])
 
-    # ── Sai số vị trí → km ────────────────────────────────────────────────
-    err     = pred_deg - gt_deg              # [T, B, 2] degrees
-    lat_rad = torch.deg2rad(gt_deg[..., 1])  # [T, B]
+
+    err     = pred_deg - gt_deg
+    lat_rad = torch.deg2rad(gt_deg[..., 1])
     err_km  = torch.stack([
-        err[..., 0] * 111.0 * torch.cos(lat_rad),   # Δlon → km
-        err[..., 1] * 111.0,                          # Δlat → km
-    ], dim=-1)                                # [T, B, 2]
+        err[..., 0] * 111.0 * torch.cos(lat_rad),
+        err[..., 1] * 111.0,
+    ], dim=-1)
 
-    # ── Hướng di chuyển GT (forward difference, last step backward) ──────
+
     if T >= 2:
         dir_raw = torch.cat([
             gt_deg[1:] - gt_deg[:-1],
             gt_deg[-1:] - gt_deg[-2:-1],
-        ], dim=0)                             # [T, B, 2]
+        ], dim=0)
     else:
-        # Không đủ bước: giả định hướng đông
+
         dir_raw = torch.zeros_like(gt_deg)
         dir_raw[..., 0] = 1.0
 
-    # Chuyển hướng sang km để đồng nhất đơn vị
+
     dir_km = torch.stack([
         dir_raw[..., 0] * 111.0 * torch.cos(lat_rad),
         dir_raw[..., 1] * 111.0,
-    ], dim=-1)                                # [T, B, 2]
+    ], dim=-1)
     dir_norm = dir_km.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    dir_unit = dir_km / dir_norm              # [T, B, 2] unit vector
+    dir_unit = dir_km / dir_norm
 
-    # ── ATE = dot(err_km, dir_unit) ───────────────────────────────────────
-    ate = (err_km * dir_unit).sum(dim=-1)     # [T, B]
 
-    # ── CTE = 2D cross-product (signed perpendicular component) ──────────
+    ate = (err_km * dir_unit).sum(dim=-1)
+
+
     cte = (err_km[..., 0] * dir_unit[..., 1]
-           - err_km[..., 1] * dir_unit[..., 0])  # [T, B]
+           - err_km[..., 1] * dir_unit[..., 0])
 
     return ate, cte
 
 
 def compute_ade_per_horizon(
-    pred_norm: torch.Tensor,   # [T, B, 2] normalised
-    gt_norm:   torch.Tensor,   # [T, B, 2] normalised
+    pred_norm: torch.Tensor,
+    gt_norm:   torch.Tensor,
 ) -> Dict[str, float]:
-    """
-    ADE (km) tại các mốc 12h, 24h, 48h, 72h + overall ADE/FDE.
-    """
     T = min(pred_norm.shape[0], gt_norm.shape[0])
     pred_deg = _norm_to_deg(pred_norm[:T])
     gt_deg   = _norm_to_deg(gt_norm[:T])
 
-    dist = haversine_km(pred_deg, gt_deg)    # [T, B]
+    dist = haversine_km(pred_deg, gt_deg)
 
     result: Dict[str, float] = {}
     result["ADE"] = float(dist.mean().item())
@@ -155,20 +100,11 @@ def compute_ade_per_horizon(
 
 
 def compute_ate_cte_per_horizon(
-    pred_norm: torch.Tensor,   # [T, B, 2] normalised
-    gt_norm:   torch.Tensor,   # [T, B, 2] normalised
+    pred_norm: torch.Tensor,
+    gt_norm:   torch.Tensor,
 ) -> Dict[str, float]:
-    """
-    ATE / CTE (km) tại các mốc 12h, 24h, 48h, 72h + overall mean.
-
-    Trả về cả signed mean và absolute mean:
-      ATE_{H}h     : signed mean (bias dọc track)
-      ATE_abs_{H}h : |ATE| mean  (magnitude)
-      CTE_{H}h     : signed mean (bias ngang track)
-      CTE_abs_{H}h : |CTE| mean  (magnitude)
-    """
     T = min(pred_norm.shape[0], gt_norm.shape[0])
-    ate, cte = _ate_cte_tensors(pred_norm[:T], gt_norm[:T])   # each [T, B]
+    ate, cte = _ate_cte_tensors(pred_norm[:T], gt_norm[:T])
 
     result: Dict[str, float] = {
         "ATE":     float(ate.mean().item()),
@@ -195,18 +131,12 @@ def compute_full_metrics(
     pred_norm: torch.Tensor,
     gt_norm:   torch.Tensor,
 ) -> Dict[str, float]:
-    """Tổng hợp ADE + ATE/CTE metrics vào một dict."""
     m = compute_ade_per_horizon(pred_norm, gt_norm)
     m.update(compute_ate_cte_per_horizon(pred_norm, gt_norm))
     return m
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Paper RNN_Model  ── Algorithm 2
-# ══════════════════════════════════════════════════════════════════════════════
-
 class PaperRNNHead(nn.Module):
-    """RNN stepwise prediction (Algorithm 2 của paper)."""
 
     def __init__(
         self,
@@ -264,12 +194,7 @@ class PaperRNNHead(nn.Module):
         return torch.stack(preds, dim=0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Paper LSTM_Model  ── Algorithm 3
-# ══════════════════════════════════════════════════════════════════════════════
-
 class PaperLSTMHead(nn.Module):
-    """LSTMCell stepwise prediction (Algorithm 3 của paper)."""
 
     def __init__(
         self,
@@ -331,12 +256,7 @@ class PaperLSTMHead(nn.Module):
         return torch.stack(preds, dim=0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Paper GRU_Model  ── Algorithm 4
-# ══════════════════════════════════════════════════════════════════════════════
-
 class PaperGRUHead(nn.Module):
-    """GRUCell stepwise prediction với dropout (Algorithm 4 của paper)."""
 
     def __init__(
         self,
@@ -396,15 +316,7 @@ class PaperGRUHead(nn.Module):
         return torch.stack(preds, dim=0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Encoder Pipeline  ── GIỮ NGUYÊN (dùng chung với STTrans)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class PaperEncoder(nn.Module):
-    """
-    Encoder pipeline dùng chung cho PaperBaseline và STTrans.
-    FNO3D + Mamba + Env_net → raw_ctx [B, RAW_CTX_DIM=512]
-    """
     RAW_CTX_DIM = 512
 
     def __init__(
@@ -450,7 +362,6 @@ class PaperEncoder(nn.Module):
         self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, ctx_dim)
 
     def forward(self, batch_list) -> torch.Tensor:
-        """→ raw_ctx [B, RAW_CTX_DIM=512]"""
         obs_traj  = batch_list[0]
         obs_Me    = batch_list[7]
         image_obs = batch_list[11]
@@ -492,23 +403,13 @@ class PaperEncoder(nn.Module):
 
         raw = torch.cat([h_t, e_env, f_spatial], dim=-1)
         raw = F.gelu(self.ctx_ln(self.ctx_fc1(raw)))
-        return raw   # [B, 512]
+        return raw
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Paper Baseline Model  ── Wrapper chính
-# ══════════════════════════════════════════════════════════════════════════════
 
 MODEL_TYPES = ("lstm", "gru", "rnn")
 
 
 class PaperBaseline(nn.Module):
-    """
-    Paper baseline model theo Rahman et al. (2025).
-    Encoder: FNO3D + Mamba + Env_net (shared với STTrans)
-    Prediction head: LSTMCell / GRUCell / RNNCell
-    Loss: MSE (paper §2.7)
-    """
 
     def __init__(
         self,
@@ -539,22 +440,17 @@ class PaperBaseline(nn.Module):
             self.head = PaperRNNHead(input_dim=input_dim, hidden_dim=hidden_dim,
                                      n_layers=n_layers, pred_len=pred_len)
 
-    # ── Loss ─────────────────────────────────────────────────────────────────
 
     def mse_loss(self, pred_norm: torch.Tensor, gt_norm: torch.Tensor) -> torch.Tensor:
-        """MSE loss (paper §2.7)."""
         T = min(pred_norm.shape[0], gt_norm.shape[0])
         return F.mse_loss(pred_norm[:T], gt_norm[:T])
 
-    # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(self, batch_list) -> torch.Tensor:
-        """→ pred [pred_len, B, 2] normalised."""
         raw_ctx  = self.encoder(batch_list)
         obs_traj = batch_list[0]
         return self.head(raw_ctx, obs_traj, feed_forward=True)
 
-    # ── Training interface ────────────────────────────────────────────────────
 
     def get_loss(self, batch_list) -> torch.Tensor:
         traj_gt = batch_list[1]
@@ -572,7 +468,6 @@ class PaperBaseline(nn.Module):
 
         return dict(total=loss, mse=loss.item(), **ade_m, **atc_m)
 
-    # ── Inference interface ───────────────────────────────────────────────────
 
     @torch.no_grad()
     def sample(
@@ -581,12 +476,6 @@ class PaperBaseline(nn.Module):
         num_ensemble: int = 1,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            pred_mean : [T, B, 2] normalised
-            me_mean   : [T, B, 2] zeros
-            all_trajs : [1, T, B, 2]
-        """
         pred = self.forward(batch_list)
         T, B, _ = pred.shape
         me_mean   = torch.zeros(T, B, 2, device=pred.device)

@@ -1,15 +1,4 @@
-"""
-Model/data/trajectoriesWithMe_unet.py  ── v14 (TEST / INFERENCE)
-================================================================
-Thin wrapper around the training dataset for test/inference use.
 
-No changes vs v13 wrapper logic — inherits all v13/v14 fixes from
-trajectoriesWithMe_unet_training.py:
-  FIX-DATA-1..4, FIX-CACHE-1 (all in training module).
-
-The class simply forces is_test=True and type="test" defaults so
-callers don't need to specify them explicitly.
-"""
 from __future__ import annotations
 
 from Model.data.trajectoriesWithMe_unet_training import (
