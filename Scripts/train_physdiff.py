@@ -190,13 +190,22 @@ def get_args():
     p.add_argument("--unet_in_ch",   default=13,         type=int)
 
     # Diffusion schedule
-    p.add_argument("--T_diffusion",  default=1000,       type=int)
+    p.add_argument("--T_diffusion",  default=1000,       type=int,
+                   help="[QUAN TRỌNG] Reverse sampling giờ LUÔN chạy đủ T_diffusion "
+                        "bước liên tiếp (đúng Eq.2 paper Phys-Diff, không hỗ trợ "
+                        "strided/DDIM-style skip-step). Tăng T_diffusion sẽ làm "
+                        "val/test CHẬM HƠN TUYẾN TÍNH -- cân nhắc giảm --val_freq "
+                        "và/hoặc --val_subset nếu T_diffusion lớn.")
     p.add_argument("--beta_start",   default=1e-4,       type=float)
     p.add_argument("--beta_end",     default=0.02,       type=float)
     p.add_argument("--n_sample_steps", default=50,       type=int,
-                   help="Số bước reverse process lúc validation trong training")
+                   help="[DEPRECATED, không còn ảnh hưởng] Trước đây dùng để strided-"
+                        "sample nhanh hơn, nhưng công thức đó SAI so với paper (paper "
+                        "không hỗ trợ skip-step) và đã bị loại bỏ khỏi "
+                        "_ddpm_reverse_sample(). Giữ tham số này chỉ để tương thích "
+                        "ngược với checkpoint cũ, không có tác dụng thực tế.")
     p.add_argument("--test_n_sample_steps", default=200, type=int,
-                   help="Số bước reverse process lúc test cuối cùng")
+                   help="[DEPRECATED, không còn ảnh hưởng] Cùng lý do trên.")
     p.add_argument("--eval_num_ensemble", default=20,    type=int)
 
     # Training
@@ -211,8 +220,14 @@ def get_args():
     p.add_argument("--lr_patience",  default=20,         type=int)
     p.add_argument("--lr_factor",    default=0.5,        type=float)
     p.add_argument("--lr_min",       default=1e-6,       type=float)
-    p.add_argument("--val_freq",     default=10,         type=int)
-    p.add_argument("--val_subset",   default=300,        type=int)
+    p.add_argument("--val_freq",     default=25,         type=int,
+                   help="[TĂNG từ 10] Reverse sampling giờ chạy đủ T_diffusion=1000 "
+                        "bước liên tiếp thay vì strided 10-50 bước như trước -- MỖI "
+                        "LẦN validate chậm hơn đáng kể, nên validate thưa hơn để không "
+                        "làm chậm tổng thời gian train.")
+    p.add_argument("--val_subset",   default=100,        type=int,
+                   help="[GIẢM từ 300] Cùng lý do trên -- giảm số sample validate mỗi "
+                        "lần để bù lại chi phí mỗi sample giờ đắt hơn nhiều.")
     p.add_argument("--num_workers",  default=2,          type=int)
 
     # Test

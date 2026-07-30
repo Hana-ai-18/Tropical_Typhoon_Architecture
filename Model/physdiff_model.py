@@ -386,13 +386,19 @@ class PhysDiffModel(nn.Module):
         T_diffusion:  int   = 1000,
         beta_start:   float = 1e-4,
         beta_end:     float = 0.02,
-        n_sample_steps: int = 50,
+        n_sample_steps: int = 50,   # [DEPRECATED, xem _ddpm_reverse_sample] KHÔNG còn
+                                     # dùng để điều khiển tốc độ sampling -- paper Phys-Diff
+                                     # (Eq.2) không hỗ trợ strided/skip-step sampling, reverse
+                                     # process nay LUON chay du T_diffusion buoc lien tiep.
+                                     # Giu tham so nay chi de tuong thich nguoc voi checkpoint/
+                                     # CLI args cu (train_physdiff.py van truyen no vao), KHONG
+                                     # anh huong hanh vi sample() nua.
     ):
         super().__init__()
         self.obs_len       = obs_len
         self.pred_len      = pred_len
         self.T_diffusion    = T_diffusion
-        self.n_sample_steps = n_sample_steps
+        self.n_sample_steps = n_sample_steps   # [DEPRECATED] không dùng, xem ghi chú trên
         self.d_model        = d_model
 
         self.cond_encoder = ConditionalEncoder(
@@ -508,6 +514,20 @@ class PhysDiffModel(nn.Module):
 
     @torch.no_grad()
     def _ddpm_reverse_sample(self, batch_list) -> torch.Tensor:
+        """
+        [FIX] Ban truoc dung "strided sampling" (chi chay n_sample_steps
+        buoc, nhay coc qua stride = T // n_sample_steps) nhung VAN ap
+        dung cong thuc Eq.(2) cua paper -- cong thuc nay CHI DUNG cho 1
+        buoc LIEN TIEP t -> t-1, khong dung cho viec nhay coc nhieu buoc
+        cung luc (do la ly do DDIM can 1 cong thuc rieng, paper Phys-Diff
+        KHONG dung DDIM). Ket qua: z_t khong hoi tu ve dung phan phoi
+        z_0, decode ra toa do gan nhu ngau nhien (ADE ~6000km quan sat
+        duoc khi train that).
+
+        Sua dung theo paper (Section 2.3, Eq.2): chay DU T buoc LIEN
+        TIEP tu t=T-1 xuong t=0, khong nhay coc. Paper khong nhac den
+        DDIM/strided sampling o bat ky dau.
+        """
         obs_traj = batch_list[0]
         device = obs_traj.device
         self._ensure_schedule_device(device)
@@ -516,10 +536,7 @@ class PhysDiffModel(nn.Module):
 
         z_t = torch.randn(B, N, self.d_model, device=device)
 
-        stride = max(1, self.T_diffusion // self.n_sample_steps)
-        timesteps = list(range(0, self.T_diffusion, stride))[::-1]
-
-        for t_val in timesteps:
+        for t_val in range(self.T_diffusion - 1, -1, -1):   # T-1, T-2, ..., 0 (dung 1 buoc)
             t = torch.full((B,), t_val, device=device, dtype=torch.long)
             c = self.cond_encoder(batch_list, t, self.T_diffusion)
             eps_pred, _ = self.denoiser(z_t, c)
