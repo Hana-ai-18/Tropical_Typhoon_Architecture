@@ -422,17 +422,26 @@ class PhysDiffModel(nn.Module):
     def _prepare_x0(self, batch_list) -> torch.Tensor:
         """
         Ghép (lon, lat, wind, pres) thành x_0 [B, N, 4] cho tương lai.
-        wind/pres lấy từ batch_list[1] nếu có đủ 4 cột (giống code gốc
-        train_github.py: torch.cat([pred_traj_gt, pred_traj_gt_Me])) --
-        nếu batch_list[1] chỉ có 2 cột (lon,lat), suy ra wind/pres=0
-        (placeholder trung tính, không ảnh hưởng trajectory branch).
+
+        [FIX] Bản trước đọc nhầm batch_list[2] (thực chất là obs_rel --
+        relative displacement của phần QUAN TRẮC, độ dài obs_len=8) tưởng
+        là pred_Me (wind/pressure tương lai). Đúng theo seq_collate() thật
+        (Model/data/trajectoriesWithMe_unet_training.py), cấu trúc batch_list
+        là:
+            0=obs_traj, 1=pred_traj, 2=obs_rel, 3=pred_rel,
+            4=nlp, 5=mask, 6=seq_start_end,
+            7=obs_Me, 8=pred_Me, 9=obs_Me_rel, 10=pred_Me_rel,
+            11=img_obs, 12=img_pred, 13=env_out, 14=None, 15=tyID
+        -> pred_Me (wind/pressure cho horizon tương lai, cùng độ dài
+        pred_len với pred_traj) nằm ở INDEX 8, không phải index 2.
         """
         traj_gt = batch_list[1]
         T = min(self.pred_len, traj_gt.shape[0])
         pos = traj_gt[:T]   # [T, B, 2]
 
-        if len(batch_list) > 2 and batch_list[2] is not None and batch_list[2].shape[-1] >= 2:
-            me_gt = batch_list[2][:T]   # giả định [T, B, 2] wind/pres nếu có
+        pred_me = batch_list[8] if len(batch_list) > 8 else None
+        if pred_me is not None and pred_me.shape[0] >= T and pred_me.shape[-1] >= 2:
+            me_gt = pred_me[:T, :, :2]   # [T, B, 2] -- chỉ lấy đúng 2 cột (wind,pres)
             x0 = torch.cat([pos, me_gt], dim=-1)
         else:
             wind_pres_placeholder = torch.zeros_like(pos)
