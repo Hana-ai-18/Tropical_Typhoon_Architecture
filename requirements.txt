@@ -1,0 +1,56 @@
+# ============================================================================
+# requirements.txt  --  MGTCF + Phys-Diff training (TC track prediction)
+# ============================================================================
+# Đã rà soát TRỰC TIẾP toàn bộ import (kể cả import nằm TRONG hàm, không chỉ
+# đầu file) trong:
+#   Model/mgtcf_model.py, Model/physdiff_model.py,
+#   train_mgtcf.py, train_physdiff.py,
+#   Model/paper_baseline_model.py (PaperEncoder dùng chung),
+#   Model/FNO3D_encoder.py, Model/mamba_encoder.py,
+#   Model/env_net_transformer_gphsplit.py,
+#   Model/data/loader_training.py, Model/data/trajectoriesWithMe_unet_training.py
+#
+# -> CHỈ cần torch + numpy để TRAIN MGTCF/Phys-Diff. Mọi thứ khác trong
+#    pipeline train là built-in Python (os, sys, argparse, time, random,
+#    csv, math, datetime, typing, logging, inspect).
+#
+# LƯU Ý về netCDF4/cv2/attrdict/scipy (đã rà soát kỹ, không bỏ sót import
+# nằm sâu trong hàm như lần rà soát đầu tiên từng bỏ sót):
+#   - netCDF4, cv2 (opencv): trajectoriesWithMe_unet_training.py CÓ import
+#     2 thư viện này, nhưng bọc trong try/except ImportError (HAS_NC,
+#     HAS_CV2 flags) và CHỈ dùng khi đọc file .nc (NetCDF thô) hoặc khi
+#     cần resize ảnh có shape sai chuẩn. Dataset của bạn dùng TOÀN BỘ
+#     file .npy (Data3d/*.npy) -> đi qua nhánh "if path.endswith('.npy')",
+#     KHÔNG BAO GIỜ chạm nhánh .nc -> netCDF4 KHÔNG CẦN CÀI. cv2 cũng có
+#     fallback pad/crop thủ công nếu thiếu -> KHÔNG BẮT BUỘC.
+#   - attrdict: rà soát toàn bộ codebase, KHÔNG tìm thấy import này ở
+#     bất kỳ đâu -> không cần cài.
+#   - scipy: CÓ dùng thật (scipy.stats), nhưng chỉ trong
+#     generate_paper_report.py và statistical_tests.py (kiểm định
+#     Wilcoxon/t-test cho bước TỔNG HỢP BÁO CÁO CUỐI CÙNG, không phải lúc
+#     train) -- xem mục "Tuỳ chọn" bên dưới.
+#
+# Yêu cầu Python: >= 3.9 (code dùng cú pháp built-in generic "tuple[...]",
+# PEP 585, không tương thích Python 3.8 trở xuống).
+# ============================================================================
+
+# --- Bắt buộc để TRAIN MGTCF / Phys-Diff ------------------------------------
+torch>=2.0.0
+numpy>=1.23.0
+
+# --- Khuyến nghị nếu server có GPU NVIDIA -----------------------------------
+# Cài đúng bản torch có hỗ trợ CUDA khớp driver server, KHÔNG dùng dòng
+# "torch>=2.0.0" ở trên nếu cần GPU -- ví dụ với CUDA 12.1:
+#   pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
+# Kiểm tra CUDA version server bằng: nvidia-smi
+# Xem bảng tương ứng chính thức: https://pytorch.org/get-started/locally/
+
+# --- Tuỳ chọn, CHỈ cần nếu bạn cũng chạy các script khác trong project ------
+# (KHÔNG bắt buộc để train MGTCF/Phys-Diff, bỏ comment nếu cần dùng)
+# scipy>=1.9.0       # generate_paper_report.py, statistical_tests.py (scipy.stats)
+# matplotlib>=3.5.0  # generate_paper_report.py, xai_evaluate.py (vẽ biểu đồ)
+# pandas>=1.5.0       # nếu dùng thêm phân tích dữ liệu dạng bảng
+# opencv-python       # chỉ cần nếu Data3d có file shape khác 81x81 cần resize
+#                     # (không bắt buộc, có fallback pad/crop thủ công)
+# netCDF4             # CHỈ cần nếu bạn có file .nc thô (không phải .npy)
+#                     # -- hầu hết trường hợp KHÔNG cần
