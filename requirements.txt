@@ -1,5 +1,6 @@
 # ============================================================================
 # requirements.txt  --  MGTCF + Phys-Diff training (TC track prediction)
+# Target: Linux server, NVIDIA A100 GPU
 # ============================================================================
 # Đã rà soát TRỰC TIẾP toàn bộ import (kể cả import nằm TRONG hàm, không chỉ
 # đầu file) trong:
@@ -15,35 +16,38 @@
 #    csv, math, datetime, typing, logging, inspect).
 #
 # LƯU Ý về netCDF4/cv2/attrdict/scipy (đã rà soát kỹ, không bỏ sót import
-# nằm sâu trong hàm như lần rà soát đầu tiên từng bỏ sót):
-#   - netCDF4, cv2 (opencv): trajectoriesWithMe_unet_training.py CÓ import
-#     2 thư viện này, nhưng bọc trong try/except ImportError (HAS_NC,
-#     HAS_CV2 flags) và CHỈ dùng khi đọc file .nc (NetCDF thô) hoặc khi
-#     cần resize ảnh có shape sai chuẩn. Dataset của bạn dùng TOÀN BỘ
-#     file .npy (Data3d/*.npy) -> đi qua nhánh "if path.endswith('.npy')",
-#     KHÔNG BAO GIỜ chạm nhánh .nc -> netCDF4 KHÔNG CẦN CÀI. cv2 cũng có
-#     fallback pad/crop thủ công nếu thiếu -> KHÔNG BẮT BUỘC.
-#   - attrdict: rà soát toàn bộ codebase, KHÔNG tìm thấy import này ở
-#     bất kỳ đâu -> không cần cài.
-#   - scipy: CÓ dùng thật (scipy.stats), nhưng chỉ trong
-#     generate_paper_report.py và statistical_tests.py (kiểm định
-#     Wilcoxon/t-test cho bước TỔNG HỢP BÁO CÁO CUỐI CÙNG, không phải lúc
-#     train) -- xem mục "Tuỳ chọn" bên dưới.
+# nằm sâu trong hàm):
+#   - netCDF4, cv2 (opencv): CÓ import trong trajectoriesWithMe_unet_training.py,
+#     nhưng bọc trong try/except ImportError (HAS_NC, HAS_CV2 flags), CHỈ
+#     dùng khi đọc file .nc hoặc resize ảnh sai chuẩn. Dataset .npy của bạn
+#     KHÔNG chạm nhánh này -> KHÔNG BẮT BUỘC.
+#   - attrdict: không tìm thấy import ở bất kỳ đâu -> không cần cài.
+#   - scipy: CÓ dùng thật, nhưng chỉ trong generate_paper_report.py /
+#     statistical_tests.py (bước tổng hợp báo cáo cuối, KHÔNG phải lúc train).
 #
-# Yêu cầu Python: >= 3.9 (code dùng cú pháp built-in generic "tuple[...]",
-# PEP 585, không tương thích Python 3.8 trở xuống).
+# Yêu cầu Python: >= 3.9 (code dùng cú pháp built-in generic "tuple[...]").
 # ============================================================================
 
 # --- Bắt buộc để TRAIN MGTCF / Phys-Diff ------------------------------------
-torch>=2.0.0
 numpy>=1.23.0
 
-# --- Khuyến nghị nếu server có GPU NVIDIA -----------------------------------
-# Cài đúng bản torch có hỗ trợ CUDA khớp driver server, KHÔNG dùng dòng
-# "torch>=2.0.0" ở trên nếu cần GPU -- ví dụ với CUDA 12.1:
-#   pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
-# Kiểm tra CUDA version server bằng: nvidia-smi
-# Xem bảng tương ứng chính thức: https://pytorch.org/get-started/locally/
+# --- torch: CÀI RIÊNG theo đúng bản CUDA của server, xem hướng dẫn A100 ------
+# KHÔNG dùng "pip install torch" trần trụi trên server GPU -- mặc định PyPI
+# có thể cài bản CPU-only hoặc bản CUDA không khớp driver, dẫn đến GPU không
+# được nhận diện hoặc chạy chậm bất thường (torch.cuda.is_available()=False).
+# Xem đầy đủ hướng dẫn cài đúng cho A100 trong README_MGTCF_PhysDiff.md
+# mục "1. Cài đặt môi trường" -- tóm tắt nhanh:
+#
+#   nvidia-smi                                    # kiểm tra driver/CUDA server hỗ trợ
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   # (hoặc cu118/cu124 tuỳ CUDA server, xem bảng tương thích:
+#   #  https://pytorch.org/get-started/locally/)
+#
+# A100 (kiến trúc Ampere, compute capability 8.0) yêu cầu CUDA >= 11.0 để
+# nhận diện GPU; torch >= 2.0.0 khuyến nghị để tận dụng đầy đủ TF32/BF16
+# Tensor Core của A100 (tăng tốc đáng kể so với FP32 mặc định, xem mục
+# "Tối ưu hiệu năng A100" trong README).
+torch>=2.0.0
 
 # --- Tuỳ chọn, CHỈ cần nếu bạn cũng chạy các script khác trong project ------
 # (KHÔNG bắt buộc để train MGTCF/Phys-Diff, bỏ comment nếu cần dùng)
@@ -51,6 +55,4 @@ numpy>=1.23.0
 # matplotlib>=3.5.0  # generate_paper_report.py, xai_evaluate.py (vẽ biểu đồ)
 # pandas>=1.5.0       # nếu dùng thêm phân tích dữ liệu dạng bảng
 # opencv-python       # chỉ cần nếu Data3d có file shape khác 81x81 cần resize
-#                     # (không bắt buộc, có fallback pad/crop thủ công)
-# netCDF4             # CHỈ cần nếu bạn có file .nc thô (không phải .npy)
-#                     # -- hầu hết trường hợp KHÔNG cần
+# netCDF4             # chỉ cần nếu bạn có file .nc thô (không phải .npy)

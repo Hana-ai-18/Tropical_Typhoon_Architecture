@@ -1,82 +1,91 @@
-# MGTCF & Phys-Diff — Hướng dẫn cài đặt và chạy trên server
+# MGTCF & Phys-Diff — Hướng dẫn chạy trên server Linux (A100)
 
-Hướng dẫn này chỉ cho 2 baseline mới (**MGTCF** — multi-generator GAN,
-**Phys-Diff** — latent diffusion + PIGA). Nếu bạn cũng cần chạy 5 model
-kia (LSTM/GRU/RNN/ST-Trans/FM), quy trình cài đặt/dataset giống hệt bên
-dưới — chỉ khác script train cuối cùng.
+Hướng dẫn này dành cho 2 baseline mới (**MGTCF** — multi-generator GAN,
+**Phys-Diff** — latent diffusion + PIGA), chạy trên server Linux có GPU
+NVIDIA A100. Nếu bạn cũng cần chạy 5 model kia (LSTM/GRU/RNN/ST-Trans/FM),
+quy trình cài đặt/dataset giống hệt bên dưới — chỉ khác script train cuối.
 
 ---
 
 ## 1. Cài đặt môi trường
 
 ```bash
-# Tạo virtual environment (khuyến nghị, tránh xung đột với package hệ thống)
-python3 -m venv venv
-source venv/bin/activate          # Linux/macOS
-# venv\Scripts\activate           # nếu server là Windows
-
-# Cài thư viện
-pip install -r requirements.txt
+# Kiểm tra GPU/driver trước tiên
+nvidia-smi
 ```
+
+Cột `CUDA Version` trong output `nvidia-smi` là bản CUDA **cao nhất** driver
+hỗ trợ (không nhất thiết là bản bạn phải cài) — dùng nó để chọn đúng dòng
+`pip install torch` bên dưới.
+
+```bash
+# Tạo virtual environment (khuyến nghị, tránh xung đột package hệ thống)
+python3 -m venv venv
+source venv/bin/activate
+
+# Cài numpy trước
+pip install numpy>=1.23.0
+
+# Cài torch ĐÚNG bản CUDA của server (KHÔNG dùng "pip install torch" trần trụi
+# -- có thể cài nhầm bản CPU-only hoặc bản CUDA không khớp driver)
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Nếu nvidia-smi báo CUDA Version thấp hơn 12.1, đổi cu121 -> cu118:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+# Bảng tương thích đầy đủ: https://pytorch.org/get-started/locally/
+```
+
+**Kiểm tra GPU đã được nhận diện đúng:**
+
+```bash
+python3 -c "
+import torch
+print('CUDA available:', torch.cuda.is_available())
+print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')
+print('Compute capability:', torch.cuda.get_device_capability(0) if torch.cuda.is_available() else 'N/A')
+"
+```
+
+Kỳ vọng: `CUDA available: True`, `Device: NVIDIA A100...`, `Compute
+capability: (8, 0)`. Nếu `CUDA available: False`, quay lại bước cài torch —
+95% nguyên nhân là cài sai bản (CPU-only) hoặc driver server quá cũ so với
+bản CUDA vừa cài.
 
 **Yêu cầu Python ≥ 3.9** (code dùng cú pháp built-in generic `tuple[...]`,
 không chạy được trên Python 3.8 trở xuống — kiểm tra bằng `python3 --version`).
 
-### Nếu server có GPU NVIDIA
+### Tối ưu hiệu năng cho A100 (khuyến nghị, không bắt buộc)
 
-`requirements.txt` cài bản `torch` CPU-only mặc định qua PyPI. Để dùng GPU,
-cài đúng bản torch khớp driver CUDA của server (xem hướng dẫn chi tiết
-trong comment của `requirements.txt`):
+A100 (kiến trúc Ampere) hỗ trợ TF32 — chế độ tính toán nhanh hơn FP32 chuẩn
+đáng kể với độ chính xác gần như không đổi cho hầu hết workload deep
+learning. PyTorch ≥ 2.0 có thể tự động bật TF32 cho phép nhân ma trận, nhưng
+để chắc chắn, thêm 2 dòng sau vào đầu `train_mgtcf.py`/`train_physdiff.py`
+(hoặc set biến môi trường trước khi chạy):
 
 ```bash
-nvidia-smi                        # xem CUDA version server đang có
-# Ví dụ với CUDA 12.1:
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Cách nhanh nhất: set qua biến môi trường, không cần sửa code
+export NVIDIA_TF32_OVERRIDE=1
 ```
 
-Kiểm tra GPU đã nhận đúng chưa:
-
-```bash
-python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no GPU')"
+hoặc trong Python (nếu bạn tự thêm vào đầu script):
+```python
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 ```
 
 ---
 
 ## 2. Chuẩn bị dataset trên server
 
-Dataset gốc của bạn (`Dataset_TC.zip`) đang nằm **cục bộ trên máy Windows**
-(`C:\Users\Zenbook\Downloads\archive\Dataset_TC.zip`) — server **không thể
-tự tải** đường dẫn này, bạn cần tự upload lên server bằng 1 trong các cách
-sau.
-
-### Cách 1 — `scp` từ máy Windows (PowerShell/WSL) lên server
-
-```powershell
-scp C:\Users\Zenbook\Downloads\archive\Dataset_TC.zip user@your-server-ip:/home/user/
-```
-
-### Cách 2 — Upload qua giao diện web (Kaggle/Colab/Jupyter server)
-
-Dùng nút Upload của giao diện, hoặc kéo-thả file `.zip` vào file browser
-nếu server chạy Jupyter/Kaggle Notebook.
-
-### Cách 3 — Qua cloud storage trung gian (nếu server không có SSH trực tiếp)
-
-Upload `Dataset_TC.zip` lên Google Drive/Dropbox trước, lấy link chia sẻ,
-rồi trên server:
+Upload `Dataset_TC.zip` (hoặc dataset đã chuẩn bị) lên server bằng `scp`:
 
 ```bash
-# Ví dụ với gdown (Google Drive)
-pip install gdown
-gdown "<link-file-google-drive>" -O Dataset_TC.zip
-```
+# Từ máy local (Linux/macOS/WSL):
+scp /path/to/Dataset_TC.zip user@your-server-ip:/home/user/
 
-### Giải nén và kiểm tra cấu trúc
-
-```bash
+# Giải nén trên server
+ssh user@your-server-ip
 unzip Dataset_TC.zip -d Dataset_TC/
-cd Dataset_TC
-ls
+cd Dataset_TC && ls
 ```
 
 Cấu trúc **bắt buộc** để `--dataset_root` nhận diện đúng (script tự động
@@ -86,7 +95,7 @@ tìm thư mục chứa `Data1d/` — xem `_find_tcnd_root()` trong
 ```
 Dataset_TC/
 ├── Data1d/
-│   ├── train/     <- các file .txt track sau khi prepare_dataset.py chia
+│   ├── train/     <- file .txt track sau khi prepare_dataset.py chia
 │   ├── val/
 │   └── test/
 ├── Data3d/
@@ -95,10 +104,8 @@ Dataset_TC/
     └── <year>/<storm_name>/*.npy
 ```
 
-**Nếu dataset bạn tải về CHƯA được chia `train/val/test`** (chỉ có file
-`.txt` phẳng trong `Data1d/`), cần chạy `prepare_dataset.py` trước (xem
-lại hướng dẫn ở phần trước của dự án — file này không nằm trong phạm vi
-README này vì đã có sẵn từ trước):
+Nếu dataset chưa được chia `train/val/test`, chạy `prepare_dataset.py`
+trước (đã có sẵn từ trước, không thuộc phạm vi hướng dẫn này):
 
 ```bash
 python fix_discontinuity_and_sync.py --root Dataset_TC --apply
@@ -113,10 +120,6 @@ python prepare_dataset.py --root Dataset_TC \
 ---
 
 ## 3. Cấu trúc thư mục code trên server
-
-Đảm bảo cây thư mục sau khi giải nén code khớp đúng để `import Model.xxx`
-hoạt động (chạy script từ thư mục gốc project, không phải từ bên trong
-`Model/`):
 
 ```
 project_root/
@@ -141,8 +144,7 @@ project_root/
     └── Env_data/
 ```
 
-Nếu thiếu file `__init__.py` trong `Model/` hoặc `Model/data/`, tạo file
-rỗng:
+Nếu thiếu `__init__.py`, tạo file rỗng:
 
 ```bash
 touch Model/__init__.py Model/data/__init__.py
@@ -152,26 +154,37 @@ touch Model/__init__.py Model/data/__init__.py
 
 ## 4. Chạy train
 
-### 4.1. Test nhanh (1 epoch, kiểm tra pipeline chạy được trước khi train dài)
+### 4.1. Test nhanh (1 epoch, kiểm tra pipeline trước khi train dài)
 
 ```bash
 python train_mgtcf.py \
     --dataset_root Dataset_TC \
     --output_dir runs/mgtcf_test \
     --num_epochs 1 --val_freq 1 \
-    --batch_size 8 --gpu_num 0
+    --batch_size 32 --gpu_num 0
 
 python train_physdiff.py \
     --dataset_root Dataset_TC \
     --output_dir runs/physdiff_test \
-    --num_epochs 1 --val_freq 1 --n_sample_steps 10 \
-    --batch_size 8 --gpu_num 0
+    --num_epochs 1 --val_freq 1 \
+    --batch_size 32 --gpu_num 0
 ```
 
 Nếu cả 2 lệnh chạy hết 1 epoch không lỗi (in ra dòng `[VAL ep0] ADE=...`),
-pipeline đã đúng — có thể chạy train đầy đủ.
+pipeline đã đúng — có thể train đầy đủ.
 
-### 4.2. Train đầy đủ, 3 seed (giống 5 model kia)
+### 4.2. Tận dụng VRAM A100 — batch size lớn hơn T4
+
+A100 có 40GB hoặc 80GB VRAM (so với 16GB của T4) — có thể tăng
+`--batch_size` đáng kể so với cấu hình mặc định (90) nếu muốn tăng tốc độ
+train tổng thể. Thử tăng dần và theo dõi `nvidia-smi` (cột `Memory-Usage`)
+để tìm mức phù hợp:
+
+```bash
+watch -n 1 nvidia-smi   # chạy ở terminal khác trong lúc train để theo dõi VRAM
+```
+
+### 4.3. Train đầy đủ, 3 seed
 
 ```bash
 # MGTCF — 3 seed
@@ -195,17 +208,45 @@ python train_physdiff.py \
 done
 ```
 
-Chạy nền (không mất tiến trình nếu mất kết nối SSH), dùng `nohup` hoặc
-`tmux`/`screen`:
+Chạy nền bằng `tmux` (khuyến nghị — không mất tiến trình nếu mất SSH, dễ
+theo dõi log trực tiếp):
 
 ```bash
-# Cách 1: nohup
-nohup python train_mgtcf.py --dataset_root Dataset_TC --output_dir runs/mgtcf_seed0 --seed 0 --gpu_num 0 --test_at_end > log_mgtcf_seed0.txt 2>&1 &
+tmux new -s physdiff_train
+python train_physdiff.py --dataset_root Dataset_TC --output_dir runs/physdiff_seed0 --seed 0 --gpu_num 0 --test_at_end
+# Ctrl+B rồi D để detach, "tmux attach -t physdiff_train" để xem lại
+```
 
-# Cách 2: tmux (khuyến nghị — dễ theo dõi log trực tiếp, attach lại sau)
-tmux new -s mgtcf_train
-python train_mgtcf.py --dataset_root Dataset_TC --output_dir runs/mgtcf_seed0 --seed 0 --gpu_num 0 --test_at_end
-# Ctrl+B rồi D để detach, "tmux attach -t mgtcf_train" để xem lại
+hoặc `nohup`:
+
+```bash
+nohup python train_mgtcf.py --dataset_root Dataset_TC --output_dir runs/mgtcf_seed0 --seed 0 --gpu_num 0 --test_at_end > log_mgtcf_seed0.txt 2>&1 &
+```
+
+### 4.4. Phys-Diff — lưu ý riêng về tốc độ reverse sampling
+
+Phys-Diff (DDPM) khác các baseline khác: mỗi lần đánh giá (`sample()`)
+phải chạy **đủ `T_diffusion=1000` bước liên tiếp** (đúng công thức paper,
+không hỗ trợ rút gọn bước kiểu DDIM — xem chi tiết trong docstring
+`_ddpm_reverse_sample()` trong `Model/physdiff_model.py`). Điều này khiến
+`sample()` chậm hơn hẳn so với các baseline khác dù đã tối ưu cache
+(`ConditionalEncoder.encode_static()` — tính phần không đổi theo `t` đúng
+1 lần thay vì lặp lại 1000 lần).
+
+- `--val_freq` mặc định đã tăng lên 25 (thay vì 10 như baseline khác) và
+  `--val_subset` giảm còn 100 để hạn chế tần suất/khối lượng đánh giá tốn
+  thời gian trong lúc train.
+- Nếu muốn theo dõi xu hướng hội tụ sát hơn (khuyến nghị vì DDPM có thể
+  cần nhiều epoch hơn để `denoiser` học tốt ở mọi mức nhiễu), có thể giảm
+  `--val_freq` xuống 10 và tăng `--patience`/`--num_epochs` để không dừng
+  sớm trước khi thấy xu hướng thật:
+
+```bash
+python train_physdiff.py \
+    --dataset_root Dataset_TC \
+    --output_dir runs/physdiff_seed0 \
+    --val_freq 10 --patience 300 --num_epochs 1200 \
+    --seed 0 --gpu_num 0 --test_at_end
 ```
 
 ---
@@ -240,8 +281,9 @@ so sánh (`eval_multi/*.png`), sẵn sàng đưa vào paper.
 
 | Lỗi | Nguyên nhân | Cách sửa |
 |---|---|---|
+| `torch.cuda.is_available()` trả về `False` | Cài nhầm bản torch CPU-only, hoặc driver server không đủ mới cho bản CUDA vừa cài | Xem lại mục 1 — chạy `nvidia-smi` trước, chọn đúng `cu1xx` theo CUDA Version hiển thị |
 | `ModuleNotFoundError: No module named 'Model'` | Chạy script không đúng từ `project_root/` | `cd` về đúng thư mục gốc trước khi chạy `python train_mgtcf.py` |
-| `RuntimeError: CUDA out of memory` | `--batch_size` quá lớn so với GPU | Giảm `--batch_size` (thử 32/16/8), hoặc thêm `--gpu_num` đúng GPU còn trống nếu server nhiều GPU |
-| `FileNotFoundError` liên quan `Data1d`/`Data3d` | `--dataset_root` trỏ sai, hoặc dataset chưa giải nén đúng cấu trúc | Kiểm tra lại mục 2, đảm bảo `Data1d/train`, `Data1d/val`, `Data1d/test` tồn tại |
-| Training rất chậm dù có GPU | `torch` cài bản CPU-only dù server có GPU | Kiểm tra lại mục 1 — cài đúng bản torch có CUDA |
-| `assert model_type in MODEL_TYPES` khi eval | Gõ nhầm `--model_type` hoặc thiếu `mgtcf`/`physdiff` trong `evaluate_full.py`'s `MODEL_TYPES` | Đảm bảo dùng đúng bản `evaluate_full.py` đã cập nhật hỗ trợ 7 kiến trúc |
+| `RuntimeError: CUDA out of memory` | `--batch_size` quá lớn dù A100 có nhiều VRAM (thường không xảy ra với batch mặc định 90, nhưng có thể nếu tăng quá cao ở mục 4.2) | Giảm `--batch_size`, theo dõi `nvidia-smi` |
+| `FileNotFoundError` liên quan `Data1d`/`Data3d` | `--dataset_root` trỏ sai, hoặc dataset chưa giải nén đúng cấu trúc | Kiểm tra lại mục 2 |
+| Phys-Diff `sample()`/validate rất chậm dù chạy A100 | Đây là đặc điểm cố hữu của DDPM full-chain sampling (1000 bước liên tiếp theo đúng công thức paper), không phải lỗi | Đã tối ưu cache `ConditionalEncoder` (giảm ~10x so với bản chưa tối ưu) — nếu vẫn cần nhanh hơn nữa, cân nhắc giảm `--val_freq` cho ít lần đánh giá hơn trong lúc train, chỉ đánh giá đầy đủ ở `--test_at_end` |
+| `assert model_type in MODEL_TYPES` khi eval | Gõ nhầm `--model_type`, hoặc dùng bản `evaluate_full.py` cũ chưa hỗ trợ `mgtcf`/`physdiff` | Đảm bảo dùng đúng bản `evaluate_full.py`/`evaluate_multi_model.py` đã cập nhật hỗ trợ 7 kiến trúc |

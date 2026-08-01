@@ -569,7 +569,7 @@ def get_args():
     p.add_argument("--lr_enc_peak",            default=5e-5,   type=float)
     # Eval
     p.add_argument("--val_freq",               default=5,      type=int)
-    p.add_argument("--patience",               default=20,     type=int)
+    p.add_argument("--patience",               default=40,     type=int)
     p.add_argument("--min_ep",                 default=20,     type=int)
     p.add_argument("--hard_val_threshold",     default=0.35,   type=float)
     p.add_argument("--hard_val_freq",          default=10,     type=int)

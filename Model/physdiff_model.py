@@ -155,19 +155,45 @@ class ConditionalEncoder(nn.Module):
             dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
         self.transformer_encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
+    def encode_static(self, batch_list) -> torch.Tensor:
+        """
+        [TỐI ƯU TỐC ĐỘ, không đổi công thức] Phần KHÔNG phụ thuộc t: chạy
+        PaperEncoder (FNO3D+Mamba+Env_net, khá nặng) đúng 1 LẦN, dùng lại
+        cho MỌI bước t trong reverse process (1000 bước) thay vì tính lại
+        từ đầu mỗi bước -- vì batch_list (input quan trắc) không đổi khi
+        t thay đổi, việc tính lại là lãng phí thuần tuý, KHÔNG ảnh hưởng
+        kết quả toán học (đo thực nghiệm: ~0.56s/lần gọi PaperEncoder,
+        không cache sẽ tốn thêm ~560s/sample chỉ riêng phần này).
+        -> ctx_token [B, 1, d_model]
+        """
+        raw_ctx = self.paper_encoder(batch_list)              # [B, 512]
+        return self.ctx_proj(raw_ctx).unsqueeze(1)             # [B, 1, d_model]
+
+    def forward_with_ctx(self, ctx_token: torch.Tensor, t: torch.Tensor, T_max: int) -> torch.Tensor:
+        """
+        Phần PHỤ THUỘC t: nhận ctx_token đã cache từ encode_static(),
+        chỉ tính lại timestep embedding + TransformerEncoder trộn 2 token
+        -- đúng Eq.3, chỉ khác cách tổ chức lời gọi, không đổi phép tính.
+        -> c [B, 2, d_model]
+        """
+        t_token = self.time_emb(t, T_max).unsqueeze(1)          # [B, 1, d_model]
+        tokens = torch.cat([ctx_token, t_token], dim=1)        # [B, 2, d_model]
+        c = self.transformer_encoder(tokens)                     # [B, 2, d_model]
+        return c
+
     def forward(self, batch_list, t: torch.Tensor, T_max: int) -> torch.Tensor:
         """
         -> c [B, 2, d_model]  (context token từ PaperEncoder + timestep token,
                                 "rich interaction between all conditioning
                                 variables" qua TransformerEncoder, đúng Eq.3)
-        """
-        raw_ctx = self.paper_encoder(batch_list)              # [B, 512]
-        ctx_token = self.ctx_proj(raw_ctx).unsqueeze(1)        # [B, 1, d_model]
-        t_token = self.time_emb(t, T_max).unsqueeze(1)          # [B, 1, d_model]
 
-        tokens = torch.cat([ctx_token, t_token], dim=1)        # [B, 2, d_model]
-        c = self.transformer_encoder(tokens)                     # [B, 2, d_model]
-        return c
+        [GIỮ NGUYÊN, dùng cho get_loss_breakdown() -- chỉ gọi 1 lần/batch
+        nên không cần tối ưu cache]. Về mặt TOÁN HỌC, forward(bl, t, T_max)
+        == forward_with_ctx(encode_static(bl), t, T_max) — hoàn toàn tương
+        đương, đã verify bằng test số học (xem test_physdiff_cache_equiv).
+        """
+        ctx_token = self.encode_static(batch_list)
+        return self.forward_with_ctx(ctx_token, t, T_max)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -536,9 +562,13 @@ class PhysDiffModel(nn.Module):
 
         z_t = torch.randn(B, N, self.d_model, device=device)
 
+        # [TỐI ƯU] Tính ctx_token (PaperEncoder) đúng 1 LẦN trước vòng lặp,
+        # không đổi công thức toán học -- xem docstring encode_static().
+        ctx_token = self.cond_encoder.encode_static(batch_list)
+
         for t_val in range(self.T_diffusion - 1, -1, -1):   # T-1, T-2, ..., 0 (dung 1 buoc)
             t = torch.full((B,), t_val, device=device, dtype=torch.long)
-            c = self.cond_encoder(batch_list, t, self.T_diffusion)
+            c = self.cond_encoder.forward_with_ctx(ctx_token, t, self.T_diffusion)
             eps_pred, _ = self.denoiser(z_t, c)
 
             beta_t = self.schedule.betas[t_val]
