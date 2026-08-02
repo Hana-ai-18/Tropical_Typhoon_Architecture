@@ -201,7 +201,20 @@ def get_args():
     p.add_argument("--diffusion_loss_weight",  default=1.0, type=float)
 
     # Training infra (epoch framework matching the other three baselines)
-    p.add_argument("--num_epochs",   default=1200,       type=int)
+    p.add_argument("--num_epochs",   default=150,        type=int,
+                   help="Original repo's own default (30) was tuned for a "
+                        "much larger ERA5/FengWu dataset; this project's "
+                        "dataset converges much faster (observed: val_loss "
+                        "bottoms out around epoch 7-10, then overfits). 150 "
+                        "gives headroom while keeping CosineAnnealingLR's "
+                        "T_max=num_epochs meaningful (with T_max=1200, LR "
+                        "barely decayed at all within the first 50 epochs "
+                        "this project actually needs -- observed lr=9.96e-05 "
+                        "at epoch 49 vs. lr=1.00e-04 at epoch 0, effectively "
+                        "flat). Increase if your dataset/architecture combo "
+                        "needs longer training; this is a hyperparameter "
+                        "tuned to this dataset's convergence speed, not a "
+                        "change to the DDPM/PIGA algorithm itself.")
     p.add_argument("--batch_size",   default=90,         type=int,
                    help="Original Phys-Diff repo uses batch_size=64 (config.yaml "
                         "training.batch_size), tuned for its own ERA5/FengWu "
@@ -214,7 +227,23 @@ def get_args():
     p.add_argument("--grad_clip",    default=0.1,        type=float,
                    help="Matches configs/config.yaml training.gradient_clip=0.1 "
                         "(the original repo clips very aggressively).")
-    p.add_argument("--patience",     default=100,        type=int)
+    p.add_argument("--patience",     default=30,         type=int,
+                   help="With val_freq=5, patience=30 tolerates 6 "
+                        "consecutive non-improving validations (~30 epochs) "
+                        "before stopping -- enough to ride out normal noise "
+                        "but short enough to not waste most of the training "
+                        "budget once the model has clearly started "
+                        "overfitting (observed in this project's logs: ADE "
+                        "degrades steadily and monotonically from epoch ~7 "
+                        "onward with no recovery within 40+ subsequent "
+                        "epochs). Note the original repo's own early-stopping "
+                        "default is patience=2 (configs/config.yaml "
+                        "training.early_stopping.patience), tuned for its "
+                        "own num_epochs=30 -- proportionally even stricter "
+                        "than this. 30 here is deliberately more lenient to "
+                        "account for this project's much noisier per-batch "
+                        "environment (small batch_size=90, complex "
+                        "multi-modal encoder) and val_freq=5 stride.")
     p.add_argument("--min_epochs",   default=50,         type=int)
     p.add_argument("--lr_min",       default=1e-5,       type=float,
                    help="Matches configs/config.yaml training.min_lr=0.00001. "
