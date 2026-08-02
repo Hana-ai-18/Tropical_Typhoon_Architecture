@@ -469,7 +469,61 @@ class DDPMScheduler:
         logvar = self._extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return mean, var, logvar
 
-    def p_mean_variance(self, model, x_t, t, context):
+    def p_mean_variance_jump(self, model, x_t: torch.Tensor, t: torch.Tensor,
+                             t_prev: torch.Tensor, context: torch.Tensor,
+                             eta: float = 0.0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """DDIM-style reverse step from timestep t directly to t_prev
+        (t_prev may be many steps earlier than t-1), unlike p_mean_variance/
+        p_sample which are only valid for ADJACENT steps t -> t-1 (they use
+        `posterior_mean_coef1/2` and `posterior_variance`, precomputed in
+        DDPMScheduler.__init__ specifically for alphas_cumprod_prev = the
+        IMMEDIATELY PRECEDING step). Calling p_sample repeatedly at widely
+        spaced timesteps (as an earlier, INCORRECT version of this file
+        did) silently computes the wrong posterior at every step, since it
+        implicitly assumes t_prev = t-1 even when the loop actually jumps
+        by `stride` > 1 -- this produces compounding, increasingly wrong
+        samples exactly as observed (ADE degrading over training instead
+        of improving). This method implements the correct DDIM update
+        (Song et al. 2021, eq. 12) which is valid for ANY t_prev < t:
+            x0_pred   = (x_t - sqrt(1-abar_t) * eps) / sqrt(abar_t)
+            sigma_t   = eta * sqrt((1-abar_prev)/(1-abar_t)) * sqrt(1-abar_t/abar_prev)
+            x_prev    = sqrt(abar_prev) * x0_pred
+                      + sqrt(1 - abar_prev - sigma_t^2) * eps
+                      + sigma_t * noise
+        With eta=0 (default here) this is deterministic DDIM; eta=1
+        recovers the original DDPM posterior when t_prev == t-1.
+        """
+        predicted_noise = model(x_t, t, context)
+        if torch.isnan(predicted_noise).any() or torch.isinf(predicted_noise).any():
+            predicted_noise = torch.zeros_like(predicted_noise)
+        predicted_noise = torch.clamp(predicted_noise, min=-10.0, max=10.0)
+
+        abar_t    = self._extract(self.alphas_cumprod, t, x_t.shape)
+        abar_prev = self._extract(self.alphas_cumprod, t_prev, x_t.shape)
+
+        sqrt_abar_t = torch.clamp(abar_t, min=1e-8).sqrt()
+        x0_pred = (x_t - (1 - abar_t).clamp(min=1e-8).sqrt() * predicted_noise) / sqrt_abar_t
+        x0_pred = torch.clamp(x0_pred, min=-10.0, max=10.0)
+
+        sigma_t = eta * torch.sqrt(
+            torch.clamp((1 - abar_prev) / (1 - abar_t).clamp(min=1e-8), min=0.0)
+        ) * torch.sqrt(torch.clamp(1 - abar_t / abar_prev.clamp(min=1e-8), min=0.0))
+
+        dir_coeff = torch.clamp(1 - abar_prev - sigma_t ** 2, min=0.0).sqrt()
+        mean = abar_prev.clamp(min=0.0).sqrt() * x0_pred + dir_coeff * predicted_noise
+        return mean, sigma_t
+
+    def p_sample(self, model, x_t: torch.Tensor, t: torch.Tensor, context: torch.Tensor):
+        """Single ADJACENT-step DDPM reverse sample (t -> t-1 only). Kept
+        verbatim to the original repo for training-time use / full
+        num_timesteps sampling; do NOT call this at non-adjacent (strided)
+        timesteps -- use sample_strided (DDIM jump formula) instead."""
+        mean, var = self.p_mean_variance(model, x_t, t, context)
+        noise = torch.randn_like(x_t)
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1)))
+        return mean + nonzero_mask * torch.sqrt(var) * noise
+
+    def p_mean_variance(self, model, x_t: torch.Tensor, t: torch.Tensor, context: torch.Tensor):
         predicted_noise = model(x_t, t, context)
         if torch.isnan(predicted_noise).any() or torch.isinf(predicted_noise).any():
             predicted_noise = torch.zeros_like(predicted_noise)
@@ -482,14 +536,21 @@ class DDPMScheduler:
         mean, var, _ = self.q_posterior_mean_variance(pred_x_start, x_t, t)
         return mean, var
 
-    def p_sample(self, model, x_t, t, context):
-        mean, var = self.p_mean_variance(model, x_t, t, context)
-        noise = torch.randn_like(x_t)
-        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1)))
-        return mean + nonzero_mask * torch.sqrt(var) * noise
-
     def training_losses(self, model, x_start, t, context) -> torch.Tensor:
+        """Faithful to models/ddpm.py DDPMScheduler.training_losses(),
+        including its NaN/Inf input guards. Note: in this project, the
+        actual conditioning context is captured inside `model` via a
+        closure (see PhysDiff._denoiser_fn), so the `context` PARAMETER
+        here is unused/None by design -- the original repo's `isfinite(context)`
+        guard is therefore not applicable to the parameter itself; the
+        equivalent protection is that `model(x_t, t, context)` below will
+        surface any NaN/Inf produced by a bad context through the
+        predicted_noise NaN/Inf check that follows, which is caught."""
+        if not torch.isfinite(x_start).all():
+            return torch.tensor(1000.0, device=x_start.device, requires_grad=True)
+
         noise = torch.randn_like(x_start)
+        noise = torch.clamp(noise, min=-5.0, max=5.0)
         x_t = self.q_sample(x_start, t, noise)
 
         if not torch.isfinite(x_t).all():
@@ -513,25 +574,43 @@ class DDPMScheduler:
 
     @torch.no_grad()
     def sample_strided(self, model, shape: Tuple, context: torch.Tensor,
-                       device: torch.device, num_steps: int) -> torch.Tensor:
-        """DDIM-style respaced sampling: reuses the same trained
-        epsilon-prediction network and posterior formulas as p_sample, but
-        only visits `num_steps` (<= num_timesteps) evenly-spaced timesteps.
-        This is a standard technique (Song et al. 2021) and does not alter
-        what was trained -- only how many reverse steps run at eval time,
-        which is essential to keep per-epoch validation affordable.
+                       device: torch.device, num_steps: int, eta: float = 0.0) -> torch.Tensor:
+        """DDIM-style respaced sampling (Song et al. 2021): reuses the same
+        trained epsilon-prediction network, but jumps directly between
+        `num_steps` evenly-spaced timesteps using the correct DDIM update
+        formula for non-adjacent steps (see p_mean_variance_jump). This is
+        NOT the same as calling the adjacent-step p_sample repeatedly at
+        strided timesteps (an earlier, incorrect version of this file did
+        that, which silently used the wrong posterior variance/mean at
+        every step and produced samples that got WORSE as the denoiser
+        became more confident during training).
+
+        With eta=0 (default) this is deterministic DDIM. Training is
+        unaffected -- this only changes how many/which reverse steps are
+        used at eval/inference time.
         """
         batch_size = shape[0]
         num_steps = min(num_steps, self.num_timesteps)
-        # evenly spaced indices from num_timesteps-1 down to 0
-        step_indices = torch.linspace(0, self.num_timesteps - 1, num_steps,
+        step_indices = torch.linspace(0, self.num_timesteps, num_steps + 1,
                                       device=device).long()
-        step_indices = torch.unique(step_indices, sorted=True)
+        step_indices = torch.unique(step_indices, sorted=True).tolist()
+        # step_indices e.g. [0, k, 2k, ..., num_timesteps]; we walk it in
+        # reverse as consecutive (t_prev, t) pairs.
+        if step_indices[0] != 0:
+            step_indices = [0] + step_indices
 
         img = torch.randn(shape, device=device)
-        for i in reversed(step_indices.tolist()):
-            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            img = self.p_sample(model, img, t, context)
+        for i in range(len(step_indices) - 1, 0, -1):
+            t_val = step_indices[i]
+            t_prev_val = step_indices[i - 1]
+            t = torch.full((batch_size,), t_val, device=device, dtype=torch.long)
+            t_prev = torch.full((batch_size,), t_prev_val, device=device, dtype=torch.long)
+            mean, sigma = self.p_mean_variance_jump(model, img, t, t_prev, context, eta=eta)
+            if t_prev_val > 0 and eta > 0:
+                noise = torch.randn_like(img)
+                img = mean + sigma * noise
+            else:
+                img = mean
         return img
 
 
@@ -708,9 +787,22 @@ class PhysDiff(nn.Module):
                  + self.coord_loss_weight * coord_loss)
 
         with torch.no_grad():
+            # ⚠ IMPORTANT: this ADE/ATE/CTE is computed by decoding z_0
+            # (encoded directly from GROUND TRUTH coordinates via
+            # future_encoder), NOT by running the diffusion reverse process.
+            # It only measures how well future_encoder/output_decoder can
+            # round-trip coordinates -- it is NOT a measure of the model's
+            # actual generative/sampling quality. It will look artificially
+            # good and should NOT be used to judge model performance or for
+            # early-stopping. The authoritative ADE/ATE/CTE (via real DDIM
+            # sampling) is only produced by evaluate()/model.sample() in the
+            # train script, which is what best_ade/early-stopping/CSV rows
+            # for "split=val" ADE_km actually use.
             pred_tf = pred_coords_bf.permute(1, 0, 2)          # (T_pred, B, 2) time-major
             ade_m = compute_ade_per_horizon(pred_tf.detach(), gt_coords)
             atc_m = compute_ate_cte_per_horizon(pred_tf.detach(), gt_coords)
+            ade_m = {f"autoencode_only_{k}": v for k, v in ade_m.items()}
+            atc_m = {f"autoencode_only_{k}": v for k, v in atc_m.items()}
 
         out = dict(total=total, diffusion_loss=diffusion_loss.item(),
                    coord_loss=coord_loss.item())

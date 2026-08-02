@@ -269,8 +269,17 @@ class DiffusionTraj(nn.Module):
 
         e_theta = self.net(c0 * x_0 + c1 * e_rand, beta=beta, context=context)
 
-        # Faithful per-step weighting from the original repo: first
-        # predicted step upweighted by `first_add=1.3`.
+        # Per-step weighting, generalized from the original repo's pattern.
+        # IMPORTANT: the original models/diffusion.py only defines `Wt`
+        # explicitly for T in {1, 2, 3, 4} (via if/elif branches on the
+        # ORIGINAL repo's much shorter prediction horizon); for T=12 (this
+        # project's pred_len) none of those branches match and the
+        # original code would raise NameError (Wt undefined). Every
+        # explicitly-defined branch follows the SAME pattern -- first step
+        # weighted by `first_add=1.3`, every other step weighted 1.0 -- so
+        # `Wt = [first_add] + [1.0]*(T-1)` is the unique natural extension
+        # of that documented pattern to arbitrary T, not an invented
+        # alternative weighting scheme.
         first_add = 1.3
         Wt = [first_add] + [1.0] * (T - 1)
 
@@ -298,7 +307,38 @@ class DiffusionTraj(nn.Module):
         sampling: str = "ddpm",
         step: int = 1,
     ) -> torch.Tensor:
-        """Returns (sample, B, num_points, point_dim) velocity samples."""
+        """Returns (sample, B, num_points, point_dim) velocity samples.
+
+        ⚠ IMPORTANT constraint on `step` (verbatim from the original repo's
+        models/diffusion.py DiffusionTraj.sample): the 'ddpm' branch formula
+        `x_next = c0*(x_t - c1*e_theta) + sigma*z` uses `alpha`/`alpha_bar`
+        of the CURRENT t only (not a ratio between t and t-step), so it is
+        mathematically valid ONLY when:
+          - step == 1 (full adjacent-step reverse loop), or
+          - step == self.var_sched.num_steps (one-shot: single denoising
+            step directly from pure noise to t=0 -- this is what the
+            original repo's own AutoEncoder.generate() uses by default,
+            `step=100` with `num_steps=100`).
+        Any intermediate step value (e.g. step=5 with num_steps=100) will
+        silently use the wrong alpha/alpha_bar at each jump and produce
+        samples that get WORSE, not better, as the denoiser is trained
+        further -- this was a real bug found in an earlier version of this
+        file's training script default. The 'ddim' branch (sampling="ddim")
+        IS valid for arbitrary strides since it explicitly uses both
+        alpha_bar and alpha_bar_next.
+        """
+        if sampling == "ddpm" and step not in (1, self.var_sched.num_steps):
+            import warnings
+            warnings.warn(
+                f"DiffusionTraj.sample called with sampling='ddpm' and "
+                f"step={step}, but num_steps={self.var_sched.num_steps}. "
+                f"The 'ddpm' branch is only valid for step=1 (full reverse "
+                f"loop) or step=num_steps (one-shot). An intermediate "
+                f"stride will silently produce mathematically incorrect "
+                f"samples. Use sampling='ddim' for arbitrary strides, or "
+                f"set step=1 or step={self.var_sched.num_steps}.",
+                RuntimeWarning,
+            )
         device = context.device
         traj_list = []
         for _ in range(sample):
@@ -382,7 +422,7 @@ class TCDiffuser(nn.Module):
         var_mode: str = "linear",
         dt: float = 1.0,
         best_k: int = 6,
-        sample_steps_stride: int = 5,
+        sample_steps_stride: int = 100,  # must be 1 or num_steps -- see DiffusionTraj.sample docstring
     ):
         super().__init__()
         self.obs_len = obs_len

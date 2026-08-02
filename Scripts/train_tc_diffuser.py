@@ -201,10 +201,24 @@ def get_args():
                    help="Best-of-k sampling for evaluation, matches "
                         "original repo's tc_diffuser.py train() which uses "
                         "sample=6, bestof=True.")
-    p.add_argument("--sample_steps_stride", default=5, type=int,
-                   help="Stride for the DDPM reverse loop (step= in the "
-                        "original sample()); higher = faster but coarser "
-                        "sampling. 1 = full num_steps reverse steps.")
+    p.add_argument("--sample_steps_stride", default=100, type=int,
+                   help="IMPORTANT: matches the original repo's own default "
+                        "(AutoEncoder.generate(..., step=100) in "
+                        "models/autoencoder.py, with num_steps=100). With "
+                        "stride == num_steps, the reverse loop runs exactly "
+                        "ONCE (one-shot denoising directly from pure noise "
+                        "to t=0), which is what the original repo's own "
+                        "training-time evaluation actually does -- it is "
+                        "NOT a full 100-step reverse diffusion. This is "
+                        "faithful to the original and also the fastest "
+                        "option. Do NOT set this to an intermediate value "
+                        "(e.g. 5): the 'ddpm' branch formula in "
+                        "DiffusionTraj.sample (c0*(x_t-c1*e_theta)+sigma*z) "
+                        "is only mathematically valid for adjacent steps "
+                        "(stride=1, full reverse loop) or this one-shot "
+                        "case (stride=num_steps) -- intermediate strides "
+                        "silently use the wrong alpha/alpha_bar and produce "
+                        "increasingly wrong samples as training progresses.")
 
     # Training infra (epoch framework matching the other three baselines)
     p.add_argument("--num_epochs",   default=1200,       type=int)

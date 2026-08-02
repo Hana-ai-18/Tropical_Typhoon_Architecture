@@ -312,23 +312,40 @@ class MMSTNGenerator(nn.Module):
         last_pos = obs_traj[-1]           # (B, 2) abs
         last_pos_rel = obs_traj_rel[-1]   # (B, 2) rel
 
+        # Faithful to mmstn/models.py TrajectoryGenerator.forward(), which
+        # calls `self.decoder(obs_traj[1:], obs_traj_rel[1:], ...)` --
+        # i.e. it drops the FIRST observed point before passing obs_traj_rel
+        # into the Decoder (whose forward() then uses it, unchanged, as the
+        # fixed base for the re-encode step below).
+        obs_traj_rel_for_decoder = obs_traj_rel[1:]   # (obs_len-1, B, 2)
+
         decoder_input = self.spatial_embedding(last_pos_rel).view(1, B, self.embedding_dim)
 
         preds_rel = []
-        obs_traj_rel_running = obs_traj_rel  # will grow each step, faithful to original
 
         for _ in range(self.pred_len):
             out, state = self.decoder_lstm(decoder_input, state)
             rel_pos = self.hidden2pos(out.view(-1, self.decoder_h_dim))  # (B, 2)
             curr_pos = rel_pos + last_pos
 
-            # --- faithful re-encode step (mmstn Decoder.forward lines 171-176):
-            # append the newly predicted rel step, then re-run a fresh LSTM
-            # encode over the WHOLE growing relative trajectory, and use its
-            # final hidden state as the new decoder state. ---
+            # --- faithful re-encode step (mmstn Decoder.forward):
+            # obs_traj_rel_new = cat([obs_traj_rel, rel_pos], dim=0)
+            # In the ORIGINAL repo, `obs_traj_rel` on the right-hand side is
+            # the FIXED obs_traj_rel[1:] passed in from TrajectoryGenerator
+            # -- the line that would reassign it inside Decoder.forward
+            # (`obs_traj_rel = obs_traj_rel_new[1:]`) is commented out
+            # (dead code) in mmstn/models.py. So at EVERY decode step, the
+            # re-encoder sees [obs_len-1 original steps ; only the CURRENT
+            # step's predicted rel_pos] -- a constant-length (obs_len)
+            # window that always drops all previously predicted steps
+            # except the newest one. This looks like an unfinished feature
+            # in the original code, but it is the actual behavior that
+            # runs, so we reproduce it exactly rather than "fixing" it into
+            # a growing-history accumulation (which an earlier version of
+            # this file incorrectly did). ---
             rel_pos_t = rel_pos.unsqueeze(0)                       # (1, B, 2)
-            obs_traj_rel_running = torch.cat([obs_traj_rel_running, rel_pos_t], dim=0)
-            h_n, c_n = self.encoders(obs_traj_rel_running)
+            obs_traj_rel_new = torch.cat([obs_traj_rel_for_decoder, rel_pos_t], dim=0)  # (obs_len, B, 2)
+            h_n, c_n = self.encoders(obs_traj_rel_new)
             state = (h_n, c_n)
 
             decoder_input = self.spatial_embedding(rel_pos_t.view(1, B, 2))
@@ -456,6 +473,15 @@ class MMSTN(nn.Module):
         """Mirrors mmstn train.py::discriminator_step (data_loss only;
         the (dead, commented-out in the original) triplet-loss branch is
         correctly omitted, as it is in the official code path).
+
+        Note: the original repo's `discriminator_step` calls `generator(...)`
+        WITHOUT wrapping it in `torch.no_grad()`, but since `optimizer_d`
+        never includes `generator.parameters()`, any gradient that would
+        flow back into the generator is computed but never applied --
+        mathematically inert. Wrapping the generator call in `torch.no_grad()`
+        here is a pure memory-saving optimization with an IDENTICAL result
+        (same discriminator loss value, same discriminator gradients), not a
+        behavioral deviation from the original.
         """
         obs_traj = batch_list[0]
         obs_traj_rel = batch_list[2]
