@@ -29,7 +29,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.Mmstn_model import MMSTN
+from Model.mmstn_model import MMSTN
 from Model.paper_baseline_model import (
     haversine_km, _norm_to_deg, _ate_cte_tensors,
     HORIZON_STEPS,
@@ -397,12 +397,15 @@ def main(args):
                 g_steps_left = args.g_steps
 
             if i % 30 == 0:
-                dpe_now = last_g_losses.get("ADE", float("nan"))
+                dpe_now = last_g_losses.get("ADE", None)
+                d_val = last_d_losses.get("D_data_loss", None)
+                g_l2  = last_g_losses.get("G_l2_loss_rel", None)
+                g_adv = last_g_losses.get("G_discriminator_loss", None)
                 print(f"  [{epoch:>4}][{i:>3}/{len(train_loader)}]"
-                      f"  D_loss={last_d_losses.get('D_data_loss', float('nan')):.4f}"
-                      f"  G_l2={last_g_losses.get('G_l2_loss_rel', float('nan')):.4f}"
-                      f"  G_adv={last_g_losses.get('G_discriminator_loss', float('nan')):.4f}"
-                      f"  ADE~{dpe_now:.1f}km")
+                      f"  D_loss={'n/a (G-step)' if d_val is None else f'{d_val:.4f}'}"
+                      f"  G_l2={'n/a (D-step)' if g_l2 is None else f'{g_l2:.4f}'}"
+                      f"  G_adv={'n/a (D-step)' if g_adv is None else f'{g_adv:.4f}'}"
+                      f"  ADE~{'n/a' if dpe_now is None else f'{dpe_now:.1f}km'}")
 
         avg_g = sum_g_loss / max(n_g_steps, 1)
         avg_d = sum_d_loss / max(n_d_steps, 1)

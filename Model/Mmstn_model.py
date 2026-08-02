@@ -101,19 +101,30 @@ def gan_d_loss(scores_real: torch.Tensor, scores_fake: torch.Tensor) -> torch.Te
 def l2_loss_masked(
     pred_traj: torch.Tensor,      # (seq_len, batch, 2)
     pred_traj_gt: torch.Tensor,   # (seq_len, batch, 2)
-    loss_mask: torch.Tensor,      # (batch, seq_len)
+    loss_mask: torch.Tensor,      # (seq_len, batch) -- NOTE: this project's
+                                   # seq_collate (Model/data/trajectoriesWithMe_
+                                   # unet_training.py) produces mask_out with
+                                   # shape (seq_len, batch), NOT (batch, seq_len)
+                                   # as in the original MMSTN repo's own
+                                   # dataset/collate. Semantics of l2_loss()
+                                   # are otherwise preserved exactly (same
+                                   # masked-MSE formula), just indexed on the
+                                   # axis order this project's data actually
+                                   # uses.
     mode: str = "raw",
 ) -> torch.Tensor:
-    """Verbatim semantics from mmstn/losses.py l2_loss()."""
+    """Faithful to mmstn/losses.py l2_loss(), adapted for this project's
+    (seq_len, batch) mask orientation instead of MMSTN's own (batch, seq_len)."""
     seq_len, batch, _ = pred_traj.size()
     loss = (loss_mask.unsqueeze(dim=2) *
-            (pred_traj_gt.permute(1, 0, 2) - pred_traj.permute(1, 0, 2)) ** 2)
+            (pred_traj_gt - pred_traj) ** 2)       # (seq_len, batch, 2)
     if mode == "sum":
         return torch.sum(loss)
     elif mode == "average":
         return torch.sum(loss) / torch.numel(loss_mask.data)
     elif mode == "raw":
-        return loss.sum(dim=2).sum(dim=1)
+        # per-sample scalar: sum over point-dim and time -> (batch,)
+        return loss.sum(dim=2).sum(dim=0)
     raise ValueError(mode)
 
 
@@ -472,8 +483,11 @@ class MMSTN(nn.Module):
         obs_traj_rel = batch_list[2]
         pred_traj_gt = batch_list[1]
         pred_traj_gt_rel = batch_list[3]
-        loss_mask_full = batch_list[5]          # (B, obs_len+pred_len)
-        loss_mask = loss_mask_full[:, self.obs_len:]  # (B, pred_len)
+        loss_mask_full = batch_list[5]          # (obs_len+pred_len, B) -- see
+                                                   # l2_loss_masked docstring for
+                                                   # why this axis order, not
+                                                   # MMSTN's original (B, seq_len).
+        loss_mask = loss_mask_full[self.obs_len:, :]  # (pred_len, B)
 
         B = obs_traj.shape[1]
         g_l2_loss_rel: List[torch.Tensor] = []
@@ -498,7 +512,7 @@ class MMSTN(nn.Module):
             # per-sample min, which is the correct specialization).
             stacked = torch.stack(g_l2_loss_rel, dim=1)              # (B, best_k)
             per_sample_min = torch.min(stacked, dim=1).values        # (B,)
-            denom = loss_mask.sum(dim=1).clamp(min=1e-6)             # (B,)
+            denom = loss_mask.sum(dim=0).clamp(min=1e-6)             # (B,) -- sum over time axis
             g_l2_loss_sum_rel = (per_sample_min / denom).sum()
             loss = loss + g_l2_loss_sum_rel
 
