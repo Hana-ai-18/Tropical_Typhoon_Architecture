@@ -130,7 +130,7 @@ def run_test_evaluation(model, ckpt_path: str, args, device,
     print("  TEST SET EVALUATION  (Phys-Diff)")
     print("=" * 70)
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     print(f"  Loaded checkpoint from epoch {ckpt.get('epoch', '?')}"
           f"  (best val ADE = {ckpt.get('best_ade', float('nan')):.1f} km)")
@@ -327,13 +327,55 @@ def main(args):
 
     best_ade     = float("inf")
     patience_cnt = 0
+    start_epoch  = 0
+
+    last_ckpt_path = os.path.join(args.output_dir, "last_ckpt.pth")
+    if os.path.exists(last_ckpt_path):
+        print(f"  🔄 Found {last_ckpt_path} — resuming training")
+        ckpt = torch.load(last_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        start_epoch  = ckpt["epoch"] + 1
+        best_ade     = ckpt.get("best_ade", float("inf"))
+        patience_cnt = ckpt.get("patience_cnt", 0)
+        if ckpt.get("torch_rng_state") is not None:
+            torch.set_rng_state(ckpt["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and ckpt.get("cuda_rng_state") is not None:
+            torch.cuda.set_rng_state(ckpt["cuda_rng_state"].cpu())
+        if ckpt.get("numpy_rng_state") is not None:
+            np.random.set_state(ckpt["numpy_rng_state"])
+        if ckpt.get("python_rng_state") is not None:
+            random.setstate(ckpt["python_rng_state"])
+        print(f"  ▶ Resuming from epoch {start_epoch}  "
+              f"(best_ade={best_ade:.1f} km, patience={patience_cnt})")
+
     train_start  = time.perf_counter()
+
+    def _save_full_checkpoint(path: str, epoch: int):
+        """Full state for exact resume: model, optimizer, scheduler,
+        epoch, early-stop counters, best_ade, RNG states, args."""
+        torch.save({
+            "epoch"            : epoch,
+            "model_state"      : model.state_dict(),
+            "optimizer_state"  : optimizer.state_dict(),
+            "scheduler_state"  : scheduler.state_dict(),
+            "best_ade"         : best_ade,
+            "patience_cnt"     : patience_cnt,
+            "model_type"       : "PhysDiff",
+            "seed"             : args.seed,
+            "args"             : vars(args),
+            "torch_rng_state"  : torch.get_rng_state(),
+            "cuda_rng_state"   : torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            "numpy_rng_state"  : np.random.get_state(),
+            "python_rng_state" : random.getstate(),
+        }, path)
 
     print("=" * 70)
     print(f"  TRAINING  ({len(train_loader)} steps/epoch)")
     print("=" * 70)
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         sum_loss = 0.0
         t0 = time.perf_counter()
@@ -468,6 +510,13 @@ def main(args):
             if epoch >= args.min_epochs and patience_cnt >= args.patience:
                 print(f"  ⛔ Early stop @ epoch {epoch}")
                 break
+
+            # Full-state checkpoint at every validation epoch.
+            val_ckpt_path = os.path.join(args.output_dir, f"val_ckpt_ep{epoch:04d}.pth")
+            _save_full_checkpoint(val_ckpt_path, epoch)
+
+        # Full-state checkpoint every epoch (overwritten) for exact resume.
+        _save_full_checkpoint(last_ckpt_path, epoch)
 
         if epoch % 100 == 0:
             torch.save({

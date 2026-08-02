@@ -128,7 +128,7 @@ def run_test_evaluation(model, ckpt_path: str, args, device,
     print("  TEST SET EVALUATION  (MMSTN)")
     print("=" * 70)
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     print(f"  Loaded checkpoint from epoch {ckpt.get('epoch', '?')}"
           f"  (best val ADE = {ckpt.get('best_ade', float('nan')):.1f} km)")
@@ -302,13 +302,55 @@ def main(args):
 
     best_ade     = float("inf")
     patience_cnt = 0
+    start_epoch  = 0
+
+    last_ckpt_path = os.path.join(args.output_dir, "last_ckpt.pth")
+    if os.path.exists(last_ckpt_path):
+        print(f"  🔄 Found {last_ckpt_path} — resuming training")
+        ckpt = torch.load(last_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer_g.load_state_dict(ckpt["optimizer_g_state"])
+        optimizer_d.load_state_dict(ckpt["optimizer_d_state"])
+        start_epoch  = ckpt["epoch"] + 1
+        best_ade     = ckpt.get("best_ade", float("inf"))
+        patience_cnt = ckpt.get("patience_cnt", 0)
+        if ckpt.get("torch_rng_state") is not None:
+            torch.set_rng_state(ckpt["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and ckpt.get("cuda_rng_state") is not None:
+            torch.cuda.set_rng_state(ckpt["cuda_rng_state"].cpu())
+        if ckpt.get("numpy_rng_state") is not None:
+            np.random.set_state(ckpt["numpy_rng_state"])
+        if ckpt.get("python_rng_state") is not None:
+            random.setstate(ckpt["python_rng_state"])
+        print(f"  ▶ Resuming from epoch {start_epoch}  "
+              f"(best_ade={best_ade:.1f} km, patience={patience_cnt})")
+
     train_start  = time.perf_counter()
+
+    def _save_full_checkpoint(path: str, epoch: int):
+        """Full state for exact resume: model, both optimizers, epoch,
+        early-stop counters, best_ade, RNG states, and args."""
+        torch.save({
+            "epoch"             : epoch,
+            "model_state"       : model.state_dict(),
+            "optimizer_g_state" : optimizer_g.state_dict(),
+            "optimizer_d_state" : optimizer_d.state_dict(),
+            "best_ade"          : best_ade,
+            "patience_cnt"      : patience_cnt,
+            "model_type"        : "MMSTN",
+            "seed"              : args.seed,
+            "args"              : vars(args),
+            "torch_rng_state"   : torch.get_rng_state(),
+            "cuda_rng_state"    : torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            "numpy_rng_state"   : np.random.get_state(),
+            "python_rng_state"  : random.getstate(),
+        }, path)
 
     print("=" * 70)
     print(f"  TRAINING  ({len(train_loader)} steps/epoch)")
     print("=" * 70)
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         sum_g_loss, sum_d_loss = 0.0, 0.0
         n_g_steps, n_d_steps = 0, 0
@@ -470,9 +512,21 @@ def main(args):
                 print(f"  No improvement {patience_cnt}/{args.patience}"
                       f"  (best={best_ade:.1f} km)")
 
+            # Full-state checkpoint at every validation epoch (model +
+            # both optimizers + early-stop counters + RNG states), so any
+            # past validation point can be resumed from exactly, not just
+            # the best one.
+            val_ckpt_path = os.path.join(args.output_dir, f"val_ckpt_ep{epoch:04d}.pth")
+            _save_full_checkpoint(val_ckpt_path, epoch)
+
             if epoch >= args.min_epochs and patience_cnt >= args.patience:
                 print(f"  ⛔ Early stop @ epoch {epoch}")
                 break
+
+        # Full-state checkpoint every epoch (overwritten each time) for
+        # exact resume after interruption: model, both optimizers, epoch,
+        # patience_cnt, best_ade, RNG states.
+        _save_full_checkpoint(last_ckpt_path, epoch)
 
         if epoch % 100 == 0:
             torch.save({
