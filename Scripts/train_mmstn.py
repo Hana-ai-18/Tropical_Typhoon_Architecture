@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 """
-Train Phys-Diff baseline (PIGA-augmented DDPM) with the SAME multi-modal
-encoder (PaperEncoder: FNO3D + Mamba + Env_net) used by ST-Trans / paper
-LSTM-GRU-RNN / MMSTN baselines, for a fair comparison.
+Train MMSTN baseline (Social-GAN-style, Faiaz-lineage) with the SAME
+multi-modal encoder (PaperEncoder: FNO3D + Mamba + Env_net) used by
+ST-Trans / paper LSTM-GRU-RNN baselines, for a fair comparison.
 
 Epoch loop / early-stopping / metrics-CSV / checkpoint format are IDENTICAL
-in structure to train_st_trans.py / train_paper_baseline.py / train_mmstn.py
-so all baselines are directly comparable. The DDPM mechanics themselves
-(cosine/linear beta schedule, epsilon-prediction MSE loss with the original
-repo's numerical-stability guards, PIGA-augmented transformer denoiser) are
-kept faithful to Phys-Diff's own models/ddpm.py and networks/piga.py -- see
-Model/phys_diff_model.py docstring for a full list of what was kept
-verbatim vs. what was necessarily adapted (2-D-only prediction, PaperEncoder
-context, DDIM-strided sampling for affordable per-epoch validation).
+in structure to train_st_trans.py and train_paper_baseline.py so all
+baselines are directly comparable. The GAN mechanics themselves (separate
+G/D optimizers, d_steps:g_steps alternation, best_k variety loss, noise
+injection, label-smoothed BCE) are kept faithful to MMSTN's own train.py --
+see Model/mmstn_model.py docstring for a full list of what was kept
+verbatim vs. what was necessarily adapted.
 """
 
 import sys, os
@@ -31,7 +29,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.physdiff_model import PhysDiff
+from Model.Mmstn_model import MMSTN
 from Model.paper_baseline_model import (
     haversine_km, _norm_to_deg, _ate_cte_tensors,
     HORIZON_STEPS,
@@ -72,10 +70,10 @@ def _fmt(v) -> str:
 
 
 @torch.no_grad()
-def evaluate(model: PhysDiff, loader, device) -> dict:
-    """Identical metric definitions (ADE/FDE/ATE/CTE per horizon) to the
-    other three baselines, so numbers are directly comparable. Uses
-    DDIM-strided sampling (model.sample_steps) for speed."""
+def evaluate(model: MMSTN, loader, device) -> dict:
+    """Identical metric definitions (ADE/FDE/ATE/CTE per horizon) to
+    train_st_trans.py / train_paper_baseline.py, so numbers are directly
+    comparable across all four baselines."""
     model.eval()
 
     all_ade, all_fde = [], []
@@ -127,7 +125,7 @@ def evaluate(model: PhysDiff, loader, device) -> dict:
 def run_test_evaluation(model, ckpt_path: str, args, device,
                         collate_fn, csv_path: str):
     print("\n" + "=" * 70)
-    print("  TEST SET EVALUATION  (Phys-Diff)")
+    print("  TEST SET EVALUATION  (MMSTN)")
     print("=" * 70)
 
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -147,7 +145,7 @@ def run_test_evaluation(model, ckpt_path: str, args, device,
         print(f"  {key:<20} {_fmt(val):>12}")
 
     row = {"timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
-           "split": "test", "model_type": "PhysDiff"}
+           "split": "test", "model_type": "MMSTN"}
     row.update({k: _fmt(v) for k, v in metrics.items()})
     save_metrics_csv(row, csv_path)
     print(f"\n  Test metrics saved → {csv_path}")
@@ -162,82 +160,63 @@ def run_test_evaluation(model, ckpt_path: str, args, device,
 def get_args():
     p = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Train Phys-Diff baseline (PIGA-augmented DDPM) with shared multi-modal encoder")
+        description="Train MMSTN baseline (Social-GAN-style) with shared multi-modal encoder")
 
     p.add_argument("--dataset_root", default="TCND_vn",  type=str)
     p.add_argument("--obs_len",      default=8,          type=int)
     p.add_argument("--pred_len",     default=12,         type=int)
 
-    # Phys-Diff architecture (defaults match configs/config.yaml where
-    # meaningful; unet_in_ch is this project's Data3d channel count)
-    p.add_argument("--unet_in_ch",   default=13,   type=int)
-    p.add_argument("--d_model",      default=128,  type=int)
-    p.add_argument("--d_embedding",  default=64,   type=int)
-    p.add_argument("--enc_layers",   default=3,    type=int)
-    p.add_argument("--enc_heads",    default=4,    type=int)
-    p.add_argument("--enc_ff",       default=256,  type=int)
-    p.add_argument("--enc_dropout",  default=0.1,  type=float)
-    p.add_argument("--dec_layers",   default=3,    type=int)
-    p.add_argument("--dec_heads",    default=4,    type=int)
-    p.add_argument("--dec_ff",       default=256,  type=int)
-    p.add_argument("--dec_dropout",  default=0.1,  type=float)
-    p.add_argument("--d_sub",        default=16,   type=int)
-    p.add_argument("--gate_mlp_dims", default="64,16,1", type=str,
-                   help="comma-separated, matches configs/config.yaml piga.gate_mlp_dims")
+    # MMSTN architecture (defaults match mmstn/train.py where meaningful;
+    # embedding_dim/encoder_h_dim/decoder_h_dim are MMSTN's own defaults,
+    # unet_in_ch is this project's Data3d channel count)
+    p.add_argument("--unet_in_ch",       default=13,   type=int)
+    p.add_argument("--embedding_dim",    default=32,   type=int)
+    p.add_argument("--encoder_h_dim_g",  default=64,   type=int)
+    p.add_argument("--decoder_h_dim_g",  default=64,   type=int)
+    p.add_argument("--encoder_h_dim_d",  default=128,  type=int,
+                   help="MMSTN's own train.py default is 128 (note: this "
+                        "differs from encoder_h_dim_g=64 in the original repo "
+                        "-- D and G use different hidden sizes there too).")
+    p.add_argument("--mlp_dim",          default=128,  type=int)
+    p.add_argument("--num_layers",       default=1,    type=int)
+    p.add_argument("--noise_dim",        default=16,   type=int,
+                   help="MMSTN noise_dim=(16,) by default")
+    p.add_argument("--noise_type",       default="gaussian", type=str,
+                   choices=["gaussian", "uniform"])
+    p.add_argument("--dropout",          default=0.0,  type=float)
+    p.add_argument("--best_k",           default=6,    type=int,
+                   help="MMSTN's own default best_k=6 (variety-loss samples)")
+    p.add_argument("--l2_loss_weight",   default=1.0,  type=float)
 
-    # DDPM schedule (matches configs/config.yaml model.ddpm defaults)
-    p.add_argument("--num_timesteps", default=1000,   type=int)
-    p.add_argument("--beta_schedule", default="cosine", type=str,
-                   choices=["linear", "cosine"])
-    p.add_argument("--beta_start",    default=0.0001, type=float)
-    p.add_argument("--beta_end",      default=0.02,   type=float)
-    p.add_argument("--sample_steps",  default=50,     type=int,
-                   help="DDIM-strided reverse steps used for eval/inference "
-                        "only (training always uses the full random-timestep "
-                        "objective); lower = faster validation on Kaggle.")
+    # GAN training cadence -- MMSTN's own defaults (d_steps=2, g_steps=1)
+    p.add_argument("--d_steps", default=2, type=int)
+    p.add_argument("--g_steps", default=1, type=int)
+    p.add_argument("--g_learning_rate", default=1e-4, type=float)
+    p.add_argument("--d_learning_rate", default=1e-4, type=float)
+    p.add_argument("--clipping_threshold_g", default=0.0, type=float)
+    p.add_argument("--clipping_threshold_d", default=2.0, type=float)
 
-    # Loss weights
-    p.add_argument("--coord_loss_weight",      default=1.0, type=float)
-    p.add_argument("--diffusion_loss_weight",  default=1.0, type=float)
-
-    # Training infra (epoch framework matching the other three baselines)
+    # Training infra (epoch framework matching the other two baselines)
     p.add_argument("--num_epochs",   default=1200,       type=int)
-    p.add_argument("--batch_size",   default=90,         type=int,
-                   help="Original Phys-Diff repo uses batch_size=64 (config.yaml "
-                        "training.batch_size), tuned for its own ERA5/FengWu "
-                        "encoder. With the shared FNO3D+Mamba+Env_net encoder, "
-                        "90 matches the convention used by train_st_trans.py/"
-                        "train_paper_baseline.py for a consistent comparison; "
-                        "lower it back to 64 if you hit GPU memory limits.")
-    p.add_argument("--lr",           default=1e-4,       type=float)
-    p.add_argument("--weight_decay", default=1e-4,       type=float)
-    p.add_argument("--grad_clip",    default=0.1,        type=float,
-                   help="Matches configs/config.yaml training.gradient_clip=0.1 "
-                        "(the original repo clips very aggressively).")
+    p.add_argument("--batch_size",   default=90,         type=int)
+    p.add_argument("--weight_decay", default=0.0,        type=float)
     p.add_argument("--patience",     default=100,        type=int)
     p.add_argument("--min_epochs",   default=50,         type=int)
-    p.add_argument("--lr_min",       default=1e-5,       type=float,
-                   help="Matches configs/config.yaml training.min_lr=0.00001. "
-                        "Used as eta_min for CosineAnnealingLR (the original "
-                        "repo's own scheduler: 'cosine', not plateau-based).")
     p.add_argument("--val_freq",     default=5,          type=int)
-    p.add_argument("--val_subset",   default=300,        type=int,
-                   help="Smaller than the other baselines' default (600) "
-                        "since DDIM sampling is heavier per-sample; raise "
-                        "if your GPU/time budget allows.")
+    p.add_argument("--val_subset",   default=600,        type=int)
     p.add_argument("--num_workers",  default=2,          type=int)
 
     p.add_argument("--test_at_end",  action="store_true",
                    help="Đánh giá trên tập test sau khi training xong")
 
-    p.add_argument("--output_dir",   default="runs/phys_diff", type=str)
-    p.add_argument("--metrics_csv",  default="metrics.csv",    type=str)
-    p.add_argument("--gpu_num",      default="0",              type=str)
+    p.add_argument("--output_dir",   default="runs/mmstn", type=str)
+    p.add_argument("--metrics_csv",  default="metrics.csv", type=str)
+    p.add_argument("--gpu_num",      default="0",           type=str)
     p.add_argument("--seed",         default=42,  type=int,
                    help="Random seed. Run 3-5 seeds for ESWA mean±std reporting, "
                         "same convention as train_flowmatching.py.")
 
-    # DataLoader compat (same as the other train scripts)
+    # DataLoader compat (same as the other two train scripts)
     p.add_argument("--delim",        default=" ")
     p.add_argument("--skip",         default=1,   type=int)
     p.add_argument("--min_ped",      default=1,   type=int)
@@ -271,15 +250,12 @@ def main(args):
     metrics_csv = os.path.join(args.output_dir, args.metrics_csv)
     best_ckpt   = os.path.join(args.output_dir, "best_model.pth")
 
-    gate_mlp_dims = tuple(int(x) for x in args.gate_mlp_dims.split(","))
-
     print("=" * 70)
-    print(f"  PHYS-DIFF BASELINE  (PIGA-augmented DDPM, shared multi-modal encoder)")
-    print(f"  Encoder: PaperEncoder (FNO3D + Mamba + Env_net)  ← same as ST-Trans/LSTM/MMSTN")
-    print(f"  d_model={args.d_model}  d_embedding={args.d_embedding}"
-          f"  enc_layers={args.enc_layers}  dec_layers={args.dec_layers}")
-    print(f"  num_timesteps={args.num_timesteps}  schedule={args.beta_schedule}"
-          f"  sample_steps(eval)={args.sample_steps}")
+    print(f"  MMSTN BASELINE  (Social-GAN style, shared multi-modal encoder)")
+    print(f"  Encoder: PaperEncoder (FNO3D + Mamba + Env_net)  ← same as ST-Trans/LSTM")
+    print(f"  embedding_dim={args.embedding_dim}  enc_h_g={args.encoder_h_dim_g}"
+          f"  dec_h_g={args.decoder_h_dim_g}  noise_dim={args.noise_dim}")
+    print(f"  best_k={args.best_k}  d_steps={args.d_steps}  g_steps={args.g_steps}")
     print(f"  Metrics: ADE / ATE / CTE @ 12h / 24h / 48h / 72h")
     print("=" * 70)
 
@@ -297,33 +273,32 @@ def main(args):
     print(f"  val   : {len(val_dataset)} seq")
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = PhysDiff(
-        obs_len=args.obs_len, pred_len=args.pred_len, unet_in_ch=args.unet_in_ch,
-        d_model=args.d_model, d_embedding=args.d_embedding,
-        enc_layers=args.enc_layers, enc_heads=args.enc_heads,
-        enc_ff=args.enc_ff, enc_dropout=args.enc_dropout,
-        dec_layers=args.dec_layers, dec_heads=args.dec_heads,
-        dec_ff=args.dec_ff, dec_dropout=args.dec_dropout,
-        d_sub=args.d_sub, gate_mlp_dims=gate_mlp_dims,
-        num_timesteps=args.num_timesteps, beta_schedule=args.beta_schedule,
-        beta_start=args.beta_start, beta_end=args.beta_end,
-        sample_steps=args.sample_steps,
-        coord_loss_weight=args.coord_loss_weight,
-        diffusion_loss_weight=args.diffusion_loss_weight,
+    model = MMSTN(
+        obs_len         = args.obs_len,
+        pred_len        = args.pred_len,
+        unet_in_ch      = args.unet_in_ch,
+        embedding_dim   = args.embedding_dim,
+        encoder_h_dim_g = args.encoder_h_dim_g,
+        decoder_h_dim_g = args.decoder_h_dim_g,
+        encoder_h_dim_d = args.encoder_h_dim_d,
+        mlp_dim         = args.mlp_dim,
+        num_layers      = args.num_layers,
+        noise_dim       = (args.noise_dim,),
+        noise_type      = args.noise_type,
+        dropout         = args.dropout,
+        best_k          = args.best_k,
+        l2_loss_weight  = args.l2_loss_weight,
     ).to(device)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  params : {n_params:,}")
+    n_params_g = sum(p.numel() for p in model.generator.parameters() if p.requires_grad)
+    n_params_d = sum(p.numel() for p in model.discriminator.parameters() if p.requires_grad)
+    print(f"  params : G={n_params_g:,}  D={n_params_d:,}")
 
-    # ── Optimizer + Scheduler ─────────────────────────────────────────────
-    optimizer = optim.AdamW(model.parameters(),
-                            lr=args.lr, weight_decay=args.weight_decay)
-    # Faithful to Phys-Diff's own scripts/train.py:
-    #   scheduler = optim.lr_scheduler.CosineAnnealingLR(
-    #       optimizer, T_max=config['training']['num_epochs'],
-    #       eta_min=config['training']['min_lr'])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.num_epochs, eta_min=args.lr_min)
+    # ── Optimizers (separate G/D, faithful to MMSTN train.py) ────────────
+    optimizer_g = optim.Adam(model.generator.parameters(),
+                             lr=args.g_learning_rate, weight_decay=args.weight_decay)
+    optimizer_d = optim.Adam(model.discriminator.parameters(),
+                             lr=args.d_learning_rate, weight_decay=args.weight_decay)
 
     best_ade     = float("inf")
     patience_cnt = 0
@@ -335,50 +310,79 @@ def main(args):
 
     for epoch in range(args.num_epochs):
         model.train()
-        sum_loss = 0.0
+        sum_g_loss, sum_d_loss = 0.0, 0.0
+        n_g_steps, n_d_steps = 0, 0
         t0 = time.perf_counter()
 
+        d_steps_left = args.d_steps
+        g_steps_left = args.g_steps
+        last_g_losses = {}
+        last_d_losses = {}
+
         for i, batch in enumerate(train_loader):
-            bl   = move(list(batch), device)
-            bd   = model.get_loss_breakdown(bl)
-            loss = bd["total"]
+            bl = move(list(batch), device)
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            # ── faithful d_steps : g_steps alternation, MMSTN train.py ──
+            if d_steps_left > 0:
+                d_bd = model.discriminator_step_loss(bl)
+                d_loss = d_bd["total"]
+                optimizer_d.zero_grad()
+                d_loss.backward()
+                if args.clipping_threshold_d > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.discriminator.parameters(), args.clipping_threshold_d)
+                optimizer_d.step()
+                sum_d_loss += d_loss.item()
+                n_d_steps  += 1
+                last_d_losses = d_bd
+                d_steps_left -= 1
+            elif g_steps_left > 0:
+                g_bd = model.generator_step_loss(bl)
+                g_loss = g_bd["total"]
+                optimizer_g.zero_grad()
+                g_loss.backward()
+                if args.clipping_threshold_g > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.generator.parameters(), args.clipping_threshold_g)
+                optimizer_g.step()
+                sum_g_loss += g_loss.item()
+                n_g_steps  += 1
+                last_g_losses = g_bd
+                g_steps_left -= 1
 
-            sum_loss += loss.item()
+            if d_steps_left == 0 and g_steps_left == 0:
+                d_steps_left = args.d_steps
+                g_steps_left = args.g_steps
 
             if i % 30 == 0:
-                lr = optimizer.param_groups[0]["lr"]
+                dpe_now = last_g_losses.get("ADE", float("nan"))
                 print(f"  [{epoch:>4}][{i:>3}/{len(train_loader)}]"
-                      f"  loss={loss.item():.4f}"
-                      f"  diff={bd.get('diffusion_loss', 0):.4f}"
-                      f"  coord={bd.get('coord_loss', 0):.4f}"
-                      f"  lr={lr:.2e}")
+                      f"  D_loss={last_d_losses.get('D_data_loss', float('nan')):.4f}"
+                      f"  G_l2={last_g_losses.get('G_l2_loss_rel', float('nan')):.4f}"
+                      f"  G_adv={last_g_losses.get('G_discriminator_loss', float('nan')):.4f}"
+                      f"  ADE~{dpe_now:.1f}km")
 
-        avg_train = sum_loss / len(train_loader)
+        avg_g = sum_g_loss / max(n_g_steps, 1)
+        avg_d = sum_d_loss / max(n_d_steps, 1)
 
-        # ── Val loss (same combined loss, no sampling — cheap) ────────────
+        # ── Val loss (G's total loss, used only for logging — early stop
+        # and best-checkpoint selection use ADE like the other baselines) ─
         model.eval()
-        val_loss = 0.0
+        val_g_loss = 0.0
         n_val = 0
         with torch.no_grad():
             for batch in val_loader:
                 bl_v = move(list(batch), device)
-                bd_v = model.get_loss_breakdown(bl_v)
-                val_loss += bd_v["total"].item()
+                bd_v = model.generator_step_loss(bl_v)
+                val_g_loss += bd_v["total"].item()
                 n_val += 1
-        avg_val = val_loss / max(n_val, 1)
-
-        scheduler.step()  # CosineAnnealingLR: steps unconditionally each epoch
+        avg_val_g = val_g_loss / max(n_val, 1)
 
         ep_t = time.perf_counter() - t0
-        print(f"  Epoch {epoch:>4}  train_loss={avg_train:.4f}"
-              f"  val_loss={avg_val:.4f}  t={ep_t:.0f}s")
+        print(f"  Epoch {epoch:>4}  G_loss={avg_g:.4f}  D_loss={avg_d:.4f}"
+              f"  val_G_loss={avg_val_g:.4f}  t={ep_t:.0f}s")
 
-        # ── ADE + ATE + CTE evaluation (DDIM-strided sampling) ─────────────
+        # ── ADE + ATE + CTE evaluation ────────────────────────────────────
         if epoch % args.val_freq == 0:
             r = evaluate(model, val_sub_loader, device)
 
@@ -411,9 +415,10 @@ def main(args):
                 "timestamp"      : datetime.now().strftime("%Y%m%d_%H%M%S"),
                 "split"          : "val",
                 "epoch"          : epoch,
-                "model_type"     : "PhysDiff",
-                "train_loss"     : _fmt(avg_train),
-                "val_loss"       : _fmt(avg_val),
+                "model_type"     : "MMSTN",
+                "G_loss"         : _fmt(avg_g),
+                "D_loss"         : _fmt(avg_d),
+                "val_G_loss"     : _fmt(avg_val_g),
                 "ADE_km"         : _fmt(ade),
                 "FDE_km"         : _fmt(r.get("FDE", float("nan"))),
                 "12h_km"         : _fmt(ade12),
@@ -439,24 +444,24 @@ def main(args):
                     "epoch"      : epoch,
                     "model_state": model.state_dict(),
                     "best_ade"   : best_ade,
-                    "model_type" : "PhysDiff",
-                    "paper"      : "Phys-Diff (PIGA-augmented DDPM)",
+                    "model_type" : "MMSTN",
+                    "paper"      : "MMSTN (Social-GAN style, Faiaz lineage)",
                     "seed"       : args.seed,
                     "model_cfg"  : {
-                        "obs_len": args.obs_len, "pred_len": args.pred_len,
-                        "unet_in_ch": args.unet_in_ch,
-                        "d_model": args.d_model, "d_embedding": args.d_embedding,
-                        "enc_layers": args.enc_layers, "enc_heads": args.enc_heads,
-                        "enc_ff": args.enc_ff, "enc_dropout": args.enc_dropout,
-                        "dec_layers": args.dec_layers, "dec_heads": args.dec_heads,
-                        "dec_ff": args.dec_ff, "dec_dropout": args.dec_dropout,
-                        "d_sub": args.d_sub, "gate_mlp_dims": list(gate_mlp_dims),
-                        "num_timesteps": args.num_timesteps,
-                        "beta_schedule": args.beta_schedule,
-                        "beta_start": args.beta_start, "beta_end": args.beta_end,
-                        "sample_steps": args.sample_steps,
-                        "coord_loss_weight": args.coord_loss_weight,
-                        "diffusion_loss_weight": args.diffusion_loss_weight,
+                        "obs_len":         args.obs_len,
+                        "pred_len":        args.pred_len,
+                        "unet_in_ch":      args.unet_in_ch,
+                        "embedding_dim":   args.embedding_dim,
+                        "encoder_h_dim_g": args.encoder_h_dim_g,
+                        "decoder_h_dim_g": args.decoder_h_dim_g,
+                        "encoder_h_dim_d": args.encoder_h_dim_d,
+                        "mlp_dim":         args.mlp_dim,
+                        "num_layers":      args.num_layers,
+                        "noise_dim":       args.noise_dim,
+                        "noise_type":      args.noise_type,
+                        "dropout":         args.dropout,
+                        "best_k":          args.best_k,
+                        "l2_loss_weight":  args.l2_loss_weight,
                     },
                 }, best_ckpt)
                 print(f"  ✅ Best ADE {best_ade:.1f} km  (epoch {epoch})")
@@ -473,14 +478,14 @@ def main(args):
             torch.save({
                 "epoch"      : epoch,
                 "model_state": model.state_dict(),
-                "train_loss" : avg_train,
-                "val_loss"   : avg_val,
+                "G_loss"     : avg_g,
+                "D_loss"     : avg_d,
                 "seed"       : args.seed,
             }, os.path.join(args.output_dir, f"ckpt_ep{epoch:04d}.pth"))
 
     total_h = (time.perf_counter() - train_start) / 3600
     print("=" * 70)
-    print(f"  Model   : Phys-Diff")
+    print(f"  Model   : MMSTN")
     print(f"  Best ADE: {best_ade:.1f} km")
     print(f"  Total   : {total_h:.2f}h")
     print(f"  Metrics : {metrics_csv}")
