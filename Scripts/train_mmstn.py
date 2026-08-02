@@ -29,7 +29,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.mmstn_model import MMSTN
+from Model.Mmstn_model import MMSTN
 from Model.paper_baseline_model import (
     haversine_km, _norm_to_deg, _ate_cte_tensors,
     HORIZON_STEPS,
