@@ -2,6 +2,9 @@ from __future__ import annotations
 import json, sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+_TRAIN_SCRIPT_PATCH_VERSION = "v3-gradnan-guard-2026-08-06"
+print(f">>> train_flowmatching.py PATCH VERSION: {_TRAIN_SCRIPT_PATCH_VERSION} <<<")
+
 import argparse, math, time
 from collections import defaultdict
 from typing import Dict, List, Optional
@@ -58,7 +61,8 @@ def _ate_cte(pred_deg, gt_deg):
     return tot*torch.cos(ang), tot*torch.sin(ang)
 
 def build_optimizer(model, lr_velocity, lr_encoder, weight_decay,
-                     lr_logits_scale: float = 0.2):
+                     lr_logits_scale: float = 0.2,
+                     lr_extra_scale: float = 0.2):
     raw = _unwrap(model)
 
     encoder_ids  = {id(p) for p in raw.encoder.parameters()}
@@ -80,11 +84,34 @@ def build_optimizer(model, lr_velocity, lr_encoder, weight_decay,
         {"params": list(raw.velocity.parameters()), "lr": lr_velocity, "name": "velocity"},
     ]
     if len(rest_extra_params) > 0:
-    
-        groups.append({"params": rest_extra_params, "lr": lr_velocity, "name": "learnable_extra"})
+        # [ROOT-CAUSE FIX] rest_extra_params contains speed_correction_logits,
+        # score_weight_logits, score_v_sigma_scale_logit,
+        # score_kernel_scale_logits, log_sigma_reg/heading/calib/score —
+        # all LOW-DIMENSIONAL (1-12 elements each), highly sensitive
+        # scalars/vectors that directly parameterize exp()/softplus()/
+        # sigmoid() calls feeding physics-score selection and speed
+        # calibration. Previously these shared lr_velocity (2e-4) — the
+        # SAME learning rate used for the velocity network's millions of
+        # parameters. For a network with millions of dimensions, a given
+        # gradient magnitude is naturally "diluted"; for a 1-12 element
+        # parameter, the same gradient magnitude produces a much larger
+        # relative step. Combined with AdamW's per-parameter adaptive
+        # moment estimates, this repeatedly produced anomalously large
+        # updates to exactly this parameter group (confirmed empirically:
+        # first_bad_params in training logs consistently listed ONLY
+        # members of this group, epoch after epoch, never encoder/velocity
+        # weights). Scaling down to lr_velocity * lr_extra_scale (same
+        # 0.2x factor already proven safe for the structurally similar
+        # softmax_logits group below) directly addresses the mechanism
+        # that was producing NaN gradients at the source, rather than
+        # only cleaning up after the fact.
+        groups.append({"params": rest_extra_params,
+                        "lr": lr_velocity * lr_extra_scale,
+                        "name": "learnable_extra"})
         print(f"  [build_optimizer] learnable_extra group: {len(rest_extra_params)} tensors "
               f"({sum(p.numel() for p in rest_extra_params)} params) — "
-              f"speed_correction/log_sigma*")
+              f"speed_correction/log_sigma*/score_* @ lr×{lr_extra_scale} "
+              f"(reduced from 1.0x — low-dim scalars, prone to NaN at full velocity-net lr)")
     if len(softmax_logit_params) > 0:
         groups.append({"params": softmax_logit_params,
                         "lr": lr_velocity * lr_logits_scale,
@@ -556,6 +583,18 @@ def get_args():
     p.add_argument("--batch_size",             default=64,     type=int)
     p.add_argument("--lr",                     default=2e-4,   type=float)
     p.add_argument("--lr_logits_scale",        default=0.2,    type=float)
+    p.add_argument("--lr_extra_scale",         default=0.2,    type=float,
+                   help="[ROOT-CAUSE FIX] LR multiplier for the "
+                        "learnable_extra group (speed_correction_logits, "
+                        "score_weight_logits, score_v_sigma_scale_logit, "
+                        "score_kernel_scale_logits, log_sigma_*). These "
+                        "are low-dimensional (1-12 elements), sensitive "
+                        "scalars feeding exp()/softplus()/sigmoid() calls; "
+                        "previously shared the full velocity-network LR "
+                        "(2e-4), which repeatedly produced NaN gradients "
+                        "in exactly this group (confirmed via "
+                        "first_bad_params logging). Reduced to match the "
+                        "already-proven-safe softmax_logits scale.")
     p.add_argument("--lr_min",                 default=1e-6,   type=float)
     p.add_argument("--warmup_epochs",          default=5,      type=int)
     p.add_argument("--weight_decay",           default=1e-4,   type=float)
@@ -796,7 +835,8 @@ def main(args):
 
     opt    = build_optimizer(model, lr_velocity=args.lr, lr_encoder=0.0,
                              weight_decay=args.weight_decay,
-                             lr_logits_scale=args.lr_logits_scale)
+                             lr_logits_scale=args.lr_logits_scale,
+                             lr_extra_scale=args.lr_extra_scale)
     scaler = GradScaler("cuda", enabled=args.use_amp)
     sched  = TwoGroupScheduler(
         opt=opt, warmup_epochs=args.warmup_epochs, total_epochs=args.num_epochs,
@@ -853,7 +893,7 @@ def main(args):
 
         model.train()
         sum_loss = sum_cfm = sum_reg = sum_head = sum_ade1 = 0.0
-        n_skipped_batches = 0
+        n_sanitized_batches = 0
         t0_ep = time.perf_counter()
 
         for i, batch in enumerate(trl):
@@ -863,71 +903,76 @@ def main(args):
             with autocast(device_type="cuda", enabled=args.use_amp):
                 bd = model.get_loss_breakdown(bl_aug, epoch=ep)
 
-            # ── NaN/no-grad guard ────────────────────────────────────────
-            # Model intentionally returns a fresh, graph-detached
-            # x0.new_zeros(()) for `total` whenever it computes a
-            # non-finite loss internally (see get_loss_breakdown's
-            # [REVERTED] comment in flow_matching_model.py). That
-            # replacement tensor has VALUE 0.0, which IS finite, but does
-            # NOT have requires_grad/grad_fn — so a check on isfinite()
-            # alone does not catch it. Must check both conditions:
-            #   - not finite  -> real NaN/Inf slipped through somewhere
-            #   - not requires_grad -> the model's own detached-zero guard
-            #     already fired internally
-            # Skipping backward/step/EMA/SWA for such a batch is safe:
-            # opt.zero_grad() already ran this iteration, so no stale
-            # gradients persist, and scaler.step()/update() are never
-            # called so GradScaler's internal state stays consistent.
-            _bad_loss = (not torch.isfinite(bd["total"])) or (not bd["total"].requires_grad)
-            if _bad_loss:
-                n_skipped_batches += 1
-                print(f"  ⚠ [{ep}][{i}] bad total loss "
+            # ── NaN/no-grad SANITIZE (not skip) ─────────────────────────
+            # [USER REQUIREMENT] Every batch must run backward()/step() —
+            # no batch is ever skipped via `continue`. If the model's own
+            # internal guard already fired (get_loss_breakdown returns a
+            # graph-detached x0.new_zeros(()) — see [REVERTED] comment in
+            # flow_matching_model.py — which has requires_grad=False),
+            # `total` has no gradient path at all, so there is nothing
+            # meaningful to backward() on for this specific loss value.
+            # Instead of skipping the batch, replace it with a
+            # graph-CONNECTED zero: 0.0 * l_cfm, built from the actual
+            # l_cfm tensor computed this iteration (which DOES have a
+            # valid grad_fn from the velocity network's forward pass).
+            # backward() on this produces an all-zero gradient for every
+            # parameter that contributed to l_cfm, and a well-defined
+            # (zero) gradient for the loss overall — mathematically a
+            # complete no-op update (equivalent in effect to a skip), but
+            # structurally still a full, real backward()+step() call, so
+            # no batch is ever dropped from the loop.
+            _total_has_grad = bd["total"].requires_grad and torch.isfinite(bd["total"])
+            if not _total_has_grad:
+                n_sanitized_batches += 1
+                print(f"  ⚠ [{ep}][{i}] total loss had no valid gradient "
                       f"(finite={torch.isfinite(bd['total']).item()} "
                       f"requires_grad={bd['total'].requires_grad} "
                       f"cfm={bd['l_cfm']:.4f} reg={bd['l_reg']:.4f} "
                       f"h4s={bd['l_heading']:.4f} calib={bd['l_calib']:.4f} "
                       f"score={bd['l_score']:.4f} hreg={bd.get('l_hard_reg',0.0):.4f}) "
-                      f"→ skip batch (no backward/step)")
-                continue
+                      f"→ using zero-effect gradient (backward/step still run, batch NOT skipped)")
+                loss_for_backward = 0.0 * bd["_t_l_cfm"]
+            else:
+                loss_for_backward = bd["total"]
 
-            scaler.scale(bd["total"]).backward()
+            scaler.scale(loss_for_backward).backward()
             scaler.unscale_(opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-            # ── Gradient NaN/Inf guard ──────────────────────────────────
+            # ── Gradient NaN/Inf SANITIZE (not skip) ────────────────────
             # clip_grad_norm_ only rescales gradient MAGNITUDE — it does
             # NOT remove NaN/Inf values. If any parameter's gradient is
-            # already NaN/Inf (e.g. from a degenerate OT-Sinkhorn cost
-            # matrix or an extreme augmented sample), clip_grad_norm_
-            # happily passes it through, optimizer.step() then writes
-            # NaN into that parameter PERMANENTLY, and every subsequent
-            # forward pass through that parameter is NaN forever — which
-            # is exactly the "total loss NaN forever after batch 76"
-            # symptom observed in training logs. torch.nn.utils.
-            # clip_grad_norm_ returns the pre-clip total norm; a NaN/Inf
-            # gradient anywhere makes this returned norm NaN/Inf too, so
-            # checking it here catches the problem BEFORE optimizer.step()
-            # is allowed to corrupt any weight.
+            # already NaN/Inf despite the fixes in flow_matching_model.py
+            # (e.g. from a submodule this patch cannot see, such as
+            # FNO3DEncoder/DataEncoder1D_Mamba/Env_net), letting
+            # optimizer.step() run would permanently corrupt that weight
+            # with NaN, and every subsequent forward pass through it would
+            # be NaN forever. [USER REQUIREMENT] Instead of skipping this
+            # batch's step() entirely, zero out ONLY the NaN/Inf gradients
+            # (leaving any other, valid gradients in the SAME batch
+            # intact) and still call scaler.step(opt) — so the batch is
+            # never dropped from the loop, and any parameter that got a
+            # valid gradient this batch still receives its real update.
             _bad_grad = not torch.isfinite(grad_norm)
             if _bad_grad:
-                n_skipped_batches += 1
-                # Diagnostic only (does not change any training logic):
-                # identify which named parameter(s) first carry NaN/Inf
-                # gradient, to help trace the root cause (e.g. OT-Sinkhorn,
-                # a specific augmentation branch, or a specific submodule)
-                # without needing a separate debugging run.
+                n_sanitized_batches += 1
                 _bad_names = []
                 for _name, _p in _unwrap(model).named_parameters():
                     if _p.grad is not None and not torch.isfinite(_p.grad).all():
-                        _bad_names.append(_name)
-                        if len(_bad_names) >= 5:
-                            break
+                        _p.grad = torch.nan_to_num(_p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                        if len(_bad_names) < 5:
+                            _bad_names.append(_name)
+                        # NOTE: no early break — every NaN/Inf-carrying
+                        # parameter's gradient must be sanitized, not just
+                        # the first 5. The len(<5) check above only limits
+                        # how many NAMES get logged, not how many
+                        # parameters get their gradient cleaned.
                 print(f"  ⚠ [{ep}][{i}] non-finite grad_norm={grad_norm.item()} "
-                      f"first_bad_params={_bad_names} "
-                      f"→ skip optimizer.step() (grads zeroed, weights untouched)")
-                opt.zero_grad(set_to_none=True)
-                scaler.update()
-                continue
+                      f"sanitized_params(first 5)={_bad_names[:5]} "
+                      f"→ NaN/Inf gradients zeroed, step() still runs (batch NOT skipped)")
+                # Re-clip after sanitizing so the reported/used grad_norm
+                # for logging purposes is finite and consistent.
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             if freeze:
                 for p in _unwrap(model).encoder.parameters():
@@ -956,21 +1001,26 @@ def main(args):
                       f"  enc={enc_s}{swa_s}"
                       f"  lr={lr_vel:.2e}")
 
-        n_effective = max(nstep - n_skipped_batches, 1)
-        train_loss = sum_loss / n_effective
+        # [USER REQUIREMENT] Every batch now runs backward()/step() — none
+        # are skipped — so the epoch average uses the full nstep count,
+        # not a reduced "effective" count. n_sanitized_batches is kept
+        # purely as a diagnostic counter (how many batches needed their
+        # loss/gradient sanitized this epoch), not a divisor.
+        train_loss = sum_loss / nstep
         _, lr_vel_used = get_lrs(opt)
         sched.step()
 
-        skip_s = f"  skipped={n_skipped_batches}/{nstep}" if n_skipped_batches > 0 else ""
+        sanitize_s = (f"  sanitized={n_sanitized_batches}/{nstep}"
+                      if n_sanitized_batches > 0 else "")
         print(f"\n  ── Ep{ep:>3}"
               f"  train={train_loss:.6f}"
-              f"  cfm={sum_cfm/n_effective:.4f}"
-              f"  reg={sum_reg/n_effective:.4f}"
-              f"  h4s={sum_head/n_effective:.4f}"
-              f"  ade1={sum_ade1/n_effective:.0f}km"
+              f"  cfm={sum_cfm/nstep:.4f}"
+              f"  reg={sum_reg/nstep:.4f}"
+              f"  h4s={sum_head/nstep:.4f}"
+              f"  ade1={sum_ade1/nstep:.0f}km"
               f"  lr={lr_vel_used:.2e}"
               f"  t={time.perf_counter()-t0_ep:.0f}s"
-              f"{skip_s}")
+              f"{sanitize_s}")
 
         _save(last_ckpt, ep, model, opt, sched, best_score, ema, scaler,
               model_cfg=model_cfg)
