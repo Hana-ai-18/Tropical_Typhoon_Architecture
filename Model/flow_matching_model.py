@@ -1734,31 +1734,39 @@ class TCFlowMatching(nn.Module):
             _pts  = torch.cat([last_obs.unsqueeze(0), pred_mean], 0)   # [T+1,B,2]
             _disp = _pts[1:] - _pts[:-1]                                # [T,B,2]
 
-            # [FIX-CTE-LEAK] Bản trước nhân trực tiếp _disp (vector 2D) với
-            # residual_scale -> kéo dài CẢ hướng đi lẫn độ lệch ngang, khiến
-            # CTE tăng mạnh (đo được: seed0 168->186km, seed2 168->185km).
-            # Sửa: chiếu _disp lên bearing THAM CHIẾU (hướng đi quan sát gần
-            # nhất, obs[-2]->obs[-1]) thành 2 thành phần (dọc, ngang), CHỈ
-            # scale thành phần dọc theo bearing đó — thành phần ngang (ứng
-            # với CTE) giữ nguyên không đổi.
-            # LƯU Ý: dùng MỘT bearing tham chiếu cố định (từ quan sát cuối)
-            # cho toàn bộ 12 bước, không phải bearing động theo từng bước dự
-            # đoán — vì nếu dùng bearing của chính disp từng bước, chiếu disp
-            # lên hướng CỦA CHÍNH NÓ luôn cho "dọc"=|disp| và "ngang"=0 (vô
-            # nghĩa, không tách được gì). Bearing tham chiếu cố định từ quan
-            # sát là xấp xỉ hợp lý cho "hướng đi kỳ vọng" của storm.
+            # [FIX-CTE-LEAK-v2] Bản v2a dùng 1 bearing THAM CHIẾU CỐ ĐỊNH
+            # (từ obs[-2]->obs[-1]) cho toàn bộ 12 bước -> không theo kịp
+            # recurvature của storm, nên vẫn còn rò CTE ở horizon xa (đo
+            # được: CTE vẫn cao hơn baseline ~7-12km, thay vì gần như
+            # không đổi như kỳ vọng).
+            # Sửa: bearing tham chiếu ĐỘNG theo từng bước, lấy từ CHÍNH
+            # quỹ đạo pred_mean GỐC (_pts, đã có sẵn TRƯỚC vòng lặp scale
+            # bên dưới, KHÔNG phụ thuộc dây chuyền vào kết quả đã scale
+            # của bước trước — tránh tích luỹ lệch pha qua 12 bước liên
+            # tiếp, vốn khó kiểm soát nếu bearing tự cập nhật từ output
+            # đang bị sửa). ref_bearing[t] = bearing của đoạn NGAY TRƯỚC
+            # bước t trên quỹ đạo gốc (t=0 dùng obs[-2]->obs[-1]; t>=1
+            # dùng _pts[t-1]->_pts[t], tức đoạn pred[t-2]->pred[t-1] khi
+            # t>=2, hoặc last_obs->pred[0] khi t=1).
+            _pred_deg_full = _norm_to_deg(_pts)          # [T+1, B, 2] (gồm cả last_obs ở index 0)
             _obs_deg = _norm_to_deg(obs_norm)
             if _obs_deg.shape[0] >= 2:
-                _ref_bearing = _forward_azimuth(_obs_deg[-2], _obs_deg[-1])   # [B], rad
+                _ref_bear_init = _forward_azimuth(_obs_deg[-2], _obs_deg[-1])   # [B], dùng cho t=0
             else:
-                _ref_bearing = torch.zeros(_disp.shape[1], device=_disp.device, dtype=_disp.dtype)
-            _ref_dir = torch.stack([torch.cos(_ref_bearing), torch.sin(_ref_bearing)], -1)  # [B,2]
-            _ref_dir = _ref_dir.unsqueeze(0).expand(_T, -1, -1).to(_disp.dtype)              # [T,B,2]
+                _ref_bear_init = torch.zeros(_disp.shape[1], device=_disp.device, dtype=_disp.dtype)
 
-            _along = (_disp * _ref_dir).sum(-1, keepdim=True)                # [T,B,1] thành phần DỌC theo ref bearing
-            _perp  = _disp - _along * _ref_dir                               # [T,B,2] thành phần NGANG (giữ nguyên)
+            if _T >= 2:
+                _ref_bear_rest = _forward_azimuth(_pred_deg_full[:-2], _pred_deg_full[1:-1])  # [T-1, B], cho t=1..T-1
+                _ref_bearings = torch.cat([_ref_bear_init.unsqueeze(0), _ref_bear_rest], 0)   # [T, B]
+            else:
+                _ref_bearings = _ref_bear_init.unsqueeze(0)   # [1, B]
 
-            _disp_res = _along * _residual_scale * _ref_dir + _perp          # chỉ scale phần dọc
+            _ref_dir = torch.stack([torch.cos(_ref_bearings), torch.sin(_ref_bearings)], -1).to(_disp.dtype)  # [T,B,2]
+
+            _along = (_disp * _ref_dir).sum(-1, keepdim=True)          # [T,B,1] thành phần DỌC theo ref bearing của bước đó
+            _perp  = _disp - _along * _ref_dir                          # [T,B,2] thành phần NGANG (CTE) — giữ nguyên
+
+            _disp_res = _along * _residual_scale * _ref_dir + _perp
 
             _out = torch.empty_like(pred_mean)
             _cur = last_obs
