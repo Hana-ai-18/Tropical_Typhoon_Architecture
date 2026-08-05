@@ -1730,49 +1730,63 @@ class TCFlowMatching(nn.Module):
                 [1.1329, 1.1066, 1.0416, 1.0181, 1.0319, 1.0462,
                  1.0818, 1.0982, 1.1260, 1.1813, 1.3396, 1.7559][:_T],
                 device=pred_mean.device, dtype=pred_mean.dtype,
-            ).view(_T, 1, 1)
-            _pts  = torch.cat([last_obs.unsqueeze(0), pred_mean], 0)   # [T+1,B,2]
-            _disp = _pts[1:] - _pts[:-1]                                # [T,B,2]
+            )   # [T]
 
-            # [FIX-CTE-LEAK-v2] Bản v2a dùng 1 bearing THAM CHIẾU CỐ ĐỊNH
-            # (từ obs[-2]->obs[-1]) cho toàn bộ 12 bước -> không theo kịp
-            # recurvature của storm, nên vẫn còn rò CTE ở horizon xa (đo
-            # được: CTE vẫn cao hơn baseline ~7-12km, thay vì gần như
-            # không đổi như kỳ vọng).
-            # Sửa: bearing tham chiếu ĐỘNG theo từng bước, lấy từ CHÍNH
-            # quỹ đạo pred_mean GỐC (_pts, đã có sẵn TRƯỚC vòng lặp scale
-            # bên dưới, KHÔNG phụ thuộc dây chuyền vào kết quả đã scale
-            # của bước trước — tránh tích luỹ lệch pha qua 12 bước liên
-            # tiếp, vốn khó kiểm soát nếu bearing tự cập nhật từ output
-            # đang bị sửa). ref_bearing[t] = bearing của đoạn NGAY TRƯỚC
-            # bước t trên quỹ đạo gốc (t=0 dùng obs[-2]->obs[-1]; t>=1
-            # dùng _pts[t-1]->_pts[t], tức đoạn pred[t-2]->pred[t-1] khi
-            # t>=2, hoặc last_obs->pred[0] khi t=1).
-            _pred_deg_full = _norm_to_deg(_pts)          # [T+1, B, 2] (gồm cả last_obs ở index 0)
-            _obs_deg = _norm_to_deg(obs_norm)
-            if _obs_deg.shape[0] >= 2:
-                _ref_bear_init = _forward_azimuth(_obs_deg[-2], _obs_deg[-1])   # [B], dùng cho t=0
-            else:
-                _ref_bear_init = torch.zeros(_disp.shape[1], device=_disp.device, dtype=_disp.dtype)
+            # [FIX-CTE-LEAK-v3, ARC-LENGTH REPARAMETRIZATION]
+            # ─────────────────────────────────────────────────────────
+            # CHẨN ĐOÁN TOÁN HỌC (đã kiểm chứng): v2a/v2b/v2c đều decompose
+            # từng disp[t] thành (along ref_bearing, perp ref_bearing) rồi
+            # CHỈ scale "along". Khi storm đang RẼ HƯỚNG (disp[t] lệch khỏi
+            # ref_bearing dù chỉ ~15°), phép chiếu này khiến "along" không
+            # còn là toàn bộ độ dài thật, và scale riêng "along" trong khi
+            # giữ "perp" cố định (độ dài tuyệt đối) sẽ KÉO HƯỚNG KẾT QUẢ
+            # LỆCH THÊM VỀ PHÍA ref_bearing — tạo CTE giả, tỷ lệ thuận với
+            # residual_scale và với góc rẽ thật. Đây là lỗi CẤU TRÚC của
+            # phép decompose-tuyến-tính, KHÔNG PHỤ THUỘC cách chọn
+            # ref_bearing (giải thích tại sao đổi bearing cố định -> động
+            # giữa v2b/v2c không cải thiện gì đo được — cùng công thức lỗi).
+            #
+            # FIX ĐÚNG: không decompose từng disp[t] riêng lẻ. Thay vào đó
+            # coi 12 điểm dự đoán (nối với last_obs) là MỘT ĐƯỜNG GẤP KHÚC
+            # CỐ ĐỊNH VỀ HÌNH DẠNG, rồi REPARAMETRIZE theo TỔNG QUÃNG ĐƯỜNG
+            # (arc length): tại mỗi horizon t, thay vì đứng đúng ở điểm
+            # pred[t] gốc, ta đứng ở vị trí ứng với quãng đường đã đi =
+            # (quãng đường gốc đến t) × residual_scale[t], nội suy tuyến
+            # tính TRÊN CHÍNH đường gấp khúc gốc. Vì đường đi (hình dạng,
+            # tức mọi bearing tại mọi điểm) được giữ NGUYÊN 100% — chỉ có
+            # "ta đang ở đâu trên đường đó" thay đổi — CTE lý thuyết không
+            # đổi (sai số hướng tại từng điểm nội suy vẫn đúng như đường
+            # gốc), chỉ ATE (quãng đường đi được) thay đổi theo đúng ý đồ.
+            # Đây là phép biến đổi ĐÚNG về mặt vật lý cho giả thuyết "quỹ
+            # đạo đúng hình dạng, sai tốc độ" (khớp với Q3: bias tương quan
+            # obs_speed, không tương quan hướng/heading).
+            _pts = torch.cat([last_obs.unsqueeze(0), pred_mean], 0)     # [T+1, B, 2]
+            _seg = _pts[1:] - _pts[:-1]                                  # [T, B, 2] đoạn gấp khúc gốc
+            _seg_len = _seg.norm(dim=-1)                                  # [T, B]
+            _cum_len = torch.cumsum(_seg_len, dim=0)                     # [T, B] quãng đường tích luỹ tới mỗi điểm gốc
+            _cum_len_padded = torch.cat(
+                [torch.zeros(1, _cum_len.shape[1], device=_cum_len.device, dtype=_cum_len.dtype), _cum_len], 0
+            )   # [T+1, B], index 0 = tại last_obs (quãng đường 0)
 
-            if _T >= 2:
-                _ref_bear_rest = _forward_azimuth(_pred_deg_full[:-2], _pred_deg_full[1:-1])  # [T-1, B], cho t=1..T-1
-                _ref_bearings = torch.cat([_ref_bear_init.unsqueeze(0), _ref_bear_rest], 0)   # [T, B]
-            else:
-                _ref_bearings = _ref_bear_init.unsqueeze(0)   # [1, B]
-
-            _ref_dir = torch.stack([torch.cos(_ref_bearings), torch.sin(_ref_bearings)], -1).to(_disp.dtype)  # [T,B,2]
-
-            _along = (_disp * _ref_dir).sum(-1, keepdim=True)          # [T,B,1] thành phần DỌC theo ref bearing của bước đó
-            _perp  = _disp - _along * _ref_dir                          # [T,B,2] thành phần NGANG (CTE) — giữ nguyên
-
-            _disp_res = _along * _residual_scale * _ref_dir + _perp
+            _target_len = _cum_len * _residual_scale.unsqueeze(1)         # [T, B] quãng đường MONG MUỐN tại mỗi horizon
 
             _out = torch.empty_like(pred_mean)
-            _cur = last_obs
+            B = pred_mean.shape[1]
             for _t in range(_T):
-                _cur = _cur + _disp_res[_t]
-                _out[_t] = _cur
+                _tgt = _target_len[_t]                                     # [B]
+                # tìm đoạn gấp khúc gốc [k, k+1] mà _tgt rơi vào (searchsorted theo batch)
+                # _cum_len_padded: [T+1, B] tăng dần theo dim 0 với mỗi B
+                _idx = torch.searchsorted(
+                    _cum_len_padded.transpose(0, 1).contiguous(),          # [B, T+1]
+                    _tgt.unsqueeze(1),                                     # [B, 1]
+                ).squeeze(1).clamp(1, _T)                                    # [B], vị trí đoạn chứa _tgt (1-indexed vào _pts)
+                _lo_len = torch.gather(_cum_len_padded.transpose(0, 1), 1, (_idx - 1).unsqueeze(1)).squeeze(1)  # [B]
+                _hi_len = torch.gather(_cum_len_padded.transpose(0, 1), 1, _idx.unsqueeze(1)).squeeze(1)        # [B]
+                _lo_pt  = torch.gather(_pts, 0, (_idx - 1).view(1, B, 1).expand(1, B, 2)).squeeze(0)             # [B,2]
+                _hi_pt  = torch.gather(_pts, 0, _idx.view(1, B, 1).expand(1, B, 2)).squeeze(0)                   # [B,2]
+                _seg_span = (_hi_len - _lo_len).clamp(min=1e-8)
+                _frac = ((_tgt - _lo_len) / _seg_span).clamp(0.0, 1.0).unsqueeze(1)   # [B,1]
+                _out[_t] = _lo_pt + _frac * (_hi_pt - _lo_pt)
             pred_mean = _out
 
         if not return_xai:
