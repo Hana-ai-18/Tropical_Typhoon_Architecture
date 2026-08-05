@@ -853,6 +853,7 @@ def main(args):
 
         model.train()
         sum_loss = sum_cfm = sum_reg = sum_head = sum_ade1 = 0.0
+        n_skipped_batches = 0
         t0_ep = time.perf_counter()
 
         for i, batch in enumerate(trl):
@@ -862,8 +863,24 @@ def main(args):
             with autocast(device_type="cuda", enabled=args.use_amp):
                 bd = model.get_loss_breakdown(bl_aug, epoch=ep)
 
+            # ── NaN/no-grad guard ────────────────────────────────────────
+            # Model intentionally returns a fresh, graph-detached
+            # x0.new_zeros(()) for `total` whenever it computes a
+            # non-finite loss internally (see get_loss_breakdown's
+            # [REVERTED] comment in flow_matching_model.py). That
+            # replacement tensor has VALUE 0.0, which IS finite, but does
+            # NOT have requires_grad/grad_fn — so a check on isfinite()
+            # alone does not catch it. Must check both conditions:
+            #   - not finite  -> real NaN/Inf slipped through somewhere
+            #   - not requires_grad -> the model's own detached-zero guard
+            #     already fired internally
+            # Skipping backward/step/EMA/SWA for such a batch is safe:
+            # opt.zero_grad() already ran this iteration, so no stale
+            # gradients persist, and scaler.step()/update() are never
+            # called so GradScaler's internal state stays consistent.
             _bad_loss = (not torch.isfinite(bd["total"])) or (not bd["total"].requires_grad)
             if _bad_loss:
+                n_skipped_batches += 1
                 print(f"  ⚠ [{ep}][{i}] bad total loss "
                       f"(finite={torch.isfinite(bd['total']).item()} "
                       f"requires_grad={bd['total'].requires_grad} "
@@ -875,7 +892,42 @@ def main(args):
 
             scaler.scale(bd["total"]).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            # ── Gradient NaN/Inf guard ──────────────────────────────────
+            # clip_grad_norm_ only rescales gradient MAGNITUDE — it does
+            # NOT remove NaN/Inf values. If any parameter's gradient is
+            # already NaN/Inf (e.g. from a degenerate OT-Sinkhorn cost
+            # matrix or an extreme augmented sample), clip_grad_norm_
+            # happily passes it through, optimizer.step() then writes
+            # NaN into that parameter PERMANENTLY, and every subsequent
+            # forward pass through that parameter is NaN forever — which
+            # is exactly the "total loss NaN forever after batch 76"
+            # symptom observed in training logs. torch.nn.utils.
+            # clip_grad_norm_ returns the pre-clip total norm; a NaN/Inf
+            # gradient anywhere makes this returned norm NaN/Inf too, so
+            # checking it here catches the problem BEFORE optimizer.step()
+            # is allowed to corrupt any weight.
+            _bad_grad = not torch.isfinite(grad_norm)
+            if _bad_grad:
+                n_skipped_batches += 1
+                # Diagnostic only (does not change any training logic):
+                # identify which named parameter(s) first carry NaN/Inf
+                # gradient, to help trace the root cause (e.g. OT-Sinkhorn,
+                # a specific augmentation branch, or a specific submodule)
+                # without needing a separate debugging run.
+                _bad_names = []
+                for _name, _p in _unwrap(model).named_parameters():
+                    if _p.grad is not None and not torch.isfinite(_p.grad).all():
+                        _bad_names.append(_name)
+                        if len(_bad_names) >= 5:
+                            break
+                print(f"  ⚠ [{ep}][{i}] non-finite grad_norm={grad_norm.item()} "
+                      f"first_bad_params={_bad_names} "
+                      f"→ skip optimizer.step() (grads zeroed, weights untouched)")
+                opt.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
 
             if freeze:
                 for p in _unwrap(model).encoder.parameters():
@@ -904,18 +956,21 @@ def main(args):
                       f"  enc={enc_s}{swa_s}"
                       f"  lr={lr_vel:.2e}")
 
-        train_loss = sum_loss / nstep
+        n_effective = max(nstep - n_skipped_batches, 1)
+        train_loss = sum_loss / n_effective
         _, lr_vel_used = get_lrs(opt)
         sched.step()
 
+        skip_s = f"  skipped={n_skipped_batches}/{nstep}" if n_skipped_batches > 0 else ""
         print(f"\n  ── Ep{ep:>3}"
               f"  train={train_loss:.6f}"
-              f"  cfm={sum_cfm/nstep:.4f}"
-              f"  reg={sum_reg/nstep:.4f}"
-              f"  h4s={sum_head/nstep:.4f}"
-              f"  ade1={sum_ade1/nstep:.0f}km"
+              f"  cfm={sum_cfm/n_effective:.4f}"
+              f"  reg={sum_reg/n_effective:.4f}"
+              f"  h4s={sum_head/n_effective:.4f}"
+              f"  ade1={sum_ade1/n_effective:.0f}km"
               f"  lr={lr_vel_used:.2e}"
-              f"  t={time.perf_counter()-t0_ep:.0f}s")
+              f"  t={time.perf_counter()-t0_ep:.0f}s"
+              f"{skip_s}")
 
         _save(last_ckpt, ep, model, opt, sched, best_score, ema, scaler,
               model_cfg=model_cfg)
