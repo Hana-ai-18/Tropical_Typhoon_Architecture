@@ -183,13 +183,18 @@ def _norm_to_deg(t: torch.Tensor) -> torch.Tensor:
 
 
 def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-    """Haversine distance km between two (lon°,lat°) tensors."""
     lat1 = torch.deg2rad(p1[..., 1]);  lat2 = torch.deg2rad(p2[..., 1])
     dlat = torch.deg2rad(p2[..., 1] - p1[..., 1])
     dlon = torch.deg2rad(p2[..., 0] - p1[..., 0])
     a = torch.sin(dlat / 2).pow(2) + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2).pow(2)
+    # [NUMERICAL-SAFETY FIX] a can slightly exceed [0,1] from fp32 rounding
+    # even with valid finite inputs (this clamp already existed). Extended
+    # here to also replace any NaN that reached this point from upstream
+    # with a itself never becoming negative/undefined for the asin below —
+    # nan_to_num maps NaN->0 (a=0 => distance=0, a safe/neutral fallback
+    # rather than letting NaN propagate into every downstream loss term).
+    a = torch.nan_to_num(a, nan=0.0, posinf=1.0, neginf=0.0)
     return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
-
 
 def _forward_azimuth(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
     """Bearing in radians from p1→p2 (degrees input)."""
@@ -255,13 +260,28 @@ def _sinkhorn_log(cost: torch.Tensor, epsilon: float = 0.05, n_iter: int = 50) -
     B = cost.shape[0]; device = cost.device
     log_a = -math.log(B) * torch.ones(B, device=device)
     log_b = -math.log(B) * torch.ones(B, device=device)
-    log_K = -cost / epsilon
+    # [NUMERICAL-SAFETY FIX] Clamp log_K's floor so logsumexp cannot
+    # underflow to -inf. -50 in log-space is already an astronomically
+    # small transport probability (exp(-50) ~ 2e-22) — clamping here
+    # only affects pairs that would contribute ~0 to the transport plan
+    # anyway, so the OT solution is numerically identical for any
+    # normal-magnitude cost; it only prevents the -inf/NaN cascade when
+    # cost is unexpectedly large (e.g. from a wide sigma_max or an
+    # extreme augmented sample).
+    log_K = (-cost / epsilon).clamp(min=-50.0)
     log_u = torch.zeros(B, device=device)
     log_v = torch.zeros(B, device=device)
     for _ in range(n_iter):
-        log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
-        log_v = log_b - torch.logsumexp(log_K + log_u.unsqueeze(1), dim=0)
-    return (log_K + log_u.unsqueeze(1) + log_v.unsqueeze(0)).exp().clamp(0.0)
+        log_u = (log_a - torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)).clamp(-50.0, 50.0)
+        log_v = (log_b - torch.logsumexp(log_K + log_u.unsqueeze(1), dim=0)).clamp(-50.0, 50.0)
+    pi = (log_K + log_u.unsqueeze(1) + log_v.unsqueeze(0)).exp().clamp(0.0)
+    # [NUMERICAL-SAFETY FIX] Final NaN/Inf sweep: if anything still slipped
+    # through (e.g. cost itself was NaN from further upstream), replace
+    # with 0 so downstream multinomial sampling in _ot_match degrades
+    # gracefully (falls back to its own try/except path) instead of
+    # propagating NaN into the OT-matched pairs.
+    pi = torch.nan_to_num(pi, nan=0.0, posinf=0.0, neginf=0.0)
+    return pi
 
 
 def _ot_match(x0_flat: torch.Tensor, x1_flat: torch.Tensor,
