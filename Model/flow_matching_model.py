@@ -503,14 +503,34 @@ def hard_score_from_obs(obs_traj_norm: torch.Tensor,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Physics score v2.6 (adds displacement_score) — GIỮ NGUYÊN HẰNG SỐ
+#  Physics score v2.6 (adds displacement_score) — GIỮ NGUYÊN HẰNG SỐ khi
+#  weight_logits=None; HỌC ĐƯỢC khi weight_logits được truyền vào (xem
+#  [LEARN-7]/[LEARN-8] và L_score trong get_loss_breakdown)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@torch.no_grad()
+# [FIX-CRITICAL, BUG PHÁT HIỆN Ở LẦN RÀ SOÁT CUỐI] @torch.no_grad() ĐÃ BỊ
+# XOÁ khỏi đây. Decorator này tồn tại từ bản gốc (khi hàm chỉ được gọi
+# trong sample() dưới no_grad, dùng để tối ưu tốc độ), nhưng khi
+# [LEARN-7]/[LEARN-8] thêm weight_logits/v_sigma_scale_logit/
+# kernel_scale_logits để hàm này HỌC ĐƯỢC qua L_score, decorator này ÉP
+# TOÀN BỘ HÀM CHẠY DƯỚI NO_GRAD BẤT KỂ WEIGHT_LOGITS CÓ ĐƯỢC TRUYỀN VÀO
+# HAY KHÔNG — verified bằng test độc lập: score.requires_grad = False,
+# score.grad_fn = None ngay cả khi mọi input đều requires_grad=True. Đây
+# là lỗi "tham số mồ côi kiểu mới": score_weight_logits/
+# score_v_sigma_scale_logit/score_kernel_scale_logits có vẻ tồn tại đúng
+# vị trí, được truyền vào đúng chỗ, nhưng KHÔNG BAO GIỜ nhận gradient
+# thật vì decorator này chặn toàn bộ graph ngay từ hàm gốc — chính xác
+# loại lỗi mà [LEARN-1] (speed_correction_logits) và mọi [LEARN-*] khác
+# trong file này đã phải sửa. Hàm giờ KHÔNG còn no_grad ở mức decorator;
+# các nơi gọi hàm này CHỈ để lấy giá trị (không train — ví dụ XAI logging,
+# và sample()/sample_multiscale() vốn đã tự bọc @torch.no_grad() ở toàn
+# bộ method chứa chúng) vẫn an toàn vì no_grad context của method cha đã
+# đủ để ngăn build graph không cần thiết ở đó.
 def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
                     use_curvature_score: bool = False,
                     weight_logits: Optional[torch.Tensor] = None,
-                    v_sigma_scale_logit: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    v_sigma_scale_logit: Optional[torch.Tensor] = None,
+                    kernel_scale_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Best-of-K selection score. Four components (five when
     use_curvature_score=True):
@@ -542,6 +562,32 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     no_grad như trước đây): fallback về 4 hằng số cũ đã proven, HÀNH VI
     KHÔNG ĐỔI so với bản gốc — đảm bảo không phá vỡ inference hiện có.
 
+    [LEARN-8, KERNEL SHARPNESS SCALES] Rà soát lại sau [LEARN-7]: 4
+    exponent chỉ là trọng số KẾT HỢP giữa 4 sub-score — nhưng BÊN TRONG
+    mỗi sub-score còn 3 hằng số "độ nhạy kernel" cố định khác, quyết định
+    sub-score đó phạt nặng/nhẹ thế nào với cùng một độ lệch:
+      smooth_score = exp(-accel_mag.mean(0) * 5.0)      <- hệ số 5.0 cố định
+      head_score   = exp((cos_sim - 1.0) * 3.0)          <- hệ số 3.0 cố định
+      disp_score   = exp(-rel_err * 1.5)                 <- hệ số 1.5 cố định
+    (v_sigma_scale của speed_score đã học ở [LEARN-7], KHÔNG lặp lại ở đây)
+    Đây CÙNG LOẠI hằng số tay đoán như 4 exponent — bỏ sót chúng thì
+    [LEARN-7] chỉ học được "trọng số giữa các score" mà không học được
+    "độ nhạy của từng score", vẫn còn cùng vấn đề gốc chưa giải quyết hết.
+    kernel_scale_logits (3 phần tử: [smooth, head, disp], softplus để
+    đảm bảo dương) thay 3 hằng số 5.0/3.0/1.5 CỐ ĐỊNH. Init = log(exp(hằng
+    số gốc)-1) qua softplus-inverse để tái tạo ĐÚNG giá trị gốc tại epoch
+    0 (softplus(init) = hằng số gốc), cùng cơ chế zero-impact-at-init như
+    mọi tham số [LEARN] khác trong file này. None -> fallback hằng số cũ,
+    hành vi KHÔNG ĐỔI (dùng trong sample()/inference như trước [LEARN-7]).
+    w_obs (linspace 0.5->1.0, trọng số v_ref theo thời gian quan sát) và
+    w_curv (linspace 1.0->0.3, chỉ dùng khi use_curvature_score=True) CỐ
+    Ý giữ nguyên dạng linspace: đây là schedule theo THỜI GIAN QUAN SÁT
+    (không phải theo horizon dự đoán như reg_step_logits/heading_step_logits
+    đã học), ảnh hưởng nhỏ hơn nhiều (chỉ đổi trọng số trung bình v_ref,
+    không đổi hình dạng kernel), và mở rộng chúng thành learnable đòi hỏi
+    thêm 1 vector tham số/loss riêng cho lợi ích biên rất nhỏ — để lại cho
+    công việc tương lai nếu cần, không thuộc phạm vi sửa lần này.
+
     [CURV-SCORE] Motivation: head_score above only checks the FIRST
     predicted step's direction against the last observed vector — it is
     blind to whether the candidate's curvature over the FULL horizon
@@ -569,6 +615,15 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     else:
         _v_sigma_scale = 0.5
 
+    # [LEARN-8] 3 kernel sharpness scale (smooth/head/disp), softplus để
+    # đảm bảo dương (giống bản chất "độ nhạy" luôn >0 của hằng số gốc).
+    # None -> fallback 3 hằng số cũ, hành vi không đổi.
+    if kernel_scale_logits is not None:
+        _ks = F.softplus(kernel_scale_logits.to(device))   # [3], luôn > 0
+        _smooth_scale, _head_scale, _disp_scale = _ks[0], _ks[1], _ks[2]
+    else:
+        _smooth_scale, _head_scale, _disp_scale = 5.0, 3.0, 1.5
+
     # ── Speed score ────────────────────────────────────────────────────────
     if traj_deg.shape[0] >= 2 and obs_norm.shape[0] >= 2:
         obs_deg = _norm_to_deg(obs_norm)
@@ -589,7 +644,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     if traj_deg.shape[0] >= 3:
         vel          = traj_deg[1:] - traj_deg[:-1]
         accel_mag    = (vel[1:] - vel[:-1]).norm(dim=-1)
-        smooth_score = torch.exp(-accel_mag.mean(0) * 5.0)
+        smooth_score = torch.exp(-accel_mag.mean(0) * _smooth_scale)
     else:
         smooth_score = torch.ones(B, device=device)
 
@@ -600,7 +655,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
         obs_h    = F.normalize(obs_vel,  dim=-1, eps=1e-6)
         pred_h   = F.normalize(pred_vel, dim=-1, eps=1e-6)
         cos_sim  = (obs_h * pred_h).sum(-1).clamp(-1, 1)
-        head_score = torch.exp((cos_sim - 1.0) * 3.0)
+        head_score = torch.exp((cos_sim - 1.0) * _head_scale)
     else:
         head_score = torch.ones(B, device=device)
 
@@ -637,7 +692,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
         step_dists    = _haversine_deg(traj_deg[:-1], traj_deg[1:])   # [T-1, B]
         actual_total  = step_dists.sum(0)                              # [B]
         rel_err       = (actual_total - expected_total).abs() / expected_total.clamp(min=10.)
-        disp_score    = torch.exp(-rel_err * 1.5)
+        disp_score    = torch.exp(-rel_err * _disp_scale)
     else:
         disp_score    = torch.ones(B, device=device)
 
@@ -1261,6 +1316,26 @@ class TCFlowMatching(nn.Module):
         # giống hệt hằng số cũ tại epoch 0, học dần qua CÙNG L_score.
         self.score_v_sigma_scale_logit = nn.Parameter(torch.zeros(1))
 
+        # [LEARN-8, KERNEL SHARPNESS SCALES] 3 hằng số "độ nhạy kernel" bên
+        # TRONG từng sub-score (khác v_sigma_scale ở trên — đó là độ rộng
+        # Gaussian của RIÊNG speed_score; đây là 3 hệ số scale còn lại của
+        # smooth/head/disp score, trước đây CỐ ĐỊNH 5.0/3.0/1.5):
+        #   smooth_score = exp(-accel_mag.mean(0) * 5.0)
+        #   head_score   = exp((cos_sim - 1.0) * 3.0)
+        #   disp_score   = exp(-rel_err * 1.5)
+        # Dùng softplus(logit) để đảm bảo LUÔN DƯƠNG (giống bản chất "độ
+        # nhạy" không thể âm của hằng số gốc — sigmoid/softmax không phù
+        # hợp ở đây vì các hằng số gốc không bị chặn trong (0,1) hay
+        # tổng=1, chỉ cần dương). Init = softplus^-1(hằng số gốc) =
+        # log(exp(hằng số gốc)-1), để softplus(init) = ĐÚNG hằng số gốc
+        # tại epoch 0 (4.9932 -> softplus=5.0, 2.9489 -> softplus=3.0,
+        # 1.2475 -> softplus=1.5), không phá vỡ hành vi baseline.
+        # Học qua CÙNG L_score (soft-relaxation) với score_weight_logits
+        # và score_v_sigma_scale_logit — 3 tham số này cùng nằm trên một
+        # đường gradient duy nhất, không cần loss riêng.
+        self.score_kernel_scale_logits = nn.Parameter(
+            torch.log(torch.exp(torch.tensor([5.0, 3.0, 1.5])) - 1.0))
+
         # [LEARN-5] Per-step heading constraint weights — TOÀN BỘ pred_len bước.
         # Init = zeros → softmax uniform → mỗi bước bắt đầu với weight bằng nhau.
         #
@@ -1624,6 +1699,7 @@ class TCFlowMatching(nn.Module):
                 _xabsk, obs_traj[:, :, :2],
                 weight_logits=self.score_weight_logits,
                 v_sigma_scale_logit=self.score_v_sigma_scale_logit,
+                kernel_scale_logits=self.score_kernel_scale_logits,
             )   # [B], CÓ gradient (không no_grad)
             _cand_list.append(_xabsk)
             _cand_scores.append(_scorek)
@@ -1715,6 +1791,7 @@ class TCFlowMatching(nn.Module):
             "learned_lambda_score":   float((0.5 * prec_score).detach()),
             "learned_score_weights":  F.softmax(self.score_weight_logits.detach(), dim=0).tolist(),
             "learned_score_v_sigma_scale": float(torch.sigmoid(self.score_v_sigma_scale_logit.detach())),
+            "learned_score_kernel_scales": F.softplus(self.score_kernel_scale_logits.detach()).tolist(),
             # Compat keys
             "l_fm": l_cfm.item(), "dpe": 0., "heading": 0., "vel_reg": 0.,
             "speed": 0., "accel": 0., "fm_mse": l_cfm.item(),
@@ -1860,7 +1937,8 @@ class TCFlowMatching(nn.Module):
         scores  = torch.stack(
             [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score,
                              weight_logits=self.score_weight_logits,
-                             v_sigma_scale_logit=self.score_v_sigma_scale_logit)
+                             v_sigma_scale_logit=self.score_v_sigma_scale_logit,
+                             kernel_scale_logits=self.score_kernel_scale_logits)
              for t in all_traj], 0)   # [K, B]
         all_t   = torch.stack(all_traj, 0)   # [K, T, B, 2]
         top_k   = min(3, K)
@@ -2040,7 +2118,8 @@ class TCFlowMatching(nn.Module):
         scores  = torch.stack(
             [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score,
                              weight_logits=self.score_weight_logits,
-                             v_sigma_scale_logit=self.score_v_sigma_scale_logit)
+                             v_sigma_scale_logit=self.score_v_sigma_scale_logit,
+                             kernel_scale_logits=self.score_kernel_scale_logits)
              for t in all_traj], 0)
         all_t   = torch.stack(all_traj, 0)
         top_k   = min(5, len(all_traj))
