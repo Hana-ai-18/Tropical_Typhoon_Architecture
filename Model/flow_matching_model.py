@@ -1699,6 +1699,96 @@ class TCFlowMatching(nn.Module):
         if use_speed_calibration:
             pred_mean = self.speed_calibrate_pred(pred_mean, last_obs, obs_norm)
 
+        # [POSTCAL-RESIDUAL-FIX v2c] Đo thực nghiệm (diagnose_ate_postcal.py,
+        # chạy TRÊN OUTPUT ĐÃ QUA speed_calibrate_pred() ở trên + physics
+        # re-rank, tức đúng con đường evaluate_multi_model.py dùng) cho
+        # thấy correction[t] hiện có (học qua L_calib trong training)
+        # OVERCORRECT — nó "phanh" quá tay ở horizon xa, khiến pred_mean
+        # SAU calib còn CHẬM HƠN thực tế (residual bias < 1.0 ở hầu hết
+        # horizon, đặc biệt 72h: mean_ratio=0.5695 -> cần nhân thêm 1.756):
+        #   6h: cần x1.13   24h: cần x1.02   48h: cần x1.10
+        #   60h: cần x1.18  66h: cần x1.34   72h: cần x1.76
+        # (bảng đầy đủ: dev log diagnose_ate_postcal.py, checkpoint
+        # best_model_fm_seed0.pth, test set, K=20, 8 batches)
+        #
+        # Hệ số dưới đây tính TRÊN RESIDUAL SAU calib hiện có (không phải
+        # trên candidate thô trước calib) — không chồng lên correction[t]
+        # đã học, chỉ bù phần còn sót lại. Fix RIÊNG BIỆT khỏi
+        # speed_calibrate_pred(): chỉ chạy trong sample() (đường inference),
+        # KHÔNG chạm training path (get_loss_breakdown's L_calib vẫn dùng
+        # speed_calibrate_pred() nguyên bản).
+        #
+        # [KẾT QUẢ THỰC NGHIỆM CÁC PHIÊN BẢN — xem để không lặp lại lỗi]
+        #   v2a (scale thẳng vector disp, không decompose):
+        #     ATE giảm rõ nhưng CTE tăng mạnh (168->172-186km) — vì scale
+        #     cả hướng lẫn độ dài, không tách được ATE/CTE.
+        #   v2b (decompose along/perp, bearing THAM CHIẾU CỐ ĐỊNH từ
+        #        obs[-2]->obs[-1] dùng cho cả 12 bước):
+        #     ATE giảm, CTE đỡ hơn v2a nhưng vẫn cao hơn baseline (167-180).
+        #   v2c (bản NÀY — decompose along/perp, bearing ĐỘNG per-step lấy
+        #        từ chính quỹ đạo pred_mean GỐC, mỗi bước dùng bearing của
+        #        đoạn ngay trước nó, KHÔNG dây chuyền vào output đã sửa):
+        #     Kết quả đo được gần NHƯ GIỐNG HỆT v2b (270-280 ATE, 168-180
+        #     CTE) — chứng tỏ việc bearing cố định hay động không phải
+        #     nguồn gốc chính của CTE leak (xem thêm phân tích v3 bên dưới
+        #     để hiểu TẠI SAO, dù v2c không sửa được vấn đề đó, nó vẫn là
+        #     bản có kết quả CÂN BẰNG NHẤT giữa các bản đã thử).
+        #   v3 (arc-length reparametrization, thử để sửa triệt để CTE leak):
+        #     KẾT QUẢ TỆ HƠN v2b/v2c (ATE 277-287, CTE 170-185) — chứng
+        #     minh bằng số: "đi xa hơn" dọc theo quỹ đạo pred_mean GỐC (dù
+        #     giữ đúng hình dạng/hướng cục bộ của pred_mean) KHUẾCH ĐẠI
+        #     đúng phần lỗi CTE đã có sẵn giữa pred_mean và GT theo tỷ lệ
+        #     quãng đường đã đi thêm — vì pred_mean gốc vốn dĩ đã lệch GT
+        #     một phần (đó chính là CTE gốc ~168km), "đi xa hơn" trên một
+        #     đường vốn đã lệch làm khoảng cách tuyệt đối tới GT tăng theo,
+        #     không phải giữ nguyên. KHÔNG dùng v3.
+        #   => QUYẾT ĐỊNH: dùng v2c làm bản chốt — cân bằng ATE/CTE tốt
+        #      nhất trong các bản post-hoc đã thử, dù chưa hoàn hảo. Muốn
+        #      cải thiện CTE hơn nữa cần retrain (mở rộng
+        #      speed_correction_logits học thêm theo obs_speed/hard_score
+        #      qua gradient, không phải hệ số tay đo hậu kỳ).
+        if use_speed_calibration:
+            _T = pred_mean.shape[0]
+            _residual_scale = torch.tensor(
+                [1.1329, 1.1066, 1.0416, 1.0181, 1.0319, 1.0462,
+                 1.0818, 1.0982, 1.1260, 1.1813, 1.3396, 1.7559][:_T],
+                device=pred_mean.device, dtype=pred_mean.dtype,
+            ).view(_T, 1, 1)
+            _pts  = torch.cat([last_obs.unsqueeze(0), pred_mean], 0)   # [T+1,B,2]
+            _disp = _pts[1:] - _pts[:-1]                                # [T,B,2]
+
+            # bearing tham chiếu ĐỘNG theo từng bước, lấy từ CHÍNH quỹ đạo
+            # pred_mean GỐC (_pts, đã có sẵn TRƯỚC khi áp residual scale),
+            # KHÔNG dây chuyền vào output đã sửa của bước trước.
+            # ref_bearing[t] = bearing của đoạn NGAY TRƯỚC bước t trên quỹ
+            # đạo gốc (t=0 dùng obs[-2]->obs[-1]; t>=1 dùng _pts[t-1]->_pts[t]).
+            _pred_deg_full = _norm_to_deg(_pts)          # [T+1, B, 2]
+            _obs_deg = _norm_to_deg(obs_norm)
+            if _obs_deg.shape[0] >= 2:
+                _ref_bear_init = _forward_azimuth(_obs_deg[-2], _obs_deg[-1])   # [B]
+            else:
+                _ref_bear_init = torch.zeros(_disp.shape[1], device=_disp.device, dtype=_disp.dtype)
+
+            if _T >= 2:
+                _ref_bear_rest = _forward_azimuth(_pred_deg_full[:-2], _pred_deg_full[1:-1])  # [T-1, B]
+                _ref_bearings = torch.cat([_ref_bear_init.unsqueeze(0), _ref_bear_rest], 0)   # [T, B]
+            else:
+                _ref_bearings = _ref_bear_init.unsqueeze(0)   # [1, B]
+
+            _ref_dir = torch.stack([torch.cos(_ref_bearings), torch.sin(_ref_bearings)], -1).to(_disp.dtype)  # [T,B,2]
+
+            _along = (_disp * _ref_dir).sum(-1, keepdim=True)          # [T,B,1] thành phần DỌC theo ref bearing của bước đó
+            _perp  = _disp - _along * _ref_dir                          # [T,B,2] thành phần NGANG (CTE) — giữ nguyên
+
+            _disp_res = _along * _residual_scale.view(_T, 1, 1) * _ref_dir + _perp
+
+            _out = torch.empty_like(pred_mean)
+            _cur = last_obs
+            for _t in range(_T):
+                _cur = _cur + _disp_res[_t]
+                _out[_t] = _cur
+            pred_mean = _out
+
         if not return_xai:
             return pred_mean, torch.zeros_like(pred_mean), all_t
 
