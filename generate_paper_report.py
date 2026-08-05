@@ -1520,7 +1520,7 @@ HORIZON_LEAD_TIMES = {"6h": 1, "12h": 2, "24h": 4, "48h": 8, "72h": 12}
 # If your evaluate_multi_model.py emits 0-indexed lead_time instead,
 # pass --lead_time_zero_indexed to shift this mapping by -1.
 
-ALL_MODELS = ["FM", "ST-Trans", "LSTM", "GRU", "RNN", "MGTCF", "Phys-Diff"]
+ALL_MODELS = ["FM", "ST-Trans", "LSTM", "GRU", "RNN", "MMSTN", "Phys-Diff", "TC-Diffuser"]
 
 # ─── Constants dùng riêng cho phần PLOT (giữ tách khỏi HORIZON_LEAD_TIMES
 # ở trên, vốn chỉ có 5 mốc cho bảng per-horizon — phần plot cần đủ 12 mốc
@@ -1531,17 +1531,20 @@ MODEL_COLORS = {
     "LSTM":      "#2CA02C",
     "GRU":       "#9467BD",
     "RNN":       "#8C564B",
-    # [MỚI] MGTCF (GAN, Huang et al. 2023/2025) và Phys-Diff (latent
-    # diffusion, Liu et al. 2026) — 2 baseline generative bổ sung.
-    "MGTCF":     "#17BECF",   # cyan — họ GAN
-    "Phys-Diff": "#E377C2",   # hồng — họ diffusion
+    # MMSTN (Social-GAN style, Faiaz lineage), Phys-Diff (PIGA-augmented
+    # latent DDPM), and TC-Diffuser (velocity-space DDPM, Trajectron++
+    # lineage) — 3 additional generative baselines, all sharing PaperEncoder
+    # (FNO3D+Mamba+Env_net) with the deterministic baselines above.
+    "MMSTN":       "#17BECF",   # cyan — GAN family
+    "Phys-Diff":   "#E377C2",   # pink — diffusion family (latent)
+    "TC-Diffuser": "#BCBD22",   # olive — diffusion family (velocity-space)
 }
 # yếu->mạnh theo trực giác kiến trúc (RNN-family < Transformer < generative
-# models); THỨ TỰ TƯƠNG ĐỐI GIỮA MGTCF/Phys-Diff/FM (3 model generative)
-# nên được XÁC NHẬN LẠI dựa trên ADE thực đo được sau khi train xong 3
-# seed — thứ tự dưới đây chỉ là placeholder hợp lý ban đầu, không phải
-# khẳng định trước kết quả.
-MODEL_PLOT_ORDER = ["RNN", "LSTM", "GRU", "ST-Trans", "MGTCF", "Phys-Diff", "FM"]
+# models); THỨ TỰ TƯƠNG ĐỐI GIỮA MMSTN/Phys-Diff/TC-Diffuser/FM (4 model
+# generative) nên được XÁC NHẬN LẠI dựa trên ADE thực đo được sau khi train
+# xong 3 seed — thứ tự dưới đây chỉ là placeholder hợp lý ban đầu, không
+# phải khẳng định trước kết quả.
+MODEL_PLOT_ORDER = ["RNN", "LSTM", "GRU", "ST-Trans", "MMSTN", "Phys-Diff", "TC-Diffuser", "FM"]
 
 HORIZON_LEAD_TIMES_FULL = {"6h": 1, "12h": 2, "18h": 3, "24h": 4, "30h": 5, "36h": 6,
                             "42h": 7, "48h": 8, "54h": 9, "60h": 10, "66h": 11, "72h": 12}
@@ -2677,7 +2680,7 @@ def main():
                    help="Path to multi_model_<split>.json from evaluate_multi_model.py")
     p.add_argument("--baseline_model", default="FM")
     p.add_argument("--compare_against", nargs="+",
-                   default=["ST-Trans", "RNN", "GRU", "LSTM", "MGTCF", "Phys-Diff"])
+                   default=["ST-Trans", "RNN", "GRU", "LSTM", "MMSTN", "Phys-Diff", "TC-Diffuser"])
     p.add_argument("--metrics", nargs="+", default=["ade", "ate", "cte"],
                    choices=["ade", "ate", "cte"])
     p.add_argument("--output_dir", default="eval_multi",
