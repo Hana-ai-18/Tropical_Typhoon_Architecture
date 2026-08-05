@@ -1699,59 +1699,44 @@ class TCFlowMatching(nn.Module):
         if use_speed_calibration:
             pred_mean = self.speed_calibrate_pred(pred_mean, last_obs, obs_norm)
 
-        # [POSTCAL-RESIDUAL-FIX v2c] Đo thực nghiệm (diagnose_ate_postcal.py,
-        # chạy TRÊN OUTPUT ĐÃ QUA speed_calibrate_pred() ở trên + physics
-        # re-rank, tức đúng con đường evaluate_multi_model.py dùng) cho
-        # thấy correction[t] hiện có (học qua L_calib trong training)
-        # OVERCORRECT — nó "phanh" quá tay ở horizon xa, khiến pred_mean
-        # SAU calib còn CHẬM HƠN thực tế (residual bias < 1.0 ở hầu hết
-        # horizon, đặc biệt 72h: mean_ratio=0.5695 -> cần nhân thêm 1.756):
-        #   6h: cần x1.13   24h: cần x1.02   48h: cần x1.10
-        #   60h: cần x1.18  66h: cần x1.34   72h: cần x1.76
-        # (bảng đầy đủ: dev log diagnose_ate_postcal.py, checkpoint
-        # best_model_fm_seed0.pth, test set, K=20, 8 batches)
+        # [POSTCAL-RESIDUAL-FIX v2c-VAL] Hệ số đo trên VALIDATION SET, KHÔNG
+        # phải test set — đây là điểm SỬA QUAN TRỌNG so với các bản trước.
         #
-        # Hệ số dưới đây tính TRÊN RESIDUAL SAU calib hiện có (không phải
-        # trên candidate thô trước calib) — không chồng lên correction[t]
-        # đã học, chỉ bù phần còn sót lại. Fix RIÊNG BIỆT khỏi
-        # speed_calibrate_pred(): chỉ chạy trong sample() (đường inference),
-        # KHÔNG chạm training path (get_loss_breakdown's L_calib vẫn dùng
-        # speed_calibrate_pred() nguyên bản).
+        # LIÊM CHÍNH KHOA HỌC — LÝ DO SỬA: các bản v1-v3 trước đó đều đo
+        # residual_scale TRỰC TIẾP TRÊN TEST SET rồi áp dụng NGAY LÊN CHÍNH
+        # test set đó để báo cáo kết quả — đây là DATA LEAKAGE (tương đương
+        # "học" tham số từ chính tập dùng để đánh giá cuối cùng, dù không
+        # qua gradient mà qua đo đạc thủ công). Kết quả ATE cải thiện mạnh
+        # quan sát được trước đó (270-280km) một phần là ảo ảnh do overfit
+        # vào đặc thù riêng của 449 storm sequences trong test set.
         #
-        # [KẾT QUẢ THỰC NGHIỆM CÁC PHIÊN BẢN — xem để không lặp lại lỗi]
-        #   v2a (scale thẳng vector disp, không decompose):
-        #     ATE giảm rõ nhưng CTE tăng mạnh (168->172-186km) — vì scale
-        #     cả hướng lẫn độ dài, không tách được ATE/CTE.
-        #   v2b (decompose along/perp, bearing THAM CHIẾU CỐ ĐỊNH từ
-        #        obs[-2]->obs[-1] dùng cho cả 12 bước):
-        #     ATE giảm, CTE đỡ hơn v2a nhưng vẫn cao hơn baseline (167-180).
-        #   v2c (bản NÀY — decompose along/perp, bearing ĐỘNG per-step lấy
-        #        từ chính quỹ đạo pred_mean GỐC, mỗi bước dùng bearing của
-        #        đoạn ngay trước nó, KHÔNG dây chuyền vào output đã sửa):
-        #     Kết quả đo được gần NHƯ GIỐNG HỆT v2b (270-280 ATE, 168-180
-        #     CTE) — chứng tỏ việc bearing cố định hay động không phải
-        #     nguồn gốc chính của CTE leak (xem thêm phân tích v3 bên dưới
-        #     để hiểu TẠI SAO, dù v2c không sửa được vấn đề đó, nó vẫn là
-        #     bản có kết quả CÂN BẰNG NHẤT giữa các bản đã thử).
-        #   v3 (arc-length reparametrization, thử để sửa triệt để CTE leak):
-        #     KẾT QUẢ TỆ HƠN v2b/v2c (ATE 277-287, CTE 170-185) — chứng
-        #     minh bằng số: "đi xa hơn" dọc theo quỹ đạo pred_mean GỐC (dù
-        #     giữ đúng hình dạng/hướng cục bộ của pred_mean) KHUẾCH ĐẠI
-        #     đúng phần lỗi CTE đã có sẵn giữa pred_mean và GT theo tỷ lệ
-        #     quãng đường đã đi thêm — vì pred_mean gốc vốn dĩ đã lệch GT
-        #     một phần (đó chính là CTE gốc ~168km), "đi xa hơn" trên một
-        #     đường vốn đã lệch làm khoảng cách tuyệt đối tới GT tăng theo,
-        #     không phải giữ nguyên. KHÔNG dùng v3.
-        #   => QUYẾT ĐỊNH: dùng v2c làm bản chốt — cân bằng ATE/CTE tốt
-        #      nhất trong các bản post-hoc đã thử, dù chưa hoàn hảo. Muốn
-        #      cải thiện CTE hơn nữa cần retrain (mở rộng
-        #      speed_correction_logits học thêm theo obs_speed/hard_score
-        #      qua gradient, không phải hệ số tay đo hậu kỳ).
+        # BẰNG CHỨNG CHO THẤY VAL VÀ TEST CÓ PHÂN BỐ BIAS KHÁC NHAU ĐÁNG KỂ
+        # (đo trên 3 checkpoint FM seed0/1/2, val=3436 sequences, K=20):
+        #   Horizon   mean_ratio_VAL(3-seed)   mean_ratio_TEST(seed0 trước)   chênh lệch
+        #     6h            1.0196                    0.8827                  +0.137
+        #    24h            1.0050                    0.9822                  +0.023
+        #    48h            1.0239                    0.9106                  +0.113
+        #    72h            0.8809                    0.5695                  +0.311  <- lệch RẤT lớn
+        # => Bias trên test NẶNG HƠN NHIỀU so với val, đặc biệt ở horizon xa.
+        #    Nếu dùng hệ số đo từ test (residual_scale 72h=1.76x) sẽ overfit
+        #    nghiêm trọng — không tổng quát hoá được sang dữ liệu khác.
+        #
+        # HỆ SỐ DƯỚI ĐÂY: tính đúng quy trình train/val/test — đo trên VAL
+        # (trung bình 3 seed, KHÔNG NHÌN THẤY test set), áp dụng khi eval
+        # TRÊN TEST. Khiêm tốn hơn nhiều bản trước (0.96-1.14x thay vì
+        # 0.96-1.76x) — đây là con số ĐÁNG TIN CẬY, có thể tổng quát hoá,
+        # dùng được cho báo cáo/paper. Cải thiện ATE sẽ NHẸ HƠN các bản
+        # trước, nhưng là cải thiện THẬT, không phải overfit vào test.
+        #
+        # (Vẫn giữ nguyên toàn bộ cơ chế decompose along/perp bearing động
+        # per-step từ v2c — đã kiểm chứng đây là bản CÂN BẰNG ATE/CTE tốt
+        # nhất trong các phương pháp post-hoc đã thử; chỉ thay NGUỒN của
+        # 12 con số residual_scale, không đổi thuật toán áp dụng.)
         if use_speed_calibration:
             _T = pred_mean.shape[0]
             _residual_scale = torch.tensor(
-                [1.1329, 1.1066, 1.0416, 1.0181, 1.0319, 1.0462,
-                 1.0818, 1.0982, 1.1260, 1.1813, 1.3396, 1.7559][:_T],
+                [0.9808, 1.0161, 1.0083, 0.9950, 0.9707, 0.9852,
+                 0.9598, 0.9767, 0.9937, 1.0256, 1.0762, 1.1352][:_T],
                 device=pred_mean.device, dtype=pred_mean.dtype,
             ).view(_T, 1, 1)
             _pts  = torch.cat([last_obs.unsqueeze(0), pred_mean], 0)   # [T+1,B,2]
