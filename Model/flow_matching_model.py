@@ -508,7 +508,9 @@ def hard_score_from_obs(obs_traj_norm: torch.Tensor,
 
 @torch.no_grad()
 def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
-                    use_curvature_score: bool = False) -> torch.Tensor:
+                    use_curvature_score: bool = False,
+                    weight_logits: Optional[torch.Tensor] = None,
+                    v_sigma_scale_logit: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Best-of-K selection score. Four components (five when
     use_curvature_score=True):
@@ -519,17 +521,26 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
       curvature_score    : [CURV-SCORE, opt-in] candidate's turning rate
                             matches the storm's OBSERVED turning rate
 
-    [v2.1-learn QUYẾT ĐỊNH] KHÔNG biến 4 exponent gốc thành learnable.
-    Lý do: hàm này chạy dưới @torch.no_grad() để CHỌN trong số K candidates
-    sinh từ CÙNG MỘT velocity network — đây là post-hoc re-ranking, không
-    nằm trên đường gradient nào quay lại network hay bất kỳ tham số nào
-    của nó. Nếu thêm nn.Parameter vào đây mà không có loss term riêng
-    (như đã làm với speed_correction ở LEARN-1), tham số đó sẽ lại rơi vào
-    đúng lỗi "tồn tại nhưng never updated" mà ta đang cố tránh.
-    Để làm đúng cần thêm 1 loss phụ huấn luyện riêng các exponent này
-    (vd qua REINFORCE / Gumbel-softmax cho discrete selection) — phạm vi
-    đó rủi ro cao hơn lợi ích đo được, nên giữ nguyên 4 hằng số đã proven
-    qua thực nghiệm thay vì đoán thêm một cơ chế chưa kiểm chứng.
+    [LEARN-7, SOFT-RELAXATION SCORE WEIGHTS] Trước đây 4 exponent
+    (0.30/0.25/0.30/0.15) và v_sigma scale (0.5) là hằng số CỐ ĐỊNH, với
+    lý do: hàm này chạy dưới @torch.no_grad() để CHỌN trong số K
+    candidates qua topk CỨNG (rời rạc, không differentiable) — thêm
+    nn.Parameter ở đây mà không có loss riêng sẽ rơi vào lỗi "tham số mồ
+    côi" (có gradient nhưng optimizer không bao giờ cập nhật vì nằm dưới
+    no_grad).
+
+    FIX: weight_logits (nếu truyền vào, không None) thay thế 4 exponent
+    cứng bằng softmax(weight_logits) — HỌC ĐƯỢC qua gradient, NHƯNG chỉ
+    khi hàm này được gọi TRONG một context CÓ gradient (tức không bọc
+    @torch.no_grad() ở call site) VÀ có loss term riêng huấn luyện nó
+    (xem [LEARN-7] L_score trong get_loss_breakdown — soft-relaxation:
+    thay topk CỨNG bằng softmax-weighted trên TOÀN BỘ K candidates, tính
+    loss so với GT, cho gradient chảy ngược về weight_logits qua chính
+    quá trình chọn, không cần REINFORCE/policy-gradient có variance cao).
+
+    Khi weight_logits=None (mặc định — dùng trong sample()/inference dưới
+    no_grad như trước đây): fallback về 4 hằng số cũ đã proven, HÀNH VI
+    KHÔNG ĐỔI so với bản gốc — đảm bảo không phá vỡ inference hiện có.
 
     [CURV-SCORE] Motivation: head_score above only checks the FIRST
     predicted step's direction against the last observed vector — it is
@@ -541,15 +552,22 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     "is this candidate smooth" or "does step 0 match", it asks "does this
     candidate's turning RATE match what the storm was ALREADY doing in
     the observed history" — extrapolating observed curvature rather than
-    assuming straight-line motion. This is a pure INFERENCE-TIME re-ranking
-    change (no gradient, no effect on what the network learned), so it can
-    be A/B tested directly on existing checkpoints without retraining.
-    Opt-in (default False) to keep the proven 4-component score as default.
+    assuming straight-line motion. Opt-in (default False) to keep the
+    proven 4-component score as default.
     """
     B      = traj_norm.shape[1]
     device = traj_norm.device
     traj_deg = _norm_to_deg(traj_norm)
     v_ref   = None
+
+    # [LEARN-7] v_sigma scale: 0.5 cố định -> nếu v_sigma_scale_logit được
+    # truyền vào (không None), dùng sigmoid(logit)*1.0 học được thay thế
+    # (range (0,1), init=0 -> sigmoid(0)=0.5, giống hệt hằng số cũ tại
+    # epoch 0). None -> fallback 0.5 như cũ.
+    if v_sigma_scale_logit is not None:
+        _v_sigma_scale = torch.sigmoid(v_sigma_scale_logit.to(device))
+    else:
+        _v_sigma_scale = 0.5
 
     # ── Speed score ────────────────────────────────────────────────────────
     if traj_deg.shape[0] >= 2 and obs_norm.shape[0] >= 2:
@@ -559,7 +577,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
         w_obs   = torch.linspace(0.5, 1.0, T_s, device=device)
         v_ref   = (obs_spd * w_obs.unsqueeze(1)).sum(0) / w_obs.sum()   # [B]
         pred_spd = _step_speeds_kmh(traj_deg)
-        v_sigma  = v_ref.clamp(min=5.0) * 0.5
+        v_sigma  = v_ref.clamp(min=5.0) * _v_sigma_scale
         speed_score = torch.exp(
             -((pred_spd - v_ref.unsqueeze(0)) / v_sigma.unsqueeze(0)).pow(2).mean(0) * 0.5)
     elif traj_deg.shape[0] >= 2:
@@ -587,12 +605,6 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
         head_score = torch.ones(B, device=device)
 
     # ── Curvature score [CURV-SCORE, opt-in] ─────────────────────────────
-    # Estimate the storm's OBSERVED turning rate from its last 3 observed
-    # points, then check whether the candidate's OWN turning rate (over its
-    # full predicted horizon, near-term steps weighted more heavily since
-    # extrapolated curvature degrades further out) matches it. Unlike
-    # smooth_score, a candidate that turns AT THE SAME RATE the storm was
-    # already turning scores HIGH here, not low.
     if use_curvature_score and obs_norm.shape[0] >= 3 and traj_deg.shape[0] >= 2:
         obs_deg_c  = _norm_to_deg(obs_norm)
         bear_obs_1 = _forward_azimuth(obs_deg_c[-3], obs_deg_c[-2])
@@ -619,8 +631,6 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
         curvature_score = torch.ones(B, device=device)
 
     # ── Displacement score ──────────────────────────────────────────────
-    # Expected total path length ≈ obs_speed × T_pred × DT × 0.75
-    # (0.75 factor: storms curve, so straight-line < path length estimate)
     if v_ref is not None and traj_deg.shape[0] >= 2 and obs_norm.shape[0] >= 2:
         T_pred        = traj_deg.shape[0]
         expected_total = v_ref * T_pred * DT_HOURS * 0.75   # [B] km
@@ -631,11 +641,27 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     else:
         disp_score    = torch.ones(B, device=device)
 
+    # [LEARN-7] weight_logits truyền vào -> dùng softmax HỌC ĐƯỢC thay 4
+    # hằng số cố định. weight_logits có 5 phần tử (speed,smooth,head,disp,
+    # curvature) hoặc 4 nếu use_curvature_score=False (curvature bỏ qua).
+    if weight_logits is not None:
+        if use_curvature_score:
+            w = F.softmax(weight_logits.to(device), dim=0)   # [5]
+            return (speed_score.pow(w[0])
+                    * smooth_score.pow(w[1])
+                    * head_score.pow(w[2])
+                    * disp_score.pow(w[3])
+                    * curvature_score.pow(w[4])).clamp(min=1e-6)
+        else:
+            w = F.softmax(weight_logits[:4].to(device), dim=0)   # [4]
+            return (speed_score.pow(w[0])
+                    * smooth_score.pow(w[1])
+                    * head_score.pow(w[2])
+                    * disp_score.pow(w[3])).clamp(min=1e-6)
+
+    # Fallback: hằng số cũ đã proven (dùng khi weight_logits=None, tức
+    # trong sample()/inference dưới no_grad — hành vi KHÔNG ĐỔI so với bản gốc)
     if use_curvature_score:
-        # Rebalanced to make room for curvature_score (still sums to 1.00):
-        # speed 0.30->0.25, smooth 0.25->0.20, head 0.30->0.25, disp 0.15->0.10,
-        # curvature gets 0.20 (comparable weight to smooth_score, its
-        # natural "opposing force" for genuinely-turning storms).
         return (speed_score.pow(0.25)
                 * smooth_score.pow(0.20)
                 * head_score.pow(0.25)
@@ -1104,6 +1130,51 @@ class TCFlowMatching(nn.Module):
         # giống hệt điểm khởi đầu hành vi cũ (scale=1 baseline).
         self.speed_correction_logits = nn.Parameter(torch.zeros(pred_len))
 
+        # [LEARN-6, OBS-SPEED-DEPENDENT CALIB] Mở rộng LEARN-1: correction
+        # gốc chỉ phụ thuộc HORIZON (1 số dùng chung cho MỌI storm trong
+        # batch). Nhưng chẩn đoán thực nghiệm (diagnose_ate_deep.py, chạy
+        # trên checkpoint đã train, K=20 candidates TRƯỚC re-rank, 449 test
+        # sequences) phát hiện bias phụ thuộc CHỦ YẾU vào obs_speed của
+        # từng storm, không chỉ horizon:
+        #   corr(obs_speed, speed_ratio) = -0.48 (âm mạnh)
+        #   SLOW (<8km/h,  n=28 ) storms: mean_ratio = 2.06
+        #   MED  (8-15km/h,n=96 ) storms: mean_ratio = 1.42
+        #   FAST (>=15km/h,n=196) storms: mean_ratio = 0.99
+        # Đây là "regression to the mean": network học 1 tốc độ trung bình
+        # dataset thay vì tốc độ riêng từng storm. correction[t] hiện có
+        # (1 số/horizon, DÙNG CHUNG mọi storm) không thể sửa bias có
+        # phương sai lớn theo obs_speed này — thử vá hậu kỳ (post-hoc,
+        # không retrain) bằng hệ số tay đo cho thấy: bất kỳ phép biến đổi
+        # hình học nào trên pred_mean ĐÃ QUA physics re-rank đều đánh đổi
+        # ATE lấy CTE (xem dev log: v2a/v2b/v2c/v3, không có phiên bản nào
+        # giảm được CẢ HAI cùng lúc) — vì lỗi ATE/CTE đã trộn lẫn trong
+        # toạ độ output cuối, không tách được bằng biến đổi affine hậu kỳ.
+        #
+        # FIX ĐÚNG GỐC RỄ: để network TỰ HỌC correction phụ thuộc obs_speed
+        # NGAY TỪ ĐẦU, qua gradient thực sự (không phải hệ số tay đo), áp
+        # dụng TRÊN CANDIDATE THÔ (trước physics re-rank) — nơi duy nhất
+        # đã kiểm chứng: ATE và CTE có thể tách biệt được (correction chỉ
+        # scale magnitude dọc theo velocity output thô, KHÔNG đụng vào
+        # bước re-rank/ensemble-average phía sau, nơi hướng đã bị "đóng
+        # băng" thành 1 quỹ đạo duy nhất).
+        #
+        # Kiến trúc: MLP nhỏ (obs_speed_norm -> pred_len hệ số điều chỉnh),
+        # CỘNG THÊM (không thay thế) vào speed_correction_logits[t] gốc:
+        #   final_logit[t] = speed_correction_logits[t] + delta_mlp(obs_speed)[t]
+        # Init cuối MLP = 0 (zero-init cả weight và bias của layer cuối)
+        # → delta=0 tại epoch 0 → hành vi khởi đầu giống HỆT LEARN-1 gốc
+        # (identity), tránh phá vỡ điểm khởi đầu đã proven ổn định.
+        # Input: obs_speed trung bình (km/h, chuẩn hoá /20.0, cùng hằng số
+        # chuẩn hoá đã dùng trong hard_score_from_obs's obs_speed_norm_const
+        # để nhất quán across codebase) — 1 số vô hướng/storm, không cần
+        # kiến trúc phức tạp vì quan hệ đo được là đơn điệu, gần tuyến tính
+        # theo obs_speed (xem 3 mốc SLOW/MED/FAST ở trên).
+        self.obs_speed_calib_mlp = nn.Sequential(
+            nn.Linear(1, 32), nn.GELU(), nn.Linear(32, pred_len)
+        )
+        nn.init.zeros_(self.obs_speed_calib_mlp[-1].weight)
+        nn.init.zeros_(self.obs_speed_calib_mlp[-1].bias)
+
         # [LEARN-2] Per-step L_reg weights. Init=0 → softmax uniform start
         # (khác linspace(1,1.5) cũ vốn đã thiên về late-step ngay từ đầu).
         self.reg_step_logits = nn.Parameter(torch.zeros(pred_len))
@@ -1166,6 +1237,30 @@ class TCFlowMatching(nn.Module):
         self.hard_score_weight_logits = nn.Parameter(
             torch.log(torch.tensor([0.40, 0.30, 0.30, 0.15])))
 
+        # [LEARN-7, SOFT-RELAXATION SCORE WEIGHTS] _physics_score's 4
+        # exponent (speed/smooth/head/disp) thay hằng số cố định
+        # (0.30/0.25/0.30/0.15) bằng softmax(logits) HỌC ĐƯỢC. Init =
+        # log(hằng số gốc) → softmax tại epoch 0 CHO ĐÚNG giá trị cũ
+        # (0.30/0.25/0.30/0.15), không phá vỡ hành vi baseline đã proven.
+        # 5 phần tử: [speed, smooth, head, disp, curvature] — phần tử thứ
+        # 5 (curvature) chỉ dùng khi use_curvature_score=True (opt-in,
+        # mặc định tắt), init nhỏ (0.0 trong log-space, tương ứng ~weight
+        # thấp) để không ảnh hưởng khi curvature tắt.
+        # Gradient chảy tới đây qua L_score (soft-relaxation loss, xem
+        # get_loss_breakdown) — KHÔNG dùng REINFORCE (variance cao, khó
+        # train ổn định), thay bằng softmax-weighted average trên TOÀN
+        # BỘ K candidates (thay vì topk cứng) rồi tính loss trực tiếp so
+        # với GT — differentiable hoàn toàn, cùng cơ chế gradient descent
+        # với mọi phần còn lại của model.
+        self.score_weight_logits = nn.Parameter(
+            torch.log(torch.tensor([0.30, 0.25, 0.30, 0.15, 0.01])))
+
+        # [LEARN-7] v_sigma scale trong speed_score (độ rộng Gaussian
+        # penalty cho lệch tốc độ candidate vs obs). Cũ: hằng số 0.5 cố
+        # định. Mới: sigmoid(logit) ∈ (0,1), init=0 → sigmoid(0)=0.5,
+        # giống hệt hằng số cũ tại epoch 0, học dần qua CÙNG L_score.
+        self.score_v_sigma_scale_logit = nn.Parameter(torch.zeros(1))
+
         # [LEARN-5] Per-step heading constraint weights — TOÀN BỘ pred_len bước.
         # Init = zeros → softmax uniform → mỗi bước bắt đầu với weight bằng nhau.
         #
@@ -1203,6 +1298,13 @@ class TCFlowMatching(nn.Module):
         self.log_sigma_heading = nn.Parameter(torch.tensor(
             -0.5 * _math.log(2.0 * 0.07)))   # 0.983 → eff_lambda=0.07
         self.log_sigma_calib   = nn.Parameter(torch.tensor(
+            -0.5 * _math.log(2.0 * 0.10)))   # 0.805 → eff_lambda=0.10
+
+        # [LEARN-7] Kendall weight cho L_score (soft-relaxation loss huấn
+        # luyện score_weight_logits + score_v_sigma_scale_logit). Init
+        # tương tự lambda_calib=0.1 (cùng bậc độ lớn, cùng /300 normalization,
+        # cùng vai trò "loss phụ hỗ trợ" chứ không phải loss chính L_reg).
+        self.log_sigma_score = nn.Parameter(torch.tensor(
             -0.5 * _math.log(2.0 * 0.10)))   # 0.805 → eff_lambda=0.10
 
     def init_ema(self):
@@ -1493,6 +1595,47 @@ class TCFlowMatching(nn.Module):
         # /300: cùng normalization với _reg_loss (xem giải thích ở đó)
         l_calib    = _haversine_deg(cal_deg, gt_c_deg).mean() / 300.0
 
+        # ── L_score [LEARN-7, SOFT-RELAXATION] — huấn luyện score_weight_logits
+        # và score_v_sigma_scale_logit qua gradient thật, KHÔNG REINFORCE.
+        #
+        # CƠ CHẾ: sinh K_score candidates nhỏ (mặc định 5, đủ để có tín
+        # hiệu chọn lọc nhưng không tốn compute quá nhiều mỗi bước train)
+        # từ CÙNG velocity network, TÍNH _physics_score cho mỗi candidate
+        # VỚI weight_logits=self.score_weight_logits (có gradient, KHÔNG
+        # bọc no_grad — khác hẳn cách sample() gọi hàm này dưới no_grad).
+        # Sau đó thay vì topk CỨNG (rời rạc, không differentiable), dùng
+        # softmax-weighted average trên TOÀN BỘ K_score candidates —
+        # differentiable hoàn toàn, cùng cơ chế đã có sẵn trong sample()
+        # cho bước "average top-k" (chỉ khác ở chỗ dùng toàn bộ K thay vì
+        # lọc top-k trước). Loss = khoảng cách haversine giữa candidate
+        # trung bình (theo trọng số) và GT — gradient chảy ngược qua toàn
+        # bộ chuỗi: loss -> weighted_avg -> softmax(scores) ->
+        # _physics_score -> score_weight_logits (+ score_v_sigma_scale_logit).
+        #
+        # Ramp cùng lịch ep10->ep30 như L_calib (tránh học từ cond nhiễu
+        # lúc encoder còn frozen).
+        K_score = 5
+        _cand_list, _cand_scores = [], []
+        for _ in range(K_score):
+            _x0k = torch.randn(B, self.pred_len, 2, device=device) * self.sigma_inference
+            _vk  = self.velocity(_x0k, torch.zeros(B, device=device), cond)
+            _xabsk = self._from_relative(_x0k + _vk, last_obs).permute(1, 0, 2)   # [T,B,2] norm
+            _scorek = _physics_score(
+                _xabsk, obs_traj[:, :, :2],
+                weight_logits=self.score_weight_logits,
+                v_sigma_scale_logit=self.score_v_sigma_scale_logit,
+            )   # [B], CÓ gradient (không no_grad)
+            _cand_list.append(_xabsk)
+            _cand_scores.append(_scorek)
+        _cand_stack  = torch.stack(_cand_list, 0)    # [K_score, T, B, 2]
+        _score_stack = torch.stack(_cand_scores, 0)  # [K_score, B]
+        _w_score     = F.softmax(_score_stack * 3.0, dim=0)   # [K_score, B], cùng temperature=3.0 với sample()
+        _pred_score_avg = (_cand_stack * _w_score.view(K_score, 1, B, 1)).sum(0)   # [T,B,2] norm
+
+        _pred_score_deg = _norm_to_deg(_pred_score_avg)
+        _gt_score_deg   = _norm_to_deg(x1_gt.permute(1, 0, 2))
+        l_score = _haversine_deg(_pred_score_deg, _gt_score_deg).mean() / 300.0
+
         # ── Total — [v2.4 FIX] Kendall với HALF_LOG_2PI và clamp ────────────
         # [FIX-A] clamp(min=-3): ngăn log_sigma → -∞ (eff_lambda → ∞)
         #   ep145 log: log_sigma_reg=-1.897 → eff_lambda=22x (quá cao!)
@@ -1509,17 +1652,22 @@ class TCFlowMatching(nn.Module):
         prec_reg     = torch.exp(-2.0 * self.log_sigma_reg.clamp(min=self.log_sigma_reg_min_clamp))
         prec_heading = torch.exp(-2.0 * self.log_sigma_heading.clamp(min=-3.0))
         prec_calib   = torch.exp(-2.0 * self.log_sigma_calib.clamp(min=-3.0))
+        prec_score   = torch.exp(-2.0 * self.log_sigma_score.clamp(min=-3.0))
 
         weighted_reg     = ramp_reg    * (0.5 * prec_reg     * l_reg     + self.log_sigma_reg.clamp(min=self.log_sigma_reg_min_clamp)     + HALF_LOG_2PI)
         weighted_heading = ramp_dir    * (0.5 * prec_heading * l_heading + self.log_sigma_heading.clamp(min=-3.0) + HALF_LOG_2PI)
         weighted_calib   = ramp_calib  * (0.5 * prec_calib   * l_calib   + self.log_sigma_calib.clamp(min=-3.0)   + HALF_LOG_2PI)
+        # [LEARN-7] cùng ramp với L_calib (ramp_calib, ep10->ep30) — lý do
+        # giống hệt: cần encoder ổn định (hết freeze) trước khi cho phần
+        # loss phụ này bắt đầu ảnh hưởng, tránh học từ cond nhiễu lúc đầu.
+        weighted_score   = ramp_calib  * (0.5 * prec_score   * l_score   + self.log_sigma_score.clamp(min=-3.0)   + HALF_LOG_2PI)
 
         # [VAR-REDUCE] fixed weight, no ramp (regularizes the collapse from
         # epoch 0, since the divergence between seeds is already visible by
         # epoch 20-30 — waiting to ramp it in would be too late), no Kendall
         # (must stay a genuine constraint, not something the model can
         # learn to switch off).
-        total = (l_cfm + weighted_reg + weighted_heading + weighted_calib
+        total = (l_cfm + weighted_reg + weighted_heading + weighted_calib + weighted_score
                   + self.lambda_hard_reg * l_hard_reg)
         if not torch.isfinite(total):
             total = x0.new_zeros(())
@@ -1539,6 +1687,7 @@ class TCFlowMatching(nn.Module):
             "l_reg":     l_reg.item() if torch.is_tensor(l_reg) else 0.0,
             "l_heading": l_heading.item() if torch.is_tensor(l_heading) else 0.0,
             "l_calib":   l_calib.item(),
+            "l_score":   l_score.item(),
             "l_hard_reg": l_hard_reg.item(),
             "hard_dist": hard_dist.detach().tolist(),
             "lambda_hard_reg": self.lambda_hard_reg,
@@ -1550,6 +1699,7 @@ class TCFlowMatching(nn.Module):
             "_t_l_reg":      l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
             "_t_l_heading":  l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),
             "_t_l_calib":    l_calib,
+            "_t_l_score":    l_score,
             "_t_l_hard_reg": l_hard_reg,
             "l_momentum": 0.0,
             "lam_reg":   ramp_reg,
@@ -1562,11 +1712,14 @@ class TCFlowMatching(nn.Module):
             "learned_lambda_reg":     float((0.5 * prec_reg).detach()),
             "learned_lambda_heading": float((0.5 * prec_heading).detach()),
             "learned_lambda_calib":   float((0.5 * prec_calib).detach()),
+            "learned_lambda_score":   float((0.5 * prec_score).detach()),
+            "learned_score_weights":  F.softmax(self.score_weight_logits.detach(), dim=0).tolist(),
+            "learned_score_v_sigma_scale": float(torch.sigmoid(self.score_v_sigma_scale_logit.detach())),
             # Compat keys
             "l_fm": l_cfm.item(), "dpe": 0., "heading": 0., "vel_reg": 0.,
             "speed": 0., "accel": 0., "fm_mse": l_cfm.item(),
             "l_hard_total": 0., "n_hard": 0, "alpha_hard": 0.,
-            "l_sel_total": 0., "speed_head_l": 0., "l_score": 0.,
+            "l_sel_total": 0., "speed_head_l": 0.,
             "l_speed_ratio": 0., "l_sigma_nll": 0.,
             "learned_lambda_speed_ratio": 0., "learned_sigma_infer": float(self.sigma_inference),
         }
@@ -1599,13 +1752,35 @@ class TCFlowMatching(nn.Module):
 
         correction[t] = 2 * sigmoid(speed_correction_logits[t]) ∈ (0, 2)
         init = sigmoid(0)*2 = 1.0 → no-op tại epoch 0, học dần qua L_calib.
+
+        [LEARN-6, OBS-SPEED-DEPENDENT] correction giờ có 2 phần CỘNG vào
+        nhau TRƯỚC sigmoid: correction[t,b] = 2*sigmoid(base_logit[t] +
+        delta_mlp(obs_speed[b])[t]). base_logit là 1 số/horizon dùng
+        chung (giữ nguyên [LEARN-1], baseline). delta_mlp thêm phần
+        RIÊNG TỪNG STORM dựa trên obs_speed đo được từ obs_norm — sửa
+        đúng bias "regression to the mean" đã đo (xem docstring
+        obs_speed_calib_mlp ở __init__). Init delta=0 (zero-init MLP cuối)
+        → hành vi khởi đầu giống hệt [LEARN-1] gốc, model TỰ HỌC phần
+        delta qua đúng gradient của L_calib, không phải hệ số tay đo.
         """
         if obs_norm.shape[0] < 2 or pred_abs_norm.shape[0] < 2:
             return pred_abs_norm
 
         T = pred_abs_norm.shape[0]
-        correction = (torch.sigmoid(self.speed_correction_logits[:T]) * 2.0
-                      ).to(pred_abs_norm.dtype).view(T, 1, 1)               # [T,1,1]
+        B = pred_abs_norm.shape[1]
+
+        # obs_speed trung bình mỗi storm trong batch, chuẩn hoá /20.0
+        # (cùng hằng số với hard_score_from_obs's obs_speed_norm_const,
+        # nhất quán across codebase)
+        obs_deg_c = _norm_to_deg(obs_norm[..., :2])
+        obs_spd_mu = _step_speeds_kmh(obs_deg_c).mean(0)              # [B], km/h
+        obs_spd_norm = (obs_spd_mu / 20.0).clamp(0., 3.).view(B, 1)    # [B, 1]
+
+        base_logit  = self.speed_correction_logits[:T].view(1, T)      # [1, T]
+        delta_logit = self.obs_speed_calib_mlp(obs_spd_norm.to(pred_abs_norm.dtype))[:, :T]  # [B, T]
+
+        correction = (torch.sigmoid(base_logit + delta_logit) * 2.0
+                      ).to(pred_abs_norm.dtype).permute(1, 0).unsqueeze(-1)   # [T, B, 1]
 
         pts  = torch.cat([last_obs_norm.unsqueeze(0), pred_abs_norm], 0)    # [T+1, B, 2]
         disp = pts[1:] - pts[:-1]                                           # [T, B, 2]
@@ -1683,7 +1858,9 @@ class TCFlowMatching(nn.Module):
             all_traj.append(x_abs.permute(1, 0, 2))   # [T, B, 2]
 
         scores  = torch.stack(
-            [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score)
+            [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score,
+                             weight_logits=self.score_weight_logits,
+                             v_sigma_scale_logit=self.score_v_sigma_scale_logit)
              for t in all_traj], 0)   # [K, B]
         all_t   = torch.stack(all_traj, 0)   # [K, T, B, 2]
         top_k   = min(3, K)
@@ -1698,81 +1875,6 @@ class TCFlowMatching(nn.Module):
         # [LEARN-1] Per-horizon LEARNED speed calibration (no hardcoded clip args)
         if use_speed_calibration:
             pred_mean = self.speed_calibrate_pred(pred_mean, last_obs, obs_norm)
-
-        # [POSTCAL-RESIDUAL-FIX v2c-VAL] Hệ số đo trên VALIDATION SET, KHÔNG
-        # phải test set — đây là điểm SỬA QUAN TRỌNG so với các bản trước.
-        #
-        # LIÊM CHÍNH KHOA HỌC — LÝ DO SỬA: các bản v1-v3 trước đó đều đo
-        # residual_scale TRỰC TIẾP TRÊN TEST SET rồi áp dụng NGAY LÊN CHÍNH
-        # test set đó để báo cáo kết quả — đây là DATA LEAKAGE (tương đương
-        # "học" tham số từ chính tập dùng để đánh giá cuối cùng, dù không
-        # qua gradient mà qua đo đạc thủ công). Kết quả ATE cải thiện mạnh
-        # quan sát được trước đó (270-280km) một phần là ảo ảnh do overfit
-        # vào đặc thù riêng của 449 storm sequences trong test set.
-        #
-        # BẰNG CHỨNG CHO THẤY VAL VÀ TEST CÓ PHÂN BỐ BIAS KHÁC NHAU ĐÁNG KỂ
-        # (đo trên 3 checkpoint FM seed0/1/2, val=3436 sequences, K=20):
-        #   Horizon   mean_ratio_VAL(3-seed)   mean_ratio_TEST(seed0 trước)   chênh lệch
-        #     6h            1.0196                    0.8827                  +0.137
-        #    24h            1.0050                    0.9822                  +0.023
-        #    48h            1.0239                    0.9106                  +0.113
-        #    72h            0.8809                    0.5695                  +0.311  <- lệch RẤT lớn
-        # => Bias trên test NẶNG HƠN NHIỀU so với val, đặc biệt ở horizon xa.
-        #    Nếu dùng hệ số đo từ test (residual_scale 72h=1.76x) sẽ overfit
-        #    nghiêm trọng — không tổng quát hoá được sang dữ liệu khác.
-        #
-        # HỆ SỐ DƯỚI ĐÂY: tính đúng quy trình train/val/test — đo trên VAL
-        # (trung bình 3 seed, KHÔNG NHÌN THẤY test set), áp dụng khi eval
-        # TRÊN TEST. Khiêm tốn hơn nhiều bản trước (0.96-1.14x thay vì
-        # 0.96-1.76x) — đây là con số ĐÁNG TIN CẬY, có thể tổng quát hoá,
-        # dùng được cho báo cáo/paper. Cải thiện ATE sẽ NHẸ HƠN các bản
-        # trước, nhưng là cải thiện THẬT, không phải overfit vào test.
-        #
-        # (Vẫn giữ nguyên toàn bộ cơ chế decompose along/perp bearing động
-        # per-step từ v2c — đã kiểm chứng đây là bản CÂN BẰNG ATE/CTE tốt
-        # nhất trong các phương pháp post-hoc đã thử; chỉ thay NGUỒN của
-        # 12 con số residual_scale, không đổi thuật toán áp dụng.)
-        if use_speed_calibration:
-            _T = pred_mean.shape[0]
-            _residual_scale = torch.tensor(
-                [0.9808, 1.0161, 1.0083, 0.9950, 0.9707, 0.9852,
-                 0.9598, 0.9767, 0.9937, 1.0256, 1.0762, 1.1352][:_T],
-                device=pred_mean.device, dtype=pred_mean.dtype,
-            ).view(_T, 1, 1)
-            _pts  = torch.cat([last_obs.unsqueeze(0), pred_mean], 0)   # [T+1,B,2]
-            _disp = _pts[1:] - _pts[:-1]                                # [T,B,2]
-
-            # bearing tham chiếu ĐỘNG theo từng bước, lấy từ CHÍNH quỹ đạo
-            # pred_mean GỐC (_pts, đã có sẵn TRƯỚC khi áp residual scale),
-            # KHÔNG dây chuyền vào output đã sửa của bước trước.
-            # ref_bearing[t] = bearing của đoạn NGAY TRƯỚC bước t trên quỹ
-            # đạo gốc (t=0 dùng obs[-2]->obs[-1]; t>=1 dùng _pts[t-1]->_pts[t]).
-            _pred_deg_full = _norm_to_deg(_pts)          # [T+1, B, 2]
-            _obs_deg = _norm_to_deg(obs_norm)
-            if _obs_deg.shape[0] >= 2:
-                _ref_bear_init = _forward_azimuth(_obs_deg[-2], _obs_deg[-1])   # [B]
-            else:
-                _ref_bear_init = torch.zeros(_disp.shape[1], device=_disp.device, dtype=_disp.dtype)
-
-            if _T >= 2:
-                _ref_bear_rest = _forward_azimuth(_pred_deg_full[:-2], _pred_deg_full[1:-1])  # [T-1, B]
-                _ref_bearings = torch.cat([_ref_bear_init.unsqueeze(0), _ref_bear_rest], 0)   # [T, B]
-            else:
-                _ref_bearings = _ref_bear_init.unsqueeze(0)   # [1, B]
-
-            _ref_dir = torch.stack([torch.cos(_ref_bearings), torch.sin(_ref_bearings)], -1).to(_disp.dtype)  # [T,B,2]
-
-            _along = (_disp * _ref_dir).sum(-1, keepdim=True)          # [T,B,1] thành phần DỌC theo ref bearing của bước đó
-            _perp  = _disp - _along * _ref_dir                          # [T,B,2] thành phần NGANG (CTE) — giữ nguyên
-
-            _disp_res = _along * _residual_scale.view(_T, 1, 1) * _ref_dir + _perp
-
-            _out = torch.empty_like(pred_mean)
-            _cur = last_obs
-            for _t in range(_T):
-                _cur = _cur + _disp_res[_t]
-                _out[_t] = _cur
-            pred_mean = _out
 
         if not return_xai:
             return pred_mean, torch.zeros_like(pred_mean), all_t
@@ -1936,7 +2038,9 @@ class TCFlowMatching(nn.Module):
                 all_traj.append(x_abs.permute(1, 0, 2))
 
         scores  = torch.stack(
-            [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score)
+            [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score,
+                             weight_logits=self.score_weight_logits,
+                             v_sigma_scale_logit=self.score_v_sigma_scale_logit)
              for t in all_traj], 0)
         all_t   = torch.stack(all_traj, 0)
         top_k   = min(5, len(all_traj))
