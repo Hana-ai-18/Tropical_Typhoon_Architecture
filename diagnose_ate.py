@@ -95,8 +95,8 @@ def diagnose(model, loader, device, n_batches: int = 5):
             x_rel = torch.randn(B, model.pred_len, 2, device=device) * model.sigma_inference
             v = model.velocity(x_rel, t0, cond)
             x_rel = x_rel + v
-            x_abs = model._from_relative(x_rel, last_obs)
-            pred_deg = _norm_to_deg(x_abs)  # [T, B, 2]
+            x_abs = model._from_relative(x_rel, last_obs)   # [B, T, 2]
+            pred_deg = _norm_to_deg(x_abs.permute(1, 0, 2))  # [T, B, 2]
 
             last_deg = obs_deg[-1]
             pts = torch.cat([last_deg.unsqueeze(0), pred_deg], 0)
