@@ -1733,7 +1733,33 @@ class TCFlowMatching(nn.Module):
             ).view(_T, 1, 1)
             _pts  = torch.cat([last_obs.unsqueeze(0), pred_mean], 0)   # [T+1,B,2]
             _disp = _pts[1:] - _pts[:-1]                                # [T,B,2]
-            _disp_res = _disp * _residual_scale
+
+            # [FIX-CTE-LEAK] Bản trước nhân trực tiếp _disp (vector 2D) với
+            # residual_scale -> kéo dài CẢ hướng đi lẫn độ lệch ngang, khiến
+            # CTE tăng mạnh (đo được: seed0 168->186km, seed2 168->185km).
+            # Sửa: chiếu _disp lên bearing THAM CHIẾU (hướng đi quan sát gần
+            # nhất, obs[-2]->obs[-1]) thành 2 thành phần (dọc, ngang), CHỈ
+            # scale thành phần dọc theo bearing đó — thành phần ngang (ứng
+            # với CTE) giữ nguyên không đổi.
+            # LƯU Ý: dùng MỘT bearing tham chiếu cố định (từ quan sát cuối)
+            # cho toàn bộ 12 bước, không phải bearing động theo từng bước dự
+            # đoán — vì nếu dùng bearing của chính disp từng bước, chiếu disp
+            # lên hướng CỦA CHÍNH NÓ luôn cho "dọc"=|disp| và "ngang"=0 (vô
+            # nghĩa, không tách được gì). Bearing tham chiếu cố định từ quan
+            # sát là xấp xỉ hợp lý cho "hướng đi kỳ vọng" của storm.
+            _obs_deg = _norm_to_deg(obs_norm)
+            if _obs_deg.shape[0] >= 2:
+                _ref_bearing = _forward_azimuth(_obs_deg[-2], _obs_deg[-1])   # [B], rad
+            else:
+                _ref_bearing = torch.zeros(_disp.shape[1], device=_disp.device, dtype=_disp.dtype)
+            _ref_dir = torch.stack([torch.cos(_ref_bearing), torch.sin(_ref_bearing)], -1)  # [B,2]
+            _ref_dir = _ref_dir.unsqueeze(0).expand(_T, -1, -1).to(_disp.dtype)              # [T,B,2]
+
+            _along = (_disp * _ref_dir).sum(-1, keepdim=True)                # [T,B,1] thành phần DỌC theo ref bearing
+            _perp  = _disp - _along * _ref_dir                               # [T,B,2] thành phần NGANG (giữ nguyên)
+
+            _disp_res = _along * _residual_scale * _ref_dir + _perp          # chỉ scale phần dọc
+
             _out = torch.empty_like(pred_mean)
             _cur = last_obs
             for _t in range(_T):
