@@ -1863,8 +1863,8 @@ from Model.st_trans_model import STTrans
 # num_ensemble override the way FM's ddim_steps does -- see is_ensemble_model
 # and the --mmstn_*/--physdiff_*/--tcdiffuser_* eval-time override args in
 # main() for how each is configured explicitly instead of silently ignored.
-from Model.mmstn_model import MMSTN
-from Model.phys_diff_model import PhysDiff
+from Model.Mmstn_model import MMSTN
+from Model.physdiff_model import PhysDiff
 from Model.tc_diffuser_model import TCDiffuser
 
 
