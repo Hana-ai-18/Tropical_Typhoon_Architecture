@@ -1745,6 +1745,24 @@ class TCFlowMatching(nn.Module):
         # learn to switch off).
         total = (l_cfm + weighted_reg + weighted_heading + weighted_calib + weighted_score
                   + self.lambda_hard_reg * l_hard_reg)
+
+        # [REVERTED] Đã thử sửa guard này để "tự phục hồi" graph khi NaN
+        # (total*0.0, torch.where, torch.nan_to_num) — TẤT CẢ đều thất bại
+        # khi kiểm chứng bằng test số học: NaN lan vào gradient của MỌI
+        # tham số upstream (x0.grad = [nan,nan,...]) dù forward value trông
+        # như đã "sửa" về 0 — vì backward pass của các phép toán này vẫn đi
+        # qua nhánh chứa NaN gốc. GIỮ NGUYÊN hành vi gốc (x0.new_zeros(()),
+        # tensor tách khỏi graph hoàn toàn) vì đây là cách AN TOÀN TUYỆT ĐỐI
+        # duy nhất về mặt số học để không lan NaN vào optimizer.
+        #
+        # HỆ QUẢ CẦN XỬ LÝ Ở TRAINING LOOP (train_flowmatching.py), KHÔNG
+        # PHẢI TRONG MODEL: vì total trả về không có grad_fn khi NaN/Inf,
+        # `scaler.scale(bd["total"]).backward()` sẽ crash nếu gọi trực
+        # tiếp trên tensor này. Training loop PHẢI kiểm tra
+        # `torch.isfinite(bd["total"])` NGAY SAU khi gọi get_loss_breakdown,
+        # và nếu False thì SKIP backward()/optimizer.step() cho batch đó
+        # (continue sang batch tiếp theo) thay vì gọi backward() vô điều
+        # kiện. Đây là fix cần thêm vào training script, không phải ở đây.
         if not torch.isfinite(total):
             total = x0.new_zeros(())
 
