@@ -1608,6 +1608,37 @@ class TCFlowMatching(nn.Module):
 
         correction[t] = 2 * sigmoid(speed_correction_logits[t]) ∈ (0, 2)
         init = sigmoid(0)*2 = 1.0 → no-op tại epoch 0, học dần qua L_calib.
+
+        [DIAG-OBS-SPEED-BIAS] Chẩn đoán thực nghiệm (diagnose_ate_deep.py,
+        chạy trên checkpoint đã train, 449 test sequences, K=20 candidates,
+        TRƯỚC re-rank) phát hiện correction theo-horizon KHÔNG đủ vì bias
+        thực chất phụ thuộc CHỦ YẾU vào obs_speed của từng storm, không
+        chỉ vào horizon:
+          corr(obs_speed, speed_ratio) = -0.48 (âm mạnh)
+          SLOW (<8km/h,  n=28 ) storms: mean_ratio = 2.06 (network dự đoán
+                                          NHANH GẤP ĐÔI thực tế)
+          MED  (8-15km/h,n=96 ) storms: mean_ratio = 1.42
+          FAST (>=15km/h,n=196) storms: mean_ratio = 0.99 (gần đúng)
+        Đây là "regression to the mean" kinh điển: network học một tốc độ
+        "trung bình dataset" thay vì tốc độ riêng từng storm, nên storm
+        chậm bị kéo nhanh lên nhiều nhất. correction[t] hiện tại (12 số,
+        1/horizon, DÙNG CHUNG cho mọi storm bất kể obs_speed) không thể
+        sửa bias có phương sai lớn theo obs_speed này — nó chỉ dịch được
+        TÂM của toàn bộ phân phối, không thu hẹp được độ trải theo
+        obs_speed. Bias còn tăng dồn theo horizon (autoregressive-like):
+        %ratio>1.15 từ 27.9% ở 6h lên 81.3% ở 72h.
+
+        [OBS-SPEED-CALIB] Thêm bước hiệu chỉnh THỨ HAI, hoạt động NGAY
+        SAU correction theo-horizon ở trên, dựa trực tiếp trên obs_speed
+        đo được (không cần parameter mới, không cần retrain — hệ số suy
+        ra thẳng từ 3 con số thực nghiệm ở trên). Mục đích: kéo storm
+        chậm chậm lại nhiều hơn, để lại storm nhanh gần như nguyên vẹn.
+        Đây KHÔNG phải loss mới — chỉ là một scaling factor xác định
+        (deterministic), giống bản chất với speed_correction_logits
+        nhưng điều kiện hoá thêm theo obs_speed thay vì chỉ theo t.
+        obs_speed_scale nội suy tuyến tính qua 3 điểm đo được, KHÔNG
+        ngoại suy quá xa các mốc XAI-9 (clamp trong khoảng dữ liệu quan
+        sát được, tránh phá vỡ với storm cực đoan ngoài phân phối train).
         """
         if obs_norm.shape[0] < 2 or pred_abs_norm.shape[0] < 2:
             return pred_abs_norm
@@ -1619,6 +1650,39 @@ class TCFlowMatching(nn.Module):
         pts  = torch.cat([last_obs_norm.unsqueeze(0), pred_abs_norm], 0)    # [T+1, B, 2]
         disp = pts[1:] - pts[:-1]                                           # [T, B, 2]
         disp_cal = disp * correction
+
+        # [OBS-SPEED-CALIB] Hệ số bù thứ 2, theo obs_speed đo được từ obs_norm.
+        # Nội suy tuyến tính qua 3 điểm đo (Q3 diagnose_ate_deep.py):
+        #   obs_speed <= 8  km/h -> observed mean_ratio 2.06 -> scale ~= 1/2.06 = 0.485
+        #   obs_speed == 11.5    -> observed mean_ratio 1.42 -> scale ~= 1/1.42 = 0.704
+        #   obs_speed >= 15 km/h -> observed mean_ratio 0.99 -> scale ~= 1/0.99 = 1.010
+        # scale = 1/mean_ratio(obs_speed) vì mục tiêu là NHÂN NGƯỢC lại bias đo
+        # được để đưa ratio về ~1.0. clamp [0.4, 1.2] để không khuếch đại/triệt
+        # tiêu quá mức nếu obs_speed nằm ngoài khoảng đã đo (vd < 3 km/h hiếm gặp).
+        if obs_norm.shape[0] >= 2:
+            obs_deg_c = _norm_to_deg(obs_norm)
+            obs_spd_mu = _step_speeds_kmh(obs_deg_c).mean(0)   # [B]
+            xp = torch.tensor([8.0, 11.5, 15.0], device=obs_spd_mu.device, dtype=obs_spd_mu.dtype)
+            fp = torch.tensor([0.485, 0.704, 1.010], device=obs_spd_mu.device, dtype=obs_spd_mu.dtype)
+            # torch không có interp 1D built-in cho mọi version -> cài tay
+            obs_speed_scale = torch.empty_like(obs_spd_mu)
+            below = obs_spd_mu <= xp[0]
+            above = obs_spd_mu >= xp[-1]
+            mid   = ~below & ~above
+            obs_speed_scale[below] = fp[0]
+            obs_speed_scale[above] = fp[-1]
+            if mid.any():
+                # nội suy tuyến tính giữa xp[0..1] hoặc xp[1..2] tuỳ vị trí
+                v = obs_spd_mu[mid]
+                seg2 = v >= xp[1]
+                t_lo = torch.where(seg2, xp[1], xp[0])
+                t_hi = torch.where(seg2, xp[2], xp[1])
+                f_lo = torch.where(seg2, fp[1], fp[0])
+                f_hi = torch.where(seg2, fp[2], fp[1])
+                frac = (v - t_lo) / (t_hi - t_lo).clamp(min=1e-6)
+                obs_speed_scale[mid] = f_lo + frac * (f_hi - f_lo)
+            obs_speed_scale = obs_speed_scale.clamp(0.4, 1.2).view(1, -1, 1)  # [1,B,1]
+            disp_cal = disp_cal * obs_speed_scale
 
         out = torch.empty_like(pred_abs_norm)
         cur = last_obs_norm
