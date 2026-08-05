@@ -862,9 +862,12 @@ def main(args):
             with autocast(device_type="cuda", enabled=args.use_amp):
                 bd = model.get_loss_breakdown(bl_aug, epoch=ep)
 
-            if not torch.isfinite(bd["total"]):
-                print(f"  ⚠ [{ep}][{i}] non-finite total loss "
-                      f"(cfm={bd['l_cfm']:.4f} reg={bd['l_reg']:.4f} "
+            _bad_loss = (not torch.isfinite(bd["total"])) or (not bd["total"].requires_grad)
+            if _bad_loss:
+                print(f"  ⚠ [{ep}][{i}] bad total loss "
+                      f"(finite={torch.isfinite(bd['total']).item()} "
+                      f"requires_grad={bd['total'].requires_grad} "
+                      f"cfm={bd['l_cfm']:.4f} reg={bd['l_reg']:.4f} "
                       f"h4s={bd['l_heading']:.4f} calib={bd['l_calib']:.4f} "
                       f"score={bd['l_score']:.4f} hreg={bd.get('l_hard_reg',0.0):.4f}) "
                       f"→ skip batch (no backward/step)")
