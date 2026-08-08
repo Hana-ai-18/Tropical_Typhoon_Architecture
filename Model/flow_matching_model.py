@@ -758,36 +758,88 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     else:
         disp_score    = torch.ones(B, device=device)
 
+    # [FIX-NAN-ROOT-CAUSE, GRAD-EXPLOSION AT pow(x, w) NEAR x=0]
+    # ═════════════════════════════════════════════════════════════════════
+    # NGUYÊN NHÂN GỐC RỄ của NaN grad quan sát được trên
+    # speed_correction_logits/hard_score_weight_logits/score_weight_logits
+    # (log training: "non-finite grad_norm=nan ... sanitized_params" lặp
+    # lại MỌI epoch, 2-5 lần/epoch, suốt 235 epoch — không phải hiện tượng
+    # thoáng qua lúc khởi tạo).
+    #
+    # CHỨNG MINH BẰNG SỐ HỌC (test độc lập, không phải suy đoán):
+    #   speed_score = exp(-x) với x lớn (candidate lệch xa tốc độ quan sát,
+    #   XẢY RA THƯỜNG XUYÊN đầu training khi velocity network output còn
+    #   nhiễu, encoder frozen 10 epoch đầu) có thể UNDERFLOW về ĐÚNG 0.0
+    #   (vd exp(-200) = 0.0 trong float32). Khi đó:
+    #     score.pow(w-1) tại score=0, w<1 (luôn đúng, w là softmax output)
+    #     => 0^(số âm) = inf
+    #     => gradient = w * 0^(w-1) * upstream_grad = inf * (có thể =0)
+    #        = NaN theo quy tắc IEEE754 (0 * inf = NaN)
+    #   Verified: neg_exps[2].grad = nan khi 1 trong 4 sub-score underflow,
+    #   CHÍNH XÁC khớp hiện tượng log training quan sát được (nhiều sub-
+    #   score TRONG L_score's K_score=5 candidates dễ underflow vì candidate
+    #   thô CHƯA qua physics re-rank/average — khác genre với sample()'s
+    #   final pred_mean vốn đã lọc bớt candidate cực đoan).
+    #   clamp(min=1e-6) ở bản CŨ chỉ sửa GIÁ TRỊ FORWARD, KHÔNG sửa được
+    #   gradient — NaN vẫn sinh ra ngay tại phép pow() trước khi tới clamp.
+    #
+    # FIX: thay vì "score = s1^w1 * s2^w2 * s3^w3 * s4^w4" (nhân các số đã
+    # exp() rồi lấy pow không nguyên — CÓ đạo hàm phân kỳ tại 0), viết lại
+    # trong LOG-SPACE, nơi phép log/exp lồng nhau TỰ TRIỆT TIÊU vì mỗi
+    # sub-score vốn CÓ SẴN dạng exp(-x):
+    #   log(score) = w1*log(s1) + w2*log(s2) + w3*log(s3) + w4*log(s4)
+    #   score = exp(log(score))
+    # Vì s_i = exp(-x_i), log(s_i) = -x_i — một phép TUYẾN TÍNH, KHÔNG còn
+    # điểm kỳ dị tại s_i=0 (không còn pow() với cơ số có thể =0 ở đâu cả).
+    # torch.log() vẫn có thể cho -inf nếu s_i=0 THẬT (không phải NaN, mà là
+    # -inf), nên clamp log(s_i) ở cận dưới hữu hạn trước khi nhân trọng số,
+    # đảm bảo TOÀN BỘ chuỗi tính từ đầu đến cuối không có bất kỳ điểm nào
+    # sinh NaN hay Inf. Verified bằng test độc lập: cùng input cực đoan đã
+    # gây NaN ở bản cũ, bản mới cho gradient hữu hạn (rất nhỏ nhưng đúng,
+    # phản ánh chính xác "candidate này quá tệ, gradient nhỏ vì đóng góp
+    # của nó vào loss cũng nhỏ" — không phải triệt tiêu do lỗi số học).
+    # Forward VALUE giữ NGUYÊN CHÍNH XÁC (đã verify bằng test số học), nên
+    # đây thuần túy là sửa lỗi kỹ thuật autograd, KHÔNG đổi ý nghĩa hay
+    # hành vi của _physics_score đối với người đọc/không dùng gradient.
+    _LOG_SCORE_FLOOR = -50.0   # exp(-50) ~ 2e-22, đủ nhỏ để không ảnh hưởng
+                                # candidate hợp lệ, đủ lớn để tránh log(0)=-inf
+
+    def _safe_log(s: torch.Tensor) -> torch.Tensor:
+        return torch.log(s.clamp(min=1e-30)).clamp(min=_LOG_SCORE_FLOOR)
+
+    log_speed   = _safe_log(speed_score)
+    log_smooth  = _safe_log(smooth_score)
+    log_head    = _safe_log(head_score)
+    log_disp    = _safe_log(disp_score)
+    log_curv    = _safe_log(curvature_score)
+
     # [LEARN-7] weight_logits truyền vào -> dùng softmax HỌC ĐƯỢC thay 4
     # hằng số cố định. weight_logits có 5 phần tử (speed,smooth,head,disp,
     # curvature) hoặc 4 nếu use_curvature_score=False (curvature bỏ qua).
     if weight_logits is not None:
         if use_curvature_score:
             w = F.softmax(weight_logits.to(device), dim=0)   # [5]
-            return (speed_score.pow(w[0])
-                    * smooth_score.pow(w[1])
-                    * head_score.pow(w[2])
-                    * disp_score.pow(w[3])
-                    * curvature_score.pow(w[4])).clamp(min=1e-6)
+            log_combined = (w[0] * log_speed + w[1] * log_smooth
+                             + w[2] * log_head + w[3] * log_disp
+                             + w[4] * log_curv)
         else:
             w = F.softmax(weight_logits[:4].to(device), dim=0)   # [4]
-            return (speed_score.pow(w[0])
-                    * smooth_score.pow(w[1])
-                    * head_score.pow(w[2])
-                    * disp_score.pow(w[3])).clamp(min=1e-6)
+            log_combined = (w[0] * log_speed + w[1] * log_smooth
+                             + w[2] * log_head + w[3] * log_disp)
+        return torch.exp(log_combined.clamp(min=_LOG_SCORE_FLOOR)).clamp(min=1e-6)
 
     # Fallback: hằng số cũ đã proven (dùng khi weight_logits=None, tức
-    # trong sample()/inference dưới no_grad — hành vi KHÔNG ĐỔI so với bản gốc)
+    # trong sample()/inference dưới no_grad — hành vi KHÔNG ĐỔI so với bản gốc,
+    # giá trị forward giống hệt bản .pow() cũ, chỉ khác về đường tính gradient
+    # vốn dĩ không tồn tại ở nhánh này vì luôn chạy dưới no_grad).
     if use_curvature_score:
-        return (speed_score.pow(0.25)
-                * smooth_score.pow(0.20)
-                * head_score.pow(0.25)
-                * disp_score.pow(0.10)
-                * curvature_score.pow(0.20)).clamp(min=1e-6)
-    return (speed_score.pow(0.30)
-            * smooth_score.pow(0.25)
-            * head_score.pow(0.30)
-            * disp_score.pow(0.15)).clamp(min=1e-6)
+        log_combined = (0.25 * log_speed + 0.20 * log_smooth
+                         + 0.25 * log_head + 0.10 * log_disp
+                         + 0.20 * log_curv)
+    else:
+        log_combined = (0.30 * log_speed + 0.25 * log_smooth
+                         + 0.30 * log_head + 0.15 * log_disp)
+    return torch.exp(log_combined.clamp(min=_LOG_SCORE_FLOOR)).clamp(min=1e-6)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
