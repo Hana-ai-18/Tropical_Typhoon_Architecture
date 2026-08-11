@@ -1897,22 +1897,6 @@ def ate_cte_full(pred_deg: torch.Tensor, gt_deg: torch.Tensor):
     SAME formula as evaluate_full.py's _ate_cte_full (off-by-one already
     fixed there — see that file's own comments for the fix history).
     Returns [T-1, B] each; index k holds the error at ORIGINAL step k+1.
-
-    [DESIGN DECISION, confirmed with user] Used for ALL models in this
-    script (FM, ST-Trans, LSTM, GRU, RNN, MMSTN, Phys-Diff, TC-Diffuser),
-    not just FM — even though only FM's own training/eval code
-    (flow_matching_model.py / train_flowmatching.py) actually uses this
-    formula; every other model imports and trains with
-    paper_baseline_model.py's own _ate_cte_tensors instead (a different,
-    flat-plane-projection formula with a different heading convention).
-    This is intentional: using ONE shared formula for every model in
-    this comparison script ensures FM-vs-baseline ATE/CTE differences
-    reflect genuine model quality, not which formula happened to be
-    used — see this file's module docstring for the full rationale.
-    Consequence: ATE/CTE reported here for the 7 non-FM models will NOT
-    match what each model's own train_*.py printed right after
-    training — that mismatch is expected and correct for this script's
-    purpose (fair cross-model comparison), not a bug.
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
@@ -1937,45 +1921,6 @@ def load_fm(checkpoint: str, device):
     if missing or unexpected:
         print(f"  ⚠ FM load_state_dict: {len(missing)} missing, "
               f"{len(unexpected)} unexpected keys")
-        if missing:
-            print(f"    missing keys: {missing}")
-        if unexpected:
-            print(f"    unexpected keys: {unexpected}")
-
-    # [FIX-EMA-MISMATCH] train_flowmatching.py's own validation/eval loop
-    # ALWAYS calls ema.apply_to(model) before scoring whenever an EMA
-    # shadow exists (see evaluate()'s `if ema is not None: bk = ema.apply_to(model)`,
-    # called at every eval during training). But ck["model"] saved by _save()
-    # is the RAW, non-EMA state_dict — ema.shadow is written to a SEPARATE
-    # ck["ema"] key that this loader previously never read. That mismatch
-    # is the primary reason numbers printed right after training (EMA
-    # weights) differ from this script's FM numbers (raw weights) even on
-    # the exact same checkpoint file. Applying it here restores parity.
-    #
-    # is_swa checkpoints are a DIFFERENT, mutually-exclusive averaging
-    # scheme (SWAHandler.save_avg_state's ck["model"] IS ALREADY the SWA
-    # running average) -- do not also apply ema on top of that.
-    is_swa = ck.get("is_swa", False)
-    if ck.get("ema") and not is_swa:
-        sd = model.state_dict()
-        applied, skipped = 0, 0
-        for k, v in ck["ema"].items():
-            if k in sd:
-                sd[k].copy_(v.to(device))
-                applied += 1
-            else:
-                skipped += 1
-        print(f"  ✓ Applied EMA shadow weights ({applied} tensors"
-              f"{f', {skipped} skipped (not in current model)' if skipped else ''}) "
-              f"— matches training-time eval convention.")
-    elif is_swa:
-        print(f"  ℹ Checkpoint is an SWA average (is_swa=True) — "
-              f"ck['model'] IS the SWA running average, no separate EMA applied.")
-    else:
-        print(f"  ⚠ No 'ema' key found in checkpoint — evaluating RAW weights. "
-              f"If this checkpoint was saved mid-training with use_ema=True, "
-              f"this will NOT match the ADE/ATE printed during training.")
-
     model.eval()
     seed = _infer_seed(checkpoint, ck)
     return model, seed
@@ -2384,26 +2329,16 @@ def evaluate_one_model(model, loader, device, model_name: str,
     lead_time convention (1-indexed, 1..T; T=pred_len, e.g. 1=6h...12=72h
     when T=12): this is the SAME convention as generate_paper_report.py's
     HORIZON_LEAD_TIMES = {"6h":1,...,"72h":12}. ADE (d) has a value for
-    EVERY lead_time 1..T, for every model.
-
-    ATE/CTE use ate_cte_full (spherical forward-azimuth/haversine, from
-    flow_matching_model.py) for ALL models here, by deliberate design —
-    see this file's module docstring and ate_cte_full's own docstring
-    for the rationale (one shared formula so FM-vs-baseline comparisons
-    aren't an artifact of which formula was used). This formula needs a
-    PRIOR point, so it is undefined at lead_time=1 (6h) -- None there
-    for every model -- and defined for lead_time 2..T. This intentionally
-    does NOT match each non-FM model's own training-time ATE/CTE (which
-    uses paper_baseline_model.py's different _ate_cte_tensors formula) —
-    that mismatch is expected here, not a bug.
-
-    [FIX] An earlier version of this loop bounded lead_time by ate/cte's
-    shorter range (T-1 instead of T) for ADE too, which silently dropped
-    the LAST lead_time (T, i.e. 72h when T=12), and additionally
-    mislabeled lead_time=1 as if it were the first step (6h) when it was
-    actually the second step (12h, 0-indexed step 1) — both fixed: ADE
-    now covers the full 1..T range, and lead_time=1 genuinely is the
-    first predicted step.
+    EVERY lead_time 1..T. ATE/CTE do not: there is no heading reference
+    at the very first predicted step, so ate/cte are only defined for
+    lead_time 2..T (None at lead_time=1/6h). [FIX] An earlier version of
+    this loop bounded lead_time by ate/cte's shorter range (T-1 instead
+    of T), which silently dropped the LAST lead_time (T, i.e. 72h when
+    T=12) from ADE too, and additionally mislabeled lead_time=1 as if it
+    were the first step (6h) when it was actually the second step (12h,
+    0-indexed step 1) — both bugs are fixed by this version: ADE now
+    covers the full 1..T range, and lead_time=1 genuinely is the first
+    predicted step.
     """
     records = []
     # is_ensemble_model: FM, MMSTN, Phys-Diff, and TC-Diffuser are all
@@ -2461,31 +2396,7 @@ def evaluate_one_model(model, loader, device, model_name: str,
         pd = _norm_to_deg(pred[:T])
         gd = _norm_to_deg(gt[:T, :, :2])
         d  = _haversine_deg(pd, gd)                  # [T, B] -- steps 0..T-1 (0=6h ... T-1=72h when T=12)
-        # [TEMP-DEBUG] Per-batch ADE print to directly compare against
-        # diagnose_nondeterminism.py's output and isolate exactly where
-        # the two pipelines diverge. Remove once the discrepancy is found.
-        print(f"  [DEBUG {model_name}] batch {bi}: ADE={float(d.mean()):.6f}")
-        # [DESIGN DECISION, confirmed with user] This script deliberately
-        # uses ONE SHARED formula (ate_cte_full, spherical forward-azimuth/
-        # haversine from flow_matching_model.py) for ALL models, including
-        # ST-Trans/LSTM/GRU/RNN/MMSTN/Phys-Diff/TC-Diffuser -- even though
-        # each of those imports and trains/self-evaluates with a DIFFERENT
-        # formula (paper_baseline_model.py's _ate_cte_tensors, flat-plane
-        # projection). This is intentional, per the original script's own
-        # documented rationale (see this file's module docstring): using
-        # each model's own formula would make FM-vs-baseline ATE/CTE
-        # comparisons unsound, since any difference could be an artifact
-        # of which formula was used rather than a genuine model quality
-        # difference. A prior version of this script routed non-FM models
-        # to their own _ate_cte_tensors formula instead (for a different
-        # goal -- matching each model's own training-time printed numbers)
-        # -- that was reverted per explicit user decision to prioritize
-        # fair cross-model comparison over matching training-time numbers.
-        # Consequence: ATE/CTE printed here for 7 of 8 models will NOT
-        # match what each model's own train_*.py run_test_evaluation()
-        # printed right after training -- that is expected and correct
-        # for this script's purpose, not a bug.
-        ate, cte = ate_cte_full(pd, gd)               # [T-1, B] -- ate[k] = error at step k+1 (0-indexed); undefined at step0=0 (=6h) for ALL models
+        ate, cte = ate_cte_full(pd, gd)               # [T-1, B] -- ate[k] = error at step k+1 (0-indexed)
         T_valid = ate.shape[0]                        # = T-1
 
         obs_deg = _norm_to_deg(obs[:, :, :2])
@@ -2503,31 +2414,27 @@ def evaluate_one_model(model, loader, device, model_name: str,
                 storm_key = f"{info['old'][1]}_{info['old'][0]}"
             else:
                 storm_key = f"UNKNOWN_batch{bi}"
+            # [FIX] Bug thật đã tìm ra: trước đây vòng lặp chạy
+            # `for i in range(T_valid)` (T_valid = T-1), với
+            # lead_time = i+1 (i=0..T_valid-1 => lead_time=1..T_valid=1..T-1).
+            # Với T=12, lead_time chỉ chạy 1..11 -- KHÔNG BAO GIỜ đạt 12.
+            # generate_paper_report.py's HORIZON_LEAD_TIMES tra "72h"->12,
+            # nên luôn ra n=0 ở 72h (khớp đúng hiện tượng đã quan sát).
+            # Đồng thời "lead_time=1" trước đây thực chất ứng 0-indexed
+            # step 1 (=12h theo evaluate_full.py's HORIZONS convention),
+            # KHÔNG PHẢI 6h -- tên horizon "6h" ở nơi đọc dữ liệu cũng bị
+            # lệch 1 bước so với dữ liệu thật.
+            #
+            # Sửa: lead_time giờ là 1-indexed THẬT trên toàn bộ T bước
+            # (lead_time = step_0indexed + 1, chạy 1..T, tức 1=6h...T=72h
+            # khi T=12) -- khớp đúng HORIZON_LEAD_TIMES = {"6h":1,...,
+            # "72h":12} sau khi sửa ở generate_paper_report.py.
+            # ADE (d) có đủ giá trị cho MỌI lead_time 1..T.
+            # ATE/CTE (ate/cte) chỉ có giá trị cho lead_time 2..T (không
+            # định nghĩa được ở lead_time=1/6h, vì cần bước trước đó để
+            # biết hướng đi) -- ghi None thay vì bỏ hẳn record.
             for step0 in range(T):           # step0 = 0-indexed step, 0..T-1
                 lead_time = step0 + 1        # 1-indexed, 1..T (1=6h...T=72h)
-                # [FIX] Bug thật đã tìm ra: trước đây vòng lặp chạy
-                # `for i in range(T_valid)` (T_valid = T-1), với
-                # lead_time = i+1 (i=0..T_valid-1 => lead_time=1..T_valid=1..T-1).
-                # Với T=12, lead_time chỉ chạy 1..11 -- KHÔNG BAO GIỜ đạt 12.
-                # generate_paper_report.py's HORIZON_LEAD_TIMES tra "72h"->12,
-                # nên luôn ra n=0 ở 72h (khớp đúng hiện tượng đã quan sát).
-                # Đồng thời "lead_time=1" trước đây thực chất ứng 0-indexed
-                # step 1 (=12h theo evaluate_full.py's HORIZONS convention),
-                # KHÔNG PHẢI 6h -- tên horizon "6h" ở nơi đọc dữ liệu cũng bị
-                # lệch 1 bước so với dữ liệu thật.
-                #
-                # Sửa: lead_time giờ là 1-indexed THẬT trên toàn bộ T bước
-                # (lead_time = step_0indexed + 1, chạy 1..T, tức 1=6h...T=72h
-                # khi T=12) -- khớp đúng HORIZON_LEAD_TIMES = {"6h":1,...,
-                # "72h":12} sau khi sửa ở generate_paper_report.py.
-                # ADE (d) có đủ giá trị cho MỌI lead_time 1..T.
-                # ATE/CTE (ate/cte) chỉ có giá trị cho lead_time 2..T (không
-                # định nghĩa được ở lead_time=1/6h, vì cần bước trước đó để
-                # biết hướng đi) -- ghi None thay vì bỏ hẳn record. Áp dụng
-                # ĐỒNG NHẤT cho MỌI model (kể cả 7 model không phải FM),
-                # vì toàn bộ script này CHỦ ĐÍCH dùng chung 1 công thức
-                # ate_cte_full cho mọi model -- xem [DESIGN DECISION]
-                # comment ở nơi gọi ate_cte_full phía trên.
                 has_atecte = step0 >= 1      # ate/cte defined for step0=1..T-1
                 ate_i = step0 - 1            # ate/cte array index when has_atecte
                 records.append({
@@ -2745,26 +2652,6 @@ def main():
         n_params = sum(pm.numel() for pm in model.parameters())
         print(f"  {display_name} (seed={seed}): {n_params:,} params")
 
-        # [FIX-DETERMINISM-PER-MODEL] set_seed(args.seed) was previously
-        # called ONCE at the very top of main(), before this loop even
-        # started. That meant only the FIRST stochastic model to run
-        # (whichever one happens to be first in `jobs`) got a clean,
-        # reproducible RNG state -- every stochastic model after it
-        # (MMSTN, Phys-Diff, TC-Diffuser, or a later FM checkpoint) inherited
-        # whatever RNG state was LEFT OVER after all earlier models'
-        # torch.randn(...) draws inside their own .sample() calls. Since
-        # deterministic models (ST-Trans/LSTM/GRU/RNN, once in eval() mode
-        # so their Dropout layers are inactive) consume no RNG, this mostly
-        # hit MMSTN specifically: its results silently depended on exactly
-        # how many FM checkpoints/candidates were evaluated before it in
-        # THIS run -- adding, removing, or reordering --fm_checkpoints (or
-        # --physdiff_checkpoints / --tcdiffuser_checkpoints) between two
-        # otherwise-identical runs was enough to change MMSTN's reported
-        # ADE/ATE/CTE even though its checkpoint never changed. Re-seeding
-        # right before EACH model's evaluate_one_model() call makes every
-        # model -- stochastic or not -- start sampling from the SAME fixed
-        # RNG state every time, independent of the rest of the job list.
-        set_seed(args.seed)
         recs = evaluate_one_model(model, loader, device, display_name,
                                    seed=seed, n_ensemble=args.n_ensemble,
                                    ddim_steps=args.ddim_steps)
