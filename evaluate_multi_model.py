@@ -2461,6 +2461,10 @@ def evaluate_one_model(model, loader, device, model_name: str,
         pd = _norm_to_deg(pred[:T])
         gd = _norm_to_deg(gt[:T, :, :2])
         d  = _haversine_deg(pd, gd)                  # [T, B] -- steps 0..T-1 (0=6h ... T-1=72h when T=12)
+        # [TEMP-DEBUG] Per-batch ADE print to directly compare against
+        # diagnose_nondeterminism.py's output and isolate exactly where
+        # the two pipelines diverge. Remove once the discrepancy is found.
+        print(f"  [DEBUG {model_name}] batch {bi}: ADE={float(d.mean()):.6f}")
         # [DESIGN DECISION, confirmed with user] This script deliberately
         # uses ONE SHARED formula (ate_cte_full, spherical forward-azimuth/
         # haversine from flow_matching_model.py) for ALL models, including
