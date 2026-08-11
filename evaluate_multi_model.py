@@ -67,7 +67,7 @@ from Model.data.loader_training import data_loader
 from Model.flow_matching_model import (
     TCFlowMatching, _norm_to_deg, _haversine_deg, _forward_azimuth, _unwrap,
 )
-from Model.paper_baseline_model import PaperBaseline, MODEL_TYPES
+from Model.paper_baseline_model import PaperBaseline, MODEL_TYPES, _ate_cte_tensors
 from Model.st_trans_model import STTrans
 # MMSTN (Social-GAN style), Phys-Diff (PIGA-augmented DDPM), and TC-Diffuser
 # (velocity-space DDPM) all share PaperEncoder (FNO3D+Mamba+Env_net) with
@@ -114,6 +114,11 @@ def ate_cte_full(pred_deg: torch.Tensor, gt_deg: torch.Tensor):
     SAME formula as evaluate_full.py's _ate_cte_full (off-by-one already
     fixed there — see that file's own comments for the fix history).
     Returns [T-1, B] each; index k holds the error at ORIGINAL step k+1.
+
+    [SCOPE] This is FM's OWN ATE/CTE formula (full spherical bearing via
+    _forward_azimuth/atan2), imported from flow_matching_model.py. Use
+    this ONLY for FM. See ate_cte_paper_formula below for every other
+    model — they do NOT use this formula in their own training/eval code.
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
@@ -124,6 +129,53 @@ def ate_cte_full(pred_deg: torch.Tensor, gt_deg: torch.Tensor):
     dist_err = _haversine_deg(pred_deg[1:T], gt_deg[1:T])
     ang = bear_err - bear_ref
     return dist_err * torch.cos(ang), dist_err * torch.sin(ang)
+
+
+def ate_cte_paper_formula(pred_norm: torch.Tensor, gt_norm: torch.Tensor):
+    """
+    [FIX-ATE-CTE-FORMULA-MISMATCH] ST-Trans, LSTM/GRU/RNN (PaperBaseline),
+    MMSTN, Phys-Diff, and TC-Diffuser ALL import and use
+    paper_baseline_model.py's own _ate_cte_tensors for their ATE/CTE —
+    see each model file's own `from Model.paper_baseline_model import (...,
+    _ate_cte_tensors, ...)` header. That formula is a flat-plane
+    projection (lon/lat delta * 111.0 km/deg * cos(lat) scaling, error
+    projected onto/across the GT-implied heading direction via a 2D
+    dot/cross product) — NOT the same math as FM's ate_cte_full above
+    (full spherical forward-azimuth/haversine via atan2). The two
+    formulas diverge increasingly at longer ranges (the 300-700km ADE
+    scale seen here), which is exactly why ATE/CTE for every non-FM
+    model printed by this script previously did not match the numbers
+    each model's OWN training script (train_paper_baseline.py /
+    train_st_trans.py / train_mmstn.py / etc.) printed right after
+    training — this had NOTHING to do with seeding or Dropout/eval()
+    mode (both were already correct); it was simply the wrong formula
+    being applied to 7 of the 8 models in this comparison.
+
+    Wraps _ate_cte_tensors (input/output in NORMALIZED coords, [T,B]
+    each, defined for every step 0..T-1 using a forward-difference
+    heading that repeats the last direction at the final step) and
+    truncates to the SAME [T-1, B] / "index k = original step k+1"
+    convention evaluate_one_model()'s loop expects, so it's a drop-in
+    replacement for ate_cte_full() at the call site — only the formula
+    changes, not the indexing contract.
+
+    NOTE: takes NORMALIZED pred/gt (unlike ate_cte_full, which takes
+    degrees) because _ate_cte_tensors does its own _norm_to_deg
+    internally — see paper_baseline_model.py. Call this BEFORE
+    converting pred/gt to degrees at the evaluate_one_model() call site,
+    or pass the un-degree-converted tensors specifically for this call.
+    """
+    T = min(pred_norm.shape[0], gt_norm.shape[0])
+    if T < 2:
+        z = pred_norm.new_zeros(1, pred_norm.shape[1])
+        return z, z
+    ate_full, cte_full = _ate_cte_tensors(pred_norm[:T], gt_norm[:T])  # [T, B]
+    # _ate_cte_tensors defines a (repeated-last-step) heading at EVERY
+    # step including step 0, but evaluate_one_model()'s downstream index
+    # convention (ate_i = step0 - 1, has_atecte = step0 >= 1) expects an
+    # array of length T-1 starting at original step 1 -- drop step 0 to
+    # match, exactly as ate_cte_full's own T-1 truncation does.
+    return ate_full[1:], cte_full[1:]
 
 
 def load_fm(checkpoint: str, device):
@@ -652,7 +704,22 @@ def evaluate_one_model(model, loader, device, model_name: str,
         pd = _norm_to_deg(pred[:T])
         gd = _norm_to_deg(gt[:T, :, :2])
         d  = _haversine_deg(pd, gd)                  # [T, B] -- steps 0..T-1 (0=6h ... T-1=72h when T=12)
-        ate, cte = ate_cte_full(pd, gd)               # [T-1, B] -- ate[k] = error at step k+1 (0-indexed)
+        # [FIX-ATE-CTE-FORMULA-MISMATCH] ate_cte_full (spherical
+        # forward-azimuth/haversine, imported from flow_matching_model.py)
+        # is FM's OWN formula -- ST-Trans/LSTM/GRU/RNN/MMSTN/Phys-Diff/
+        # TC-Diffuser all import and use paper_baseline_model.py's
+        # _ate_cte_tensors instead (flat-plane projection), confirmed by
+        # each model file's own `from Model.paper_baseline_model import
+        # (..., _ate_cte_tensors, ...)` header. Applying ate_cte_full to
+        # every model regardless of which formula IT actually trains/
+        # self-evaluates with was silently producing ATE/CTE numbers for
+        # 7 of 8 models that didn't match what each model's own training
+        # script printed -- unrelated to seeding or eval()/Dropout state,
+        # which were already correct. Route each model to its own formula.
+        if is_fm:
+            ate, cte = ate_cte_full(pd, gd)           # [T-1, B] -- ate[k] = error at step k+1 (0-indexed)
+        else:
+            ate, cte = ate_cte_paper_formula(pred[:T], gt[:T, :, :2])  # [T-1, B], same indexing
         T_valid = ate.shape[0]                        # = T-1
 
         obs_deg = _norm_to_deg(obs[:, :, :2])
