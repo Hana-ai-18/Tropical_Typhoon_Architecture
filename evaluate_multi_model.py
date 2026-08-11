@@ -1997,9 +1997,39 @@ def load_paper_baseline(checkpoint: str, model_type: str, device,
     ck = torch.load(checkpoint, map_location="cpu")
     saved_type = ck.get("model_type", model_type)
     if saved_type != model_type:
-        print(f"  ⚠ Checkpoint's saved model_type='{saved_type}' differs "
-              f"from requested '{model_type}' — using requested value. "
-              f"Verify this checkpoint is really the {model_type.upper()} one.")
+        # [FIX-SILENT-MISLABEL] This was previously a quiet ⚠, easy to miss
+        # in a long log, and the code proceeded anyway to force-build a
+        # {model_type} architecture (e.g. PaperGRUHead) and load an RNN/LSTM
+        # checkpoint's state_dict into it with strict=False. Because
+        # PaperGRUHead/PaperRNNHead/PaperLSTMHead share the same
+        # nn.ModuleList("cells")/fc naming pattern, a meaningful FRACTION of
+        # keys can share names even though the underlying cell type
+        # (GRUCell vs RNNCell vs LSTMCell) differs -- so load_state_dict can
+        # load MOST weights without a large missing/unexpected count,
+        # producing a "Frankenstein" model (wrong architecture, partially
+        # mismatched weights) that still gives PLAUSIBLE-LOOKING (not
+        # obviously garbage) ADE/ATE/CTE numbers instead of an obvious
+        # failure. This is exactly how a checkpoint path accidentally
+        # pointed at the WRONG --xxx_checkpoints flag (e.g. RNN checkpoints
+        # passed to --gru_checkpoints) can silently produce a record
+        # labeled "GRU" in the output JSON that is actually RNN data run
+        # through GRU-shaped (but wrong-celltype) weights -- confirmed as
+        # the root cause of a real observed mislabeling incident. Now
+        # raises instead of silently continuing: the checkpoint path is
+        # almost certainly wrong, and continuing would silently corrupt
+        # the model-name labeling of every downstream record/table.
+        raise ValueError(
+            f"🛑 Checkpoint's saved model_type='{saved_type}' does NOT match "
+            f"the requested '{model_type}' (checkpoint path: {checkpoint}). "
+            f"This almost always means the wrong file was passed to "
+            f"--{model_type}_checkpoints (e.g. an RNN checkpoint accidentally "
+            f"pointed to by --gru_checkpoints) -- continuing would silently "
+            f"build a '{model_type}' architecture and load '{saved_type}' "
+            f"weights into it via strict=False, producing a real-looking but "
+            f"WRONG result mislabeled as '{model_type}' in the output JSON. "
+            f"Fix the --{model_type}_checkpoints path(s) to point at the "
+            f"correct {model_type.upper()} checkpoint file(s) and re-run."
+        )
 
     model_cfg = ck.get("model_cfg")
     if model_cfg:
@@ -2018,6 +2048,30 @@ def load_paper_baseline(checkpoint: str, model_type: str, device,
     if missing or unexpected:
         print(f"  ⚠ {model_type.upper()} load_state_dict: {len(missing)} "
               f"missing, {len(unexpected)} unexpected keys")
+        # [FIX-MISSING-MISMATCH-WARNING] load_st_trans/load_mmstn/
+        # load_phys_diff/load_tc_diffuser all warn loudly (🛑) when a
+        # large fraction of parameter keys mismatch -- signaling the
+        # loaded weights are essentially random-init, not the trained
+        # checkpoint, so any ADE/ATE/CTE from them is meaningless. This
+        # function (used for GRU/RNN/LSTM) was missing that same check
+        # entirely, only printing a quiet ⚠ with a raw key count that's
+        # easy to miss in a long log -- exactly the failure mode behind
+        # an ADE~1260km result (a checkpoint from a mismatched dataset/
+        # path silently loading as near-random weights instead of
+        # erroring out or warning clearly). Added for parity with every
+        # other loader in this file.
+        try:
+            total_model_params = len(list(model.state_dict().keys()))
+            mismatch_frac = (len(missing) + len(unexpected)) / max(total_model_params, 1)
+        except Exception:
+            mismatch_frac = 0.0
+        if mismatch_frac > 0.25:
+            print(f"  🛑 {mismatch_frac*100:.0f}% of {model_type.upper()}'s parameter keys did not "
+                  f"match this checkpoint's state_dict -- loaded weights are almost "
+                  f"entirely random-initialized. Any ADE/ATE/CTE reported below is "
+                  f"NOT a valid evaluation -- verify the checkpoint path/architecture "
+                  f"(hidden_dim/n_layers/dropout matching what this checkpoint was "
+                  f"actually trained with) before trusting it.")
     model.eval()
     seed = _infer_seed(checkpoint, ck)
     return model, seed
@@ -2461,10 +2515,6 @@ def evaluate_one_model(model, loader, device, model_name: str,
         pd = _norm_to_deg(pred[:T])
         gd = _norm_to_deg(gt[:T, :, :2])
         d  = _haversine_deg(pd, gd)                  # [T, B] -- steps 0..T-1 (0=6h ... T-1=72h when T=12)
-        # [TEMP-DEBUG] Per-batch ADE print to directly compare against
-        # diagnose_nondeterminism.py's output and isolate exactly where
-        # the two pipelines diverge. Remove once the discrepancy is found.
-        print(f"  [DEBUG {model_name}] batch {bi}: ADE={float(d.mean()):.6f}")
         # [DESIGN DECISION, confirmed with user] This script deliberately
         # uses ONE SHARED formula (ate_cte_full, spherical forward-azimuth/
         # haversine from flow_matching_model.py) for ALL models, including

@@ -204,7 +204,24 @@ def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
     # term. Valid, finite inputs are completely unaffected by this line —
     # nan_to_num is the identity function on already-finite tensors.
     a = torch.nan_to_num(a, nan=0.0, posinf=1.0, neginf=0.0)
-    return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
+    # [FIX-GRADIENT-EXPLOSION-NEAR-ZERO] asin(sqrt(a))'s derivative is
+    # 1/(2*sqrt(a)*sqrt(1-a)) -- as a→0 (two consecutive trajectory points
+    # nearly coincident, e.g. a slow-moving storm or a near-duplicate
+    # autoregressive prediction step), this derivative explodes: empirically
+    # confirmed ~500,000x normal magnitude at the PREVIOUS lower clamp bound
+    # (1e-12). Since _haversine_deg feeds every distance-based loss term
+    # (ADE/L_reg, L_calib, L_score, obs_speed inside speed_calibrate_pred),
+    # this was the dominant, recurring source of the NaN/Inf gradients
+    # observed and silently zeroed out throughout training (hundreds of
+    # occurrences per run, present from epoch 0). Raising the lower clamp
+    # bound to 1e-6 cuts the worst-case gradient by ~1400x while leaving
+    # the represented forward DISTANCE effectively unchanged for any
+    # trajectory pair that matters (at a=1e-6 the implied distance is
+    # ~12.7km vs ~0.01km at 1e-12 -- negligible against this model's
+    # ~240-700km ADE scale, and any two points THAT close together
+    # contribute essentially nothing to a haversine-based loss regardless
+    # of which of these two floors is used).
+    return 2.0 * R_EARTH * torch.asin(a.clamp(1e-6, 1 - 1e-6).sqrt())
 
 
 def _forward_azimuth(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:

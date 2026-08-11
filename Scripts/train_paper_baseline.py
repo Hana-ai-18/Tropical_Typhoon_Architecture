@@ -780,6 +780,16 @@ def main(args):
 
     metrics_csv = os.path.join(args.output_dir, args.metrics_csv)
     best_ckpt   = os.path.join(args.output_dir, "best_model.pth")
+    # [FIX-RESUME-GRANULARITY] Previously the only periodic checkpoint
+    # (besides best_model.pth, saved only on ADE improvement) was
+    # ckpt_ep{epoch:04d}.pth every 100 epochs -- if training is
+    # interrupted (e.g. Kaggle session timeout) between two of those,
+    # --resume can only recover up to 99 epochs of lost progress. FM's
+    # own train_flowmatching.py, and this project's own MMSTN/Phys-Diff/
+    # TC-Diffuser training scripts, already avoid this by overwriting a
+    # single last_ckpt/last_model.pth EVERY epoch. Adding the same here,
+    # at no cost to training logic -- purely an additional save point.
+    last_ckpt   = os.path.join(args.output_dir, "last_model.pth")
 
     print("=" * 70)
     print(f"  PAPER BASELINE  |  model={args.model_type.upper()}")
@@ -902,6 +912,33 @@ def main(args):
 
         ep_t = time.perf_counter() - t0
         print(f"  Epoch {epoch:>4}  train={avg_train:.4f}  val={avg_val:.4f}  t={ep_t:.0f}s")
+
+        # [FIX-RESUME-GRANULARITY] Save every epoch, overwriting the same
+        # file -- cheap (single state_dict write) and means --resume never
+        # loses more than the current in-progress epoch, regardless of
+        # val_freq/patience or the 100-epoch periodic ckpt_ep*.pth below.
+        torch.save({
+            "epoch"          : epoch,
+            "model_state"    : model.state_dict(),
+            "opt_state"      : optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state"   : scaler.state_dict() if args.use_amp else None,
+            "best_ade"       : best_ade,
+            "patience_cnt"   : patience_cnt,
+            "train_mse"      : avg_train,
+            "val_mse"        : avg_val,
+            "model_type"     : args.model_type,
+            "seed"           : args.seed,
+            "model_cfg"      : {
+                "model_type": args.model_type,
+                "pred_len":   args.pred_len,
+                "obs_len":    args.obs_len,
+                "hidden_dim": args.hidden_dim,
+                "n_layers":   args.n_layers,
+                "unet_in_ch": args.unet_in_ch,
+                "dropout":    args.dropout,
+            },
+        }, last_ckpt)
 
         # ── ADE + ATE + CTE evaluation ────────────────────────────────────
         if epoch % args.val_freq == 0:

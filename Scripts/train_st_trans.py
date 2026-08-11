@@ -816,6 +816,10 @@ def main(args):
 
     metrics_csv = os.path.join(args.output_dir, args.metrics_csv)
     best_ckpt   = os.path.join(args.output_dir, "best_model.pth")
+    # [FIX-RESUME-GRANULARITY] Same fix as train_paper_baseline.py -- see
+    # that file's comment for the full rationale (periodic ckpt_ep*.pth
+    # every 100 epochs left up to 99 epochs unrecoverable on interruption).
+    last_ckpt   = os.path.join(args.output_dir, "last_model.pth")
 
     print("=" * 70)
     print(f"  ST-TRANS BASELINE  |  type={args.model_type.upper()}")
@@ -957,6 +961,47 @@ def main(args):
         ep_t = time.perf_counter() - t0
         print(f"  Epoch {epoch:>4}  train_loss={avg_train:.4f}"
               f"  val_dpe={avg_val_dpe:.2f}km  t={ep_t:.0f}s")
+
+        # [FIX-RESUME-GRANULARITY] Save every epoch -- see train_paper_baseline.py's
+        # identical fix for the full rationale. model_cfg must match the
+        # SAME non_ar/ar variant split used at best-model save time below,
+        # since STTrans and STTransAR have different constructor signatures.
+        if args.model_type == "non_ar":
+            _last_model_cfg = {
+                "obs_len":        args.obs_len,
+                "pred_len":       args.pred_len,
+                "unet_in_ch":     args.unet_in_ch,
+                "d_model":        args.d_model,
+                "nhead":          args.nhead,
+                "num_enc_layers": args.num_enc_layers,
+                "num_dec_layers": args.num_dec_layers,
+                "dim_ff":         args.dim_ff,
+                "dropout":        args.dropout,
+            }
+        else:
+            _last_model_cfg = {
+                "obs_len":        args.obs_len,
+                "pred_len":       args.pred_len,
+                "unet_in_ch":     args.unet_in_ch,
+                "d_model":        args.d_model,
+                "nhead":          args.nhead,
+                "num_enc_layers": args.num_enc_layers,
+                "dim_ff":         args.dim_ff,
+                "dropout":        args.dropout,
+            }
+        torch.save({
+            "epoch"          : epoch,
+            "model_state"    : model.state_dict(),
+            "opt_state"      : optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "best_ade"       : best_ade,
+            "patience_cnt"   : patience_cnt,
+            "train_loss"     : avg_train,
+            "val_dpe"        : avg_val_dpe,
+            "model_type"     : args.model_type,
+            "seed"           : args.seed,
+            "model_cfg"      : _last_model_cfg,
+        }, last_ckpt)
 
         # ── ADE + ATE + CTE evaluation ────────────────────────────────────
         if epoch % args.val_freq == 0:

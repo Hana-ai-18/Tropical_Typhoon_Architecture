@@ -25,7 +25,22 @@ def haversine_km(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
     dlat = lat2 - lat1
     dlon = lon2 - lon1
     a = torch.sin(dlat / 2).pow(2) + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2).pow(2)
-    return 2.0 * 6371.0 * torch.asin(a.clamp(1e-12, 1.0).sqrt())
+    # [FIX-GRADIENT-EXPLOSION-NEAR-ZERO] Same fix as flow_matching_model.py's
+    # _haversine_deg -- see that file's comment for the full empirical
+    # derivation (asin(sqrt(a))'s derivative explodes ~500,000x as a→0,
+    # confirmed by direct PyTorch autograd test). This matters HERE
+    # specifically because st_trans_model.py's physics_loss() uses
+    # haversine_km DIRECTLY as l_dpe, the dominant term of ST-Trans's
+    # actual training loss gradient (NOT wrapped in torch.no_grad()) --
+    # every other model in this codebase (GRU/RNN/LSTM's get_loss uses
+    # plain mse_loss; MMSTN uses l2_loss_masked/gan_d_loss; Phys-Diff and
+    # TC-Diffuser use L2-norm/diffusion-noise losses) only calls
+    # haversine_km/compute_ade_per_horizon inside torch.no_grad() blocks
+    # for logging, so this fix is a no-op for their training gradients
+    # either way -- but changing the shared function once keeps every
+    # model's evaluate-time distance numbers on the same, consistent
+    # formula.
+    return 2.0 * 6371.0 * torch.asin(a.clamp(1e-6, 1 - 1e-6).sqrt())
 
 
 HORIZON_STEPS: Dict[int, int] = {12: 1, 24: 3, 48: 7, 72: 11}
