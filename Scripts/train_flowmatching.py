@@ -567,6 +567,15 @@ def get_args():
     p.add_argument("--sigma_decay_end",        default=100,    type=int)
     p.add_argument("--lambda_reg",             default=0.2,    type=float)
     p.add_argument("--lambda_heading",         default=0.07,   type=float)
+    p.add_argument("--use_curvature_score_train", action="store_true", default=False,
+                   help="[FIX-CURVATURE-WEIGHT-NEVER-TRAINED] Include curvature "
+                        "(whole-path turning-rate match) as a 5th component in "
+                        "L_score during training, so score_weight_logits[4] "
+                        "actually receives gradient instead of staying frozen "
+                        "at its ~1%% init value. Independent of and complementary "
+                        "to sample()'s own use_curvature_score at inference time "
+                        "-- enabling only at eval-time on a checkpoint trained "
+                        "without this flag has no effect (confirmed empirically).")
     p.add_argument("--lambda_momentum",        default=0.0,    type=float,
                    help="[v2.6] DISABLED — hurt test ATE by +7.9km")
     p.add_argument("--lambda_hard_reg",        default=0.02,   type=float)
@@ -718,6 +727,7 @@ def main(args):
         use_ema=args.use_ema,          n_ensemble=args.n_ensemble,
         n_inference_steps=args.n_inference_steps,
         sigma_inference=args.sigma_inference,
+        use_curvature_score_train=args.use_curvature_score_train,
     ).to(device)
 
     model_cfg = dict(
@@ -737,6 +747,7 @@ def main(args):
         use_ema=args.use_ema,          n_ensemble=args.n_ensemble,
         n_inference_steps=args.n_inference_steps,
         sigma_inference=args.sigma_inference,
+        use_curvature_score_train=args.use_curvature_score_train,
     )
 
     model.init_ema()

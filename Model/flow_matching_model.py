@@ -1269,11 +1269,28 @@ class TCFlowMatching(nn.Module):
                                             # not a bug — see _reg_loss).
         n_ensemble:        int   = 20,
         sigma_inference:   float = 0.04,   # FIXED throughout
+        use_curvature_score_train: bool = False,  # [FIX-CURVATURE-WEIGHT-NEVER-TRAINED]
+                                            # When True, L_score's _physics_score
+                                            # call (get_loss_breakdown) also scores
+                                            # candidates on whole-path turning-rate
+                                            # match vs the observed storm, so
+                                            # score_weight_logits[4] (curvature's
+                                            # softmax weight, init'd near 0.01/~1%)
+                                            # actually receives gradient during
+                                            # training instead of staying frozen at
+                                            # its init value. Independent of
+                                            # sample()'s own use_curvature_score
+                                            # argument (that only controls inference-
+                                            # time re-ranking) — this flag controls
+                                            # whether the weight is TRAINED at all.
+                                            # Default False preserves prior behavior
+                                            # exactly for existing training configs.
         **kwargs,
     ):
         super().__init__()
         self.pred_len          = pred_len
         self.obs_len            = obs_len
+        self.use_curvature_score_train = use_curvature_score_train
         self.sigma_min          = sigma_min
         self.sigma_max          = sigma_max
         self.sigma_decay_start  = sigma_decay_start
@@ -1894,11 +1911,23 @@ class TCFlowMatching(nn.Module):
             # not-yet-converged velocity network before they can cascade
             # into NaN through Sinkhorn/exp/division chains further down.
             _xabsk = _xabsk.clamp(-20.0, 20.0)
+            # [FIX-CURVATURE-WEIGHT-NEVER-TRAINED] Previously this call never
+            # passed use_curvature_score, so score_weight_logits[4] (the
+            # curvature sub-score's softmax weight) never received gradient
+            # through L_score during training -- it stayed at its ~1% init
+            # value (torch.log(tensor([...,0.01]))) regardless of whether
+            # use_curvature_score=True was passed to sample() at inference
+            # time. Enabling it at eval-time on a checkpoint trained this way
+            # was therefore a no-op, confirmed empirically (near-identical
+            # ADE/ATE/CTE with and without the flag). Wiring self.use_curvature_score_train
+            # through here lets the weight actually be learned when training
+            # with the flag enabled, matching what sample() does at inference.
             _scorek = _physics_score(
                 _xabsk, obs_traj[:, :, :2],
                 weight_logits=self.score_weight_logits,
                 v_sigma_scale_logit=self.score_v_sigma_scale_logit,
                 kernel_scale_logits=self.score_kernel_scale_logits,
+                use_curvature_score=self.use_curvature_score_train,
             )   # [B], CÓ gradient (không no_grad)
             _cand_list.append(_xabsk)
             _cand_scores.append(_scorek)
