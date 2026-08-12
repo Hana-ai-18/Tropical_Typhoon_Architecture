@@ -2425,7 +2425,8 @@ def load_tc_diffuser(checkpoint: str, device,
 def evaluate_one_model(model, loader, device, model_name: str,
                         seed: str = "unknown",
                         n_ensemble: int = 20,
-                        ddim_steps: Optional[int] = None) -> List[Dict]:
+                        ddim_steps: Optional[int] = None,
+                        use_curvature_score: bool = False) -> List[Dict]:
     """
     Returns a list of PER-LEAD-TIME records:
       {"model": name, "seed": seed, "storm": storm_key, "window": idx,
@@ -2499,7 +2500,17 @@ def evaluate_one_model(model, loader, device, model_name: str,
                 # self.n_inference_steps. Now CLI-configurable via --ddim_steps
                 # to match evaluate_full.py's convention (None = defer to
                 # checkpoint's trained value, same as before if not passed).
-                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble, ddim_steps=ddim_steps)
+                # [ADD-CURVATURE-SCORE] use_curvature_score is a pure
+                # inference-time re-ranking option (5th physics-score
+                # component, checks whole-path turning rate vs step-0
+                # direction only) -- the model's own docstring confirms it
+                # needs no retraining and can be A/B tested on any existing
+                # checkpoint. Previously this script always left it at the
+                # sample() default (False); now CLI-configurable via
+                # --use_curvature_score so it can actually be tried.
+                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble,
+                                           ddim_steps=ddim_steps,
+                                           use_curvature_score=use_curvature_score)
             elif is_mmstn or is_phys_diff or is_tc_diffuser:
                 # No num_ensemble passed -- see is_ensemble_model comment
                 # above. Each model's sample() uses its own pre-configured
@@ -2625,6 +2636,14 @@ def main():
                         "n_inference_steps, silently ignoring any intended override). "
                         "Default None matches evaluate_full.py's --ddim_steps convention: "
                         "defer to the checkpoint's own value unless explicitly set.")
+    p.add_argument("--use_curvature_score", action="store_true", default=False,
+                   help="[ADD-CURVATURE-SCORE] Enable FM's 5th physics-score "
+                        "re-ranking component (whole-path turning-rate match vs "
+                        "observed storm, instead of only checking step-0 direction). "
+                        "Pure inference-time change on FM's sample() -- confirmed by "
+                        "the model's own docstring to need no retraining, directly "
+                        "A/B-testable on any existing checkpoint. Has no effect on "
+                        "non-FM models. Default off, matching sample()'s own default.")
     p.add_argument("--test_year", type=int, default=None)
 
     p.add_argument("--fm_checkpoints",       nargs="+", default=None,
@@ -2817,7 +2836,8 @@ def main():
         set_seed(args.seed)
         recs = evaluate_one_model(model, loader, device, display_name,
                                    seed=seed, n_ensemble=args.n_ensemble,
-                                   ddim_steps=args.ddim_steps)
+                                   ddim_steps=args.ddim_steps,
+                                   use_curvature_score=args.use_curvature_score)
         all_records.extend(recs)
 
         # [FIX] ate/cte là None ở lead_time=1 (6h) theo convention đã sửa
