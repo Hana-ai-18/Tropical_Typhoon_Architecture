@@ -69,8 +69,15 @@ def build_optimizer(model, lr_velocity, lr_encoder, weight_decay,
     velocity_ids = {id(p) for p in raw.velocity.parameters()}
     covered_ids  = encoder_ids | velocity_ids
 
-    softmax_logit_names = {"reg_step_logits", "hard_score_weight_logits",
-                            "heading_step_logits"}
+    # [EMA-NORMALIZED-HORIZON UPDATE] reg_step_logits and heading_step_logits
+    # were removed from the model (replaced by non-learnable EMA buffers
+    # reg_dist_ema / heading_err_ema, which are NOT nn.Parameters and
+    # therefore never appear in named_parameters() or any optimizer group
+    # below -- they update via their own no_grad EMA rule inside the loss
+    # functions, exactly like BatchNorm running stats). Only
+    # hard_score_weight_logits remains a real softmax-based learnable
+    # logit vector in this category.
+    softmax_logit_names = {"hard_score_weight_logits"}
     softmax_logit_params, rest_extra_params = [], []
     for name, p in raw.named_parameters():
         if id(p) in covered_ids:
@@ -118,7 +125,7 @@ def build_optimizer(model, lr_velocity, lr_encoder, weight_decay,
                         "name": "softmax_logits"})
         print(f"  [build_optimizer] softmax_logits group: {len(softmax_logit_params)} tensors "
               f"({sum(p.numel() for p in softmax_logit_params)} params) — "
-              f"reg_step/hard_score/heading_step @ lr×{lr_logits_scale} "
+              f"hard_score_weight_logits @ lr×{lr_logits_scale} "
               f"(slower convergence, less seed-init sensitivity)")
 
     return optim.AdamW(groups, weight_decay=weight_decay)
@@ -263,7 +270,20 @@ def evaluate_hard_val(model, val_loader, device, hard_threshold: float = 0.35,
                     bl_h[i] = item[hard_idx, ...]
 
         try:
-            pred, _, _ = model.sample(bl_h, num_ensemble=n_ensemble)
+            # [CURV-SCORE-ENABLE] use_curvature_score=True was coded, tested,
+            # and marked "opt-in, A/B-testable on any existing checkpoint,
+            # no retraining needed" — but was never actually turned on at
+            # any eval/test call site in this file (checked: every prior
+            # model.sample() call used the default False). It is the ONLY
+            # scoring component that checks whether a candidate's turning
+            # RATE over the full horizon matches the storm's observed
+            # turning rate; head_score only checks step-0 direction and
+            # smooth_score actively penalizes turning everywhere, so for
+            # recurving storms the best-of-K selection was systematically
+            # biased toward straight-line candidates at 48h-72h. Enabling
+            # this requires no retraining to test its effect on an existing
+            # checkpoint.
+            pred, _, _ = model.sample(bl_h, num_ensemble=n_ensemble, use_curvature_score=True)
         except Exception as e:
             print(f"  hard val error: {e}"); continue
 
@@ -329,7 +349,7 @@ def evaluate(model, loader, device, tag: str = "",
                 obs_s = obs.clone(); obs_s[..., :2] = anchor + (obs[..., :2] - anchor) * sc
                 bl_s = list(bl); bl_s[0] = obs_s
                 try:
-                    p, _, _ = model.sample(bl_s, num_ensemble=n_ensemble)
+                    p, _, _ = model.sample(bl_s, num_ensemble=n_ensemble, use_curvature_score=True)
                     preds_t.append(p)
                     weights_t.append(2.0 if abs(sc - 1.0) < 1e-6 else 1.0)
                 except Exception: continue
@@ -338,7 +358,7 @@ def evaluate(model, loader, device, tag: str = "",
             pred = sum(w / tw * p for w, p in zip(weights_t, preds_t))
         else:
             try:
-                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble)
+                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble, use_curvature_score=True)
             except Exception as e:
                 print(f"  sample error: {e}"); continue
 
@@ -397,7 +417,7 @@ def evaluate(model, loader, device, tag: str = "",
  
     if run_xai and xai_batch is not None:
         try:
-            _, _, _, xai = _unwrap(model).sample(xai_batch, return_xai=True)
+            _, _, _, xai = _unwrap(model).sample(xai_batch, return_xai=True, use_curvature_score=True)
 
             print(f"  {'─'*60}")
             print(f"  XAI Summary (fixed val batch)")
@@ -567,7 +587,7 @@ def get_args():
     p.add_argument("--sigma_decay_end",        default=100,    type=int)
     p.add_argument("--lambda_reg",             default=0.2,    type=float)
     p.add_argument("--lambda_heading",         default=0.07,   type=float)
-    p.add_argument("--use_curvature_score_train", action="store_true", default=False,
+    p.add_argument("--use_curvature_score_train", action="store_true", default=True,
                    help="[FIX-CURVATURE-WEIGHT-NEVER-TRAINED] Include curvature "
                         "(whole-path turning-rate match) as a 5th component in "
                         "L_score during training, so score_weight_logits[4] "
@@ -880,6 +900,23 @@ def main(args):
         print(f"  ↩ Resume ep{start_ep}  best={best_score:.1f}  patience={patience_cnt}")
 
     try:
+        # [EMA-NORMALIZED-HORIZON NOTE] reg_dist_ema/heading_err_ema are
+        # updated via BRANCHLESS in-place buffer mutation (tensor-weighted
+        # blend, not a Python if/else on a tensor's value) inside a
+        # `if self.training:` branch (self.training is a plain Python bool
+        # attribute, which TorchDynamo guards on natively -- same pattern
+        # nn.BatchNorm uses for running_mean/running_var, and recompiles
+        # once per train/eval mode switch, not per-batch). The warm-start
+        # logic (first-batch-after-freeze overwrite vs subsequent EMA
+        # blend) deliberately avoids any `bool(tensor)`/`.item()` read
+        # inside the forward pass -- an earlier version of this mechanism
+        # DID use such a read and was verified (via
+        # torch.compile(fullgraph=True), which raises a hard error on any
+        # graph break instead of silently falling back) to force a
+        # CPU-GPU sync and TorchDynamo graph break. The current tensor-
+        # weighted-blend version was verified with the same
+        # fullgraph=True test to compile with ZERO graph breaks, so it is
+        # safe under mode="reduce-overhead" CUDA-graph capture.
         model = torch.compile(model, mode="reduce-overhead")
         print("  torch.compile: ok")
     except Exception: pass

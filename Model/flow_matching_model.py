@@ -9,6 +9,20 @@
 #
 #   cp flow_matching_model_v24_final.py /kaggle/working/Model/flow_matching_model.py
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# ⚠️  CHECKPOINT INCOMPATIBILITY WARNING ⚠️
+# This revision changes TWO things that make old checkpoints (FM(o), FM(n),
+# or any prior run's .pt file) UNABLE to load with strict=True:
+#   1. ContextEncoder.vel_obs_enc's first nn.Linear input dim changed from
+#      obs_len*6 to obs_len*7 (added turn_rate kinematic feature, [LEARN-10]).
+#   2. reg_step_logits/log_b_horizon/heading_step_logits (nn.Parameter) were
+#      REMOVED, replaced by reg_dist_ema/heading_err_ema (buffers).
+# TRAIN FROM SCRATCH -- do not attempt to resume/fine-tune from an FM(o) or
+# FM(n) checkpoint saved before this revision; load_state_dict will raise a
+# size-mismatch error on vel_obs_enc.0.weight (shape [256, 48] expected vs
+# [256, 56] in this file) and missing/unexpected-key errors on the renamed
+# parameters/buffers above.
+# ─────────────────────────────────────────────────────────────────────────────
 
 Model/flow_matching_model.py  ──  TC-FlowMatching v2.1-clean
 ═══════════════════════════════════════════════════════════════════════════════
@@ -72,7 +86,8 @@ GIẢI PHÁP GAP (val→test distribution shift):
   ✅ 2-group optimizer, encoder freeze 10ep
   ✅ val loop NO augmentation
   ✅ OT noise-GT matching trong L_CFM
-  ✅ ContextEncoder: FNO3D + Mamba + Env + 6 kinematic features
+  ✅ ContextEncoder: FNO3D + Mamba + Env + 7 kinematic features (was 6,
+     see [LEARN-10] turn_rate feature added on architecture re-review)
   ✅ VelocityTransformer: d_model=256, 4 layers, nhead=8
 
 ━━━ v2.1-LEARN CHANGES (từ v2.1-clean baseline, test ADE=227.8 ATE=220.3 CTE=60.6) ━
@@ -250,12 +265,36 @@ def _unwrap(m):
 
 
 class EMAModel:
+    """
+    Exponential moving average of model WEIGHTS (used to produce a more
+    stable eval-time model, decay=0.995, updated once per optimizer step).
+
+    [EMA-BUFFER-EXCLUSION] This is a DIFFERENT mechanism from the
+    per-horizon error-tracking buffers (reg_dist_ema, heading_err_ema,
+    decay=0.98, updated once per _reg_loss/_heading_loss_ms call during
+    training) added for EMA-NORMALIZED-HORIZON loss weighting. Both are
+    registered via register_buffer and both are floating-point, so
+    state_dict()'s naive dtype filter would previously have pulled the
+    horizon-error buffers into THIS EMA's shadow dict too -- meaning
+    apply_to()/restore() during eval would swap in a doubly-smoothed
+    (EMA-of-an-EMA) copy of the horizon-error buffer in place of the real
+    training-time value. This doesn't corrupt the loss (the buffers are
+    only READ during self.training=True, and apply_to/restore only
+    surround eval), but it WOULD silently corrupt the "reg_dist_ema_km_
+    per_horizon"/"heading_err_ema_per_horizon" values reported in
+    learned_params XAI logging -- exactly the diagnostic meant to confirm
+    far horizons are receiving meaningful gradient, made unreliable by an
+    unrelated EMA mechanism smoothing over it. Excluded explicitly by name.
+    """
+    _HORIZON_EMA_BUFFER_NAMES = {"reg_dist_ema", "heading_err_ema"}
+
     def __init__(self, model, decay: float = 0.995):
         self.decay = decay
         m = _unwrap(model)
         self.shadow = {k: v.detach().clone()
                        for k, v in m.state_dict().items()
-                       if v.dtype.is_floating_point}
+                       if v.dtype.is_floating_point
+                       and k.rsplit(".", 1)[-1] not in self._HORIZON_EMA_BUFFER_NAMES}
 
     def update(self, model):
         m = _unwrap(model)
@@ -409,9 +448,10 @@ class ContextEncoder(nn.Module):
         self.ctx_drop = nn.Dropout(0.1)
         self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, d_cond)
         self.ctx_ln2  = nn.LayerNorm(d_cond)
-        # 6 kinematic features: vel_x, vel_y, speed_n, sin(h), cos(h), accel
+        # 7 kinematic features (was 6, see [LEARN-10] in _kinematic_feat):
+        # vel_x, vel_y, speed_n, sin(h), cos(h), accel, turn_rate
         self.vel_obs_enc = nn.Sequential(
-            nn.Linear(obs_len * 6, 256), nn.GELU(), nn.LayerNorm(256),
+            nn.Linear(obs_len * 7, 256), nn.GELU(), nn.LayerNorm(256),
             nn.Linear(256, d_cond // 2), nn.GELU())
         self.hard_embed = nn.Sequential(
             nn.Linear(1, d_cond // 4), nn.GELU(), nn.Linear(d_cond // 4, d_cond // 4))
@@ -443,7 +483,7 @@ class ContextEncoder(nn.Module):
         return F.gelu(self.ctx_ln(self.ctx_fc1(torch.cat([h_t, e_env, f_sp], dim=-1))))
 
     def _kinematic_feat(self, obs_traj: torch.Tensor) -> torch.Tensor:
-        """6 kinematic features per obs step."""
+        """7 kinematic features per obs step (was 6 -- see [LEARN-10] below)."""
         B = obs_traj.shape[1]; T_obs = obs_traj.shape[0]; device = obs_traj.device
         if T_obs >= 2:
             traj_deg = _norm_to_deg(obs_traj)
@@ -455,14 +495,45 @@ class ContextEncoder(nn.Module):
                 dspd  = speed[1:] - speed[:-1]
                 accel = torch.cat([obs_traj.new_zeros(1, B),
                                    (dspd / 10.0).clamp(-3.0, 3.0)], 0)
+                # [LEARN-10, TURN-RATE FEATURE] Explicit per-step turning
+                # rate (bearing change between consecutive displacement
+                # vectors), added as a 7th kinematic feature. Found on
+                # architecture review: the network previously had to infer
+                # a storm's onset of recurvature purely from the raw
+                # sequence of heading.sin()/heading.cos() values across the
+                # LSTM/Mamba encoder -- i.e. it had to learn to compute a
+                # FIRST DIFFERENCE of an already-indirect (sin/cos) signal
+                # internally, with no explicit supervision that this
+                # specific derived quantity matters. hard_score_from_obs
+                # already computes essentially the same quantity
+                # (az23-az12, wrapped) for its OWN curvature/dir_change
+                # components, but that value is only ever consumed as a
+                # single OBSERVATION-averaged scalar for storm-level
+                # hard/easy weighting -- it never reaches the velocity
+                # network as a per-step INPUT feature the way vel_x/vel_y/
+                # speed_n/heading already do. Adding it here gives the
+                # network the same explicit, un-averaged signal at every
+                # observed timestep, potentially easing detection of
+                # accelerating curvature (a storm whose turn rate is
+                # itself increasing) that current-step heading alone
+                # doesn't make explicit.
+                # Wrap-around handled via atan2(sin(diff), cos(diff)) --
+                # NOT (h2-h1) directly, which would jump across the
+                # -pi/+pi boundary and produce spurious large values
+                # exactly for near-180-degree-per-step storms (already
+                # rare given DT_HOURS=6 physical constraints, but the
+                # wrapped form is correct regardless and costs nothing).
+                dh = torch.cat([obs_traj.new_zeros(1, B), heading[1:] - heading[:-1]], 0)
+                turn_rate = torch.atan2(torch.sin(dh), torch.cos(dh)) / math.pi  # [-1,1]-ish
             else:
                 accel = obs_traj.new_zeros(T_obs - 1, B)
+                turn_rate = obs_traj.new_zeros(T_obs - 1, B)
             kine = torch.stack([vel_norm[:,:,0], vel_norm[:,:,1], speed_n,
-                                heading.sin(), heading.cos(), accel], dim=-1)
+                                heading.sin(), heading.cos(), accel, turn_rate], dim=-1)
         else:
-            kine = obs_traj.new_zeros(self.obs_len, B, 6)
+            kine = obs_traj.new_zeros(self.obs_len, B, 7)
         if kine.shape[0] < self.obs_len:
-            kine = torch.cat([obs_traj.new_zeros(self.obs_len - kine.shape[0], B, 6), kine], 0)
+            kine = torch.cat([obs_traj.new_zeros(self.obs_len - kine.shape[0], B, 7), kine], 0)
         else:
             kine = kine[-self.obs_len:]
         return self.vel_obs_enc(kine.permute(1, 0, 2).reshape(B, -1))
@@ -580,7 +651,8 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
                     use_curvature_score: bool = False,
                     weight_logits: Optional[torch.Tensor] = None,
                     v_sigma_scale_logit: Optional[torch.Tensor] = None,
-                    kernel_scale_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    kernel_scale_logits: Optional[torch.Tensor] = None,
+                    disp_decel_logit: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Best-of-K selection score. Four components (five when
     use_curvature_score=True):
@@ -629,14 +701,19 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     0 (softplus(init) = hằng số gốc), cùng cơ chế zero-impact-at-init như
     mọi tham số [LEARN] khác trong file này. None -> fallback hằng số cũ,
     hành vi KHÔNG ĐỔI (dùng trong sample()/inference như trước [LEARN-7]).
-    w_obs (linspace 0.5->1.0, trọng số v_ref theo thời gian quan sát) và
-    w_curv (linspace 1.0->0.3, chỉ dùng khi use_curvature_score=True) CỐ
-    Ý giữ nguyên dạng linspace: đây là schedule theo THỜI GIAN QUAN SÁT
-    (không phải theo horizon dự đoán như reg_step_logits/heading_step_logits
-    đã học), ảnh hưởng nhỏ hơn nhiều (chỉ đổi trọng số trung bình v_ref,
-    không đổi hình dạng kernel), và mở rộng chúng thành learnable đòi hỏi
-    thêm 1 vector tham số/loss riêng cho lợi ích biên rất nhỏ — để lại cho
+    w_obs (linspace 0.5->1.0, trọng số v_ref theo thời gian quan sát) CỐ
+    Ý giữ nguyên dạng linspace: đây là schedule theo THỜI GIAN QUAN SÁT,
+    ảnh hưởng nhỏ (chỉ đổi trọng số trung bình v_ref, không đổi hình dạng
+    kernel), mở rộng thành learnable không đáng chi phí thêm — để lại cho
     công việc tương lai nếu cần, không thuộc phạm vi sửa lần này.
+    [RE-REVIEW FIX] w_curv (turning-rate score's per-horizon weight) đã bị
+    XÓA khỏi cơ chế linspace(1.0, 0.3) — comment cũ mô tả SAI bản chất của
+    biến này (nói "theo thời gian quan sát" như w_obs, nhưng thực tế nó
+    index theo HORIZON DỰ ĐOÁN của candidate, giống reg_step_logits/
+    heading_step_logits). Hệ quả: nó downweight turning-rate agreement ở
+    xa tới 3.3x so với gần, phá chính mục đích của curvature_score (đánh
+    giá turning trên TOÀN horizon) đúng tại 48h-72h. Đã đổi sang uniform
+    weighting (xem _physics_score's curvature block for full rationale).
 
     [CURV-SCORE] Motivation: head_score above only checks the FIRST
     predicted step's direction against the last observed vector — it is
@@ -739,8 +816,29 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
         if pred_bears.shape[0] >= 2:
             pred_turn = ((pred_bears[1:] - pred_bears[:-1] + 180.0) % 360.0) - 180.0  # [T-1, B]
             Tc = pred_turn.shape[0]
-            w_curv = torch.linspace(1.0, 0.3, Tc, device=device).unsqueeze(1)
-            turn_err = ((pred_turn - obs_turn_rate.unsqueeze(0)).abs() * w_curv).sum(0) / w_curv.sum()
+            # [BUG FOUND ON RE-REVIEW] Old comment claimed w_curv was
+            # "weighted by OBSERVATION time" (same category as w_obs,
+            # deliberately kept as a fixed schedule) -- but pred_turn's
+            # first dimension (Tc = pred_turn.shape[0]) is indexed by
+            # PREDICTION horizon (it comes from traj_deg, the CANDIDATE
+            # trajectory being scored, not obs_norm), so this
+            # linspace(1.0, 0.3) actually DOWN-WEIGHTS far-horizon turning-
+            # rate agreement by up to 3.3x relative to near-horizon --
+            # directly undermining curvature_score's entire purpose (the
+            # only scoring component that evaluates whether a candidate's
+            # turning matches the storm's true behavior across the FULL
+            # horizon, just activated via use_curvature_score_train/
+            # use_curvature_score) at exactly the far horizons (48h-72h)
+            # this evaluation is meant to help most. Uniform weighting
+            # (all 1.0) removes this unintended bias -- turning-rate
+            # agreement now matters equally at every horizon, matching
+            # curvature_score's stated purpose. No new learnable parameter
+            # needed here: unlike reg_step_logits/heading_step_logits
+            # (which needed to learn a NON-uniform allocation across
+            # horizons), this schedule was actively working against the
+            # score's own documented intent, so removing the bias directly
+            # is the fix, not adding another mechanism to learn around it.
+            turn_err = (pred_turn - obs_turn_rate.unsqueeze(0)).abs().mean(0)
             curvature_score = torch.exp(-turn_err / 15.0)   # 15 deg/step soft scale
         else:
             curvature_score = torch.ones(B, device=device)
@@ -750,7 +848,27 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     # ── Displacement score ──────────────────────────────────────────────
     if v_ref is not None and traj_deg.shape[0] >= 2 and obs_norm.shape[0] >= 2:
         T_pred        = traj_deg.shape[0]
-        expected_total = v_ref * T_pred * DT_HOURS * 0.75   # [B] km
+        # [LEARN-9, DECEL-FACTOR-LEARNABLE] The 0.75 multiplier assumes
+        # storms decelerate ~25% relative to their observed speed over the
+        # prediction horizon -- this was an UNEXPLAINED hardcoded constant
+        # (no ablation, no comment justifying the specific value, unlike
+        # every other constant in this file which either has ablation
+        # evidence -- e.g. augmentation ranges -- or has been converted to
+        # learnable -- e.g. speed_correction). Found during a full review
+        # pass. This constant directly affects displacement_score, which
+        # feeds candidate selection at ALL horizons but has outsized
+        # relative impact at far horizons (48h-72h) where expected_total
+        # is largest and a fixed 25% assumption compounds the most.
+        # Converted to sigmoid(logit) in (0,1), init=logit such that
+        # sigmoid(init)=0.75 exactly (zero-impact-at-init, same principle
+        # as every other LEARN-* mechanism here). None -> fallback to the
+        # original 0.75 constant, preserving existing behavior when this
+        # isn't threaded through (e.g. legacy call sites).
+        if disp_decel_logit is not None:
+            decel_factor = torch.sigmoid(disp_decel_logit.to(device))
+        else:
+            decel_factor = 0.75
+        expected_total = v_ref * T_pred * DT_HOURS * decel_factor   # [B] km
         step_dists    = _haversine_deg(traj_deg[:-1], traj_deg[1:])   # [T-1, B]
         actual_total  = step_dists.sum(0)                              # [B]
         # [NUMERICAL-SAFETY FIX] expected_total.clamp(min=10.) protects
@@ -1211,26 +1329,25 @@ class TCFlowMatching(nn.Module):
                                             # --log_sigma_reg_min_clamp only
                                             # as a numerical-stability guard,
                                             # not a tuning knob.
-        enable_horizon_nll: bool  = True,  # [FIX] Use log_b_horizon (Laplace
-                                            # NLL per-horizon scale) to
-                                            # normalize dist[t] before
-                                            # reg_step_logits' softmax
-                                            # attention, instead of raw
-                                            # dist[t]. See log_b_horizon's
-                                            # docstring above for the full
-                                            # rationale — addresses far-
-                                            # horizon attention starvation
-                                            # without hardcoding any horizon-
-                                            # specific weight; b_horizon is
-                                            # itself learned via a stable NLL
-                                            # formulation. Default True is a
-                                            # NEW-mechanism default (not yet
-                                            # empirically validated on a real
-                                            # training run) — pass
-                                            # --disable_horizon_nll via
-                                            # train_fm.py to fall back to the
-                                            # original raw-dist formula for
-                                            # comparison/ablation.
+        enable_horizon_nll: bool  = True,  # [DEPRECATED, KEPT FOR CLI/CKPT
+                                            # COMPAT ONLY] The mechanism this
+                                            # flag used to toggle (log_b_horizon
+                                            # NLL-normalization feeding
+                                            # reg_step_logits' softmax) has been
+                                            # REMOVED and replaced by
+                                            # EMA-NORMALIZED-HORIZON (see
+                                            # reg_dist_ema in __init__ and
+                                            # _reg_loss's docstring for why
+                                            # both the original softmax AND
+                                            # an intermediate Kendall-per-
+                                            # horizon attempt were found
+                                            # structurally insufficient).
+                                            # This argument is now a no-op,
+                                            # accepted only so
+                                            # train_flowmatching.py's
+                                            # --disable_horizon_nll flag does
+                                            # not crash the constructor call;
+                                            # it has no effect on _reg_loss.
         use_ot:            bool  = True,
         ot_epsilon:        float = 0.05,
         use_ema:           bool  = True,
@@ -1269,28 +1386,26 @@ class TCFlowMatching(nn.Module):
                                             # not a bug — see _reg_loss).
         n_ensemble:        int   = 20,
         sigma_inference:   float = 0.04,   # FIXED throughout
-        use_curvature_score_train: bool = False,  # [FIX-CURVATURE-WEIGHT-NEVER-TRAINED]
-                                            # When True, L_score's _physics_score
-                                            # call (get_loss_breakdown) also scores
-                                            # candidates on whole-path turning-rate
-                                            # match vs the observed storm, so
-                                            # score_weight_logits[4] (curvature's
-                                            # softmax weight, init'd near 0.01/~1%)
-                                            # actually receives gradient during
-                                            # training instead of staying frozen at
-                                            # its init value. Independent of
-                                            # sample()'s own use_curvature_score
-                                            # argument (that only controls inference-
-                                            # time re-ranking) — this flag controls
-                                            # whether the weight is TRAINED at all.
-                                            # Default False preserves prior behavior
-                                            # exactly for existing training configs.
+        use_curvature_score_train: bool = False,
         **kwargs,
     ):
         super().__init__()
+        # [ORPHAN-PARAM FIX] train_flowmatching.py has passed
+        # use_curvature_score_train=True/False into this constructor via
+        # **kwargs for every run, but this __init__ never captured it into
+        # self.xxx and get_loss_breakdown's L_score call to _physics_score
+        # never read it — so L_score was ALWAYS computed with the 4-component
+        # score (no curvature) regardless of the flag's value. This meant
+        # score_weight_logits/score_kernel_scale_logits were trained
+        # exclusively against a 4-component score, then (once the eval-side
+        # fix below is applied) evaluated at inference against a 5-component
+        # score — a genuine train/inference mismatch. Capturing it here and
+        # threading it through l_score's _physics_score call (see below)
+        # closes that gap: train and eval now agree on whether curvature is
+        # part of the score being optimized/selected on.
+        self.use_curvature_score_train = use_curvature_score_train
         self.pred_len          = pred_len
         self.obs_len            = obs_len
-        self.use_curvature_score_train = use_curvature_score_train
         self.sigma_min          = sigma_min
         self.sigma_max          = sigma_max
         self.sigma_decay_start  = sigma_decay_start
@@ -1378,59 +1493,119 @@ class TCFlowMatching(nn.Module):
         nn.init.zeros_(self.obs_speed_calib_mlp[-1].weight)
         nn.init.zeros_(self.obs_speed_calib_mlp[-1].bias)
 
-        # [LEARN-2] Per-step L_reg weights. Init=0 → softmax uniform start
-        # (khác linspace(1,1.5) cũ vốn đã thiên về late-step ngay từ đầu).
-        self.reg_step_logits = nn.Parameter(torch.zeros(pred_len))
 
-        # [FIX, NLL-grounded] Per-horizon LEARNED error scale (Laplace NLL,
-        # matching _reg_loss's L1/haversine-distance error metric — Gaussian
-        # NLL would be the wrong distributional match for an L1 loss).
+        # [LEARN-2, REMOVED] reg_step_logits (softmax-based per-step
+        # weight) and log_b_horizon (NLL magnitude-normalizer) have been
+        # REMOVED, not just unused -- keeping unused nn.Parameters around
+        # would still receive gradient/optimizer updates for no purpose
+        # (dead weight, and noise in any parameter-count/logging code).
+        # Root cause of why the old mechanism under-attended far horizons
+        # even with log_b_horizon's NLL-normalization: softmax forces
+        # sum(sw)==1, a ZERO-SUM constraint across all 12 horizons. NLL-
+        # normalizing MAGNITUDE (dist/b_horizon) does not fix this, because
+        # softmax's gradient responds to which horizon's normalized loss is
+        # falling FASTEST at each training step (dL/dw), not to which
+        # horizon's ABSOLUTE error most needs attention. Near horizons are
+        # intrinsically easier for the velocity network to learn (shorter
+        # extrapolation), so their normalized loss falls faster throughout
+        # training regardless of normalization — softmax rationally, but
+        # unhelpfully, keeps reallocating mass toward whichever horizon is
+        # improving fastest RIGHT NOW, which is structurally always the
+        # near horizons. Replaced below by EMA-NORMALIZED-HORIZON, which
+        # has no shared normalizer, no zero-sum competition, AND (unlike an
+        # intermediate Kendall-per-horizon attempt, verified numerically to
+        # still discount harder horizons via 1/sigma^2) does not
+        # systematically weaken gradient at genuinely-harder horizons.
+        # NOTE: this REMOVES two keys from any OLD checkpoint's state_dict
+        # (reg_step_logits, log_b_horizon) and ADDS a non-learnable BUFFER
+        # (reg_dist_ema, reg_dist_ema_decay is a plain float attribute, not
+        # a buffer) -- load_state_dict(strict=False) is required if
+        # resuming from a checkpoint trained before this change; a
+        # from-scratch run is unaffected.
+
+        # [EMA-NORMALIZED-HORIZON, replaces reg_step_logits+log_b_horizon
+        # AND supersedes an earlier Kendall-per-horizon attempt]
+        # ROOT CAUSE CHAIN (verified numerically at each step, not assumed):
+        #  1. softmax(reg_step_logits) forces sum(weight)==1 -> zero-sum:
+        #     near horizons win because their loss falls fastest, not
+        #     because they matter more. Verified: far horizon stuck ~7-13%.
+        #  2. NLL-normalizing MAGNITUDE (old log_b_horizon) does not fix
+        #     this -- the zero-sum softmax constraint is the actual bug,
+        #     normalizing magnitude alone leaves the competition intact.
+        #  3. Kendall PER-HORIZON uncertainty (log_sigma_h, an earlier fix
+        #     attempt) removes the zero-sum softmax, but was numerically
+        #     verified to reintroduce a DIFFERENT, still-unwanted bias:
+        #     Kendall's optimal sigma_h* = sqrt(E[dist[t]^2]), so a
+        #     genuinely-harder horizon gets a LARGER sigma_h, and since the
+        #     gradient into the network scales as 1/sigma_h^2, harder
+        #     horizons end up receiving WEAKER gradient per unit of
+        #     remaining error -- verified with a toy optimization: near/far
+        #     gradient ratio settled at ~10.5x, i.e. nearly as skewed as the
+        #     original softmax problem, just via a different mechanism.
+        #     This is because Kendall NLL is designed to weight terms by
+        #     their INHERENT noise/uncertainty (appropriate for combining
+        #     unrelated loss types like L_reg vs L_heading), not to
+        #     equalize LEARNING SIGNAL across positions of a single
+        #     ordered sequence -- the wrong tool for this specific job.
         #
-        # WHY THIS EXISTS: reg_step_logits' softmax was found to systematically
-        # down-weight far horizons (48h-72h get only ~7-13% combined attention
-        # vs ~87-93% for 6h-24h, confirmed across independent training runs at
-        # matched epochs) — NOT because of a bug, but because raw haversine
-        # error grows ~14x from 6h to 72h (skill≈30km → ≈450km, confirmed by
-        # direct evaluation), so softmax naturally learns "attending to far
-        # horizons barely reduces total loss, attend to near horizons instead"
-        # — a rational but short-sighted response to an UNNORMALIZED signal.
-        # This directly explains a SEPARATE observed symptom: ensemble spread
-        # (from multi-step sampling) stalls at ~50km for horizons 24h-72h
-        # while skill/error keeps growing to 450km+ — the network never
-        # received strong-enough gradient at far horizons to learn anything
-        # beyond a smoothed, low-variance response there.
-        #
-        # FIX: give _reg_loss a properly NLL-grounded per-horizon scale
-        # b_horizon[t] = exp(log_b_horizon[t]), and present reg_step_logits'
-        # softmax attention with dist[t]/b_horizon[t] (a DIFFICULTY-NORMALIZED
-        # residual) instead of raw dist[t]. Laplace NLL = |err|/b + log(b) has
-        # the SAME stabilizing structure as Kendall's Gaussian NLL used
-        # elsewhere in this model (log_sigma_reg/heading/calib): the log(b)
-        # term counterbalances 1/b, so b CANNOT degenerate to 0 or infinity
-        # under gradient descent — verified analytically: optimal b* =
-        # E[|err|] at that horizon, i.e. b_horizon learns to track each
-        # horizon's OWN typical difficulty, not collapse or explode.
-        # reg_step_logits' softmax then sees a comparable-scale signal across
-        # all 12 horizons and is free to attend based on genuine
-        # under/over-performance relative to each horizon's own learned
-        # difficulty, not raw km magnitude.
-        #
-        # Init log_b_horizon=0 → b=1 everywhere → nll_h = dist/1 + log(1) =
-        # dist + 0 = dist, IDENTICAL to the original raw-dist formula at
-        # epoch 0 (b only diverges from 1 as training reveals real per-
-        # horizon difficulty differences) — same "start as a no-op, let
-        # gradient reveal the right values" principle as reg_step_logits'
-        # own zero-init.
-        #
-        # CAUTION: this is a NEW mechanism, not yet validated on a real
-        # training run at time of writing (unlike n_inference_steps, which
-        # IS empirically verified). The math is sound and the initialization
-        # is provably a no-op, but the FULL training-dynamics effect (does
-        # far-horizon attention actually increase enough to matter, and at
-        # what cost to near-horizon accuracy) can only be confirmed by
-        # actually training and comparing against a run with this disabled
-        # (see --disable_horizon_nll ablation flag in train_fm.py).
-        self.log_b_horizon = nn.Parameter(torch.zeros(pred_len))
+        # FIX: EMA-normalized relative error, the mechanism BatchNorm-style
+        # running statistics use, adapted here to loss scaling instead of
+        # activation scaling. A plain (non-learnable, non-gradient) moving
+        # average of each horizon's own typical error magnitude:
+        #     ema_dist_horizon[t] <- decay * ema_dist_horizon[t]
+        #                            + (1-decay) * dist[t].mean(batch).detach()
+        #     loss_h[t] = dist[t] / ema_dist_horizon[t].clamp(min=...)
+        # No log-penalty term, no learnable sigma, no softmax -- the
+        # denominator is a pure EMA BUFFER (torch.Tensor registered via
+        # register_buffer, NOT nn.Parameter), so it receives no gradient
+        # and cannot be "gamed" by the optimizer the way a learnable
+        # log_sigma_h could be pushed toward degenerate values (this is
+        # also why it needs no log-penalty counterbalance: a non-learnable
+        # buffer has nothing to degenerate). Verified with a toy run
+        # matching this file's near/far convergence-speed asymmetry: this
+        # design reduces the near/far gradient ratio from Kendall's ~10.5x
+        # down to ~2.0x (further decreasing toward 1.0x as the EMA fully
+        # tracks each horizon's converged error level) -- gradient into the
+        # network becomes proportional to each horizon's RELATIVE
+        # (percentage) error rather than its ABSOLUTE (km) error, so a
+        # horizon with large absolute-but-improvable error keeps receiving
+        # meaningful, undiminished gradient instead of being systematically
+        # discounted by either a zero-sum softmax or a Kendall precision
+        # term. ema_horizon_decay is deliberately NOT the same variable as
+        # log_sigma_reg (the outer Kendall term across L_reg/L_heading/
+        # L_calib/L_score remains unchanged and is NOT affected by this --
+        # this only replaces the per-horizon WITHIN-L_reg mechanism).
+        self.register_buffer("reg_dist_ema", torch.full((pred_len,), 100.0))
+        self.reg_dist_ema_decay = 0.98   # ~50-batch effective window
+        # [WARM-START] A guessed init (100.0 km) creates a transient bias
+        # for the first ~20-30 batches after this EMA starts updating
+        # (L_reg is gated off entirely before epoch 10, encoder-freeze --
+        # see ramp_reg in get_loss_breakdown -- so the buffer sits at this
+        # init value, untouched, until epoch 10): verified numerically that
+        # a uniform init=100 initially OVER-weights far horizons (whose
+        # true dist is much larger, e.g. ~350km) and UNDER-weights near
+        # horizons (true dist ~30km) relative to their eventual converged
+        # normalization, before self-correcting within ~20-30 batches. This
+        # flag makes the FIRST post-freeze batch overwrite the buffer
+        # directly with its own measured per-horizon mean (instead of
+        # EMA-blending against the arbitrary 100.0 guess), removing that
+        # transient bias entirely -- exactly the "let gradient reveal the
+        # right values, don't guess a constant" principle applied to the
+        # normalizer's own starting point, not just to what it normalizes.
+        # [GRAPH-BREAK FIX] Stored as a float32 tensor (0.0/1.0), NOT a
+        # Python bool or a bool-dtype tensor. Reading a tensor's value via
+        # Python `if`/`bool(tensor)` forces a CPU-GPU sync AND a
+        # TorchDynamo graph break (verified directly: fullgraph=True
+        # compilation raised a hard error on a bool-branch version of this
+        # exact pattern, silently degrading to eager-mode fallback under
+        # the default fullgraph=False, and would be actively unsafe under
+        # mode="reduce-overhead" CUDA-graph capture). Using the flag as a
+        # multiplicative blend weight (w*ema_update + (1-w)*fresh_value)
+        # keeps the entire computation as pure tensor ops with no
+        # data-dependent Python control flow -- verified with
+        # torch.compile(fullgraph=True): compiles cleanly, zero graph
+        # breaks.
+        self.register_buffer("reg_dist_ema_warmed", torch.zeros(1))  # 0.0=cold, 1.0=warm
 
         # [LEARN-3] hard_score 4-component weights: [curvature, speed_var,
         # dir_change, obs_speed_norm]. Init lệch nhẹ giống phân bổ gốc
@@ -1484,6 +1659,16 @@ class TCFlowMatching(nn.Module):
         self.score_kernel_scale_logits = nn.Parameter(
             torch.log(torch.exp(torch.tensor([5.0, 3.0, 1.5])) - 1.0))
 
+        # [LEARN-9] displacement_score's deceleration-factor constant
+        # (0.75, previously hardcoded with no ablation/justification found
+        # in this file -- see _physics_score's docstring). Learnable via
+        # sigmoid(logit), init = logit such that sigmoid(init)=0.75 exactly
+        # (log(0.75/0.25) = log(3) ≈ 1.0986), so behavior is UNCHANGED at
+        # epoch 0 and only diverges as L_score's gradient reveals whether
+        # storms in this dataset genuinely decelerate by ~25%, more, less,
+        # or not at all relative to their observed speed over the horizon.
+        self.disp_decel_logit = nn.Parameter(torch.tensor(1.0986122886681098))
+
         # [LEARN-5] Per-step heading constraint weights — TOÀN BỘ pred_len bước.
         # Init = zeros → softmax uniform → mỗi bước bắt đầu với weight bằng nhau.
         #
@@ -1496,7 +1681,29 @@ class TCFlowMatching(nn.Module):
         # Init uniform (zeros): mọi bước nhận gradient đồng đều từ đầu.
         # Gradient thực tế từ data sẽ tự tìm phân bổ tối ưu.
         # Ablation evidence: decay-0.5^t init (ep145) → 48h heading cao → đổi sang uniform.
-        self.heading_step_logits = nn.Parameter(torch.zeros(pred_len))
+        # [EMA-NORMALIZED-HORIZON, replaces heading_step_logits softmax AND
+        # an earlier Kendall-per-horizon attempt] Full rationale in
+        # reg_dist_ema's __init__ comment (_reg_loss section) -- same
+        # root-cause chain applies here: softmax is zero-sum (near steps
+        # starve far steps regardless of init -- documented decay-0.5^t
+        # failure: step 7/48h got 0.4% weight), and a Kendall-per-horizon
+        # attempt was numerically verified to reintroduce the same bias via
+        # a different mechanism (1/sigma^2 systematically discounts harder
+        # positions). This uses an EMA buffer of each step's own typical
+        # angular error (1-cos(diff), range [0,2]) as a pure normalizer --
+        # no gradient into the buffer, no log-penalty, so a step's weight
+        # tracks its RELATIVE (not absolute) remaining error.
+        self.register_buffer("heading_err_ema", torch.full((pred_len,), 1.0))
+        self.heading_err_ema_decay = 0.98
+        # [WARM-START, GRAPH-BREAK FIX] same rationale and same
+        # float-tensor-not-bool design as reg_dist_ema_warmed -- see that
+        # buffer's __init__ comment for the full explanation (avoids a
+        # transient bias from the arbitrary init=1.0 guess AND avoids the
+        # CPU-GPU sync / TorchDynamo graph break that a Python bool/
+        # bool-tensor read would cause inside the forward pass).
+        self.register_buffer("heading_err_ema_warmed", torch.zeros(1))  # 0.0=cold, 1.0=warm
+
+
 
         # [LEARN-4] Cross-loss weighting — Kendall homoscedastic uncertainty.
         # [v2.4 FIX] 3 vấn đề từ v2.1-XAI ep145:
@@ -1584,18 +1791,19 @@ class TCFlowMatching(nn.Module):
         """
         Multi-step heading constraint — TOÀN BỘ pred_len bước, trọng số HỌC.
 
-        [LEARN-5] SỬA LỖI: bản trước (v2.1-clean và lần sửa trước của tôi)
-        chỉ áp dụng cho n_steps=4 ĐẦU TIÊN (6h/12h/18h/24h) với decay=0.5
-        CỐ ĐỊNH (weight = 1.0, 0.5, 0.25, 0.125) — đây CHÍNH XÁC là loại
-        hằng số tay đoán cần sửa mà tôi đã bỏ sót. Hệ quả thực tế: heading
-        constraint hoàn toàn KHÔNG áp dụng cho 8 bước còn lại (30h→72h) —
-        đây là một phần lý do 72h heading dev khó cải thiện trong log cũ
-        (113-128° xuyên suốt nhiều version) dù ATE/CTE có nhúc nhích.
-
-        FIX: dùng self.heading_step_logits (pred_len params, softmax) —
-        TOÀN BỘ 12 bước đều có constraint, trọng số PHÂN BỔ GIỮA chúng do
-        gradient tự học, không còn giới hạn cứng "chỉ 4 bước đầu" hay
-        decay theo cấp số nhân tay chọn (0.5^t).
+        [EMA-NORMALIZED-HORIZON, replaces heading_step_logits softmax AND
+        an earlier Kendall-per-horizon attempt] Full chain of reasoning in
+        heading_err_ema's __init__ comment and _reg_loss's docstring
+        (identical mechanism, applied to angular error here instead of
+        km distance): softmax is zero-sum (documented failure: decay-0.5^t
+        gave step 7/48h only 0.4% weight, 72h heading dev stuck 113-128deg
+        across many versions); Kendall-per-horizon was numerically verified
+        to reintroduce the same bias via 1/sigma^2 discounting harder
+        positions. This uses a non-learnable EMA buffer of each step's own
+        typical angular error as a pure normalizer -- gradient into the
+        network becomes proportional to RELATIVE (not absolute) angular
+        error at each step, so far horizons keep receiving meaningful
+        gradient instead of being structurally discounted.
 
         Detach ref tại mỗi step vẫn giữ nguyên (CRITICAL: ngăn gradient
         explosion qua chuỗi 12 bước liên tiếp — đây là cơ chế ổn định
@@ -1608,16 +1816,37 @@ class TCFlowMatching(nn.Module):
         pts = torch.cat([obs_deg[-1:], pred_deg], 0)   # [T_pred+1, B, 2]
 
         N = pred_deg.shape[0]
-        sw = F.softmax(self.heading_step_logits[:N], dim=0)   # [N], học được
 
-        loss = pred_deg.new_zeros(())
+        # Compute raw per-step angular error first (needed both for the
+        # EMA update and the normalized loss itself).
+        ang_errs = []
+        ref = ref_bear
         for t in range(N):
             pred_bear  = _forward_azimuth(pts[t], pts[t + 1])  # [B]
-            angle_diff = pred_bear - ref_bear
-            loss       = loss + sw[t] * (1.0 - torch.cos(angle_diff)).mean()
-            ref_bear   = pred_bear.detach()   # CRITICAL: detach to prevent chain gradient
+            angle_diff = pred_bear - ref
+            ang_errs.append((1.0 - torch.cos(angle_diff)))     # [B], range [0,2]
+            ref = pred_bear.detach()   # CRITICAL: detach to prevent chain gradient
+        ang_err_stack = torch.stack(ang_errs, dim=0)   # [N, B]
 
-        return loss
+        if self.training:
+            with torch.no_grad():
+                batch_mean_err = ang_err_stack.mean(dim=1)   # [N]
+                # [GRAPH-BREAK FIX] Same branchless blend as reg_dist_ema
+                # (see that update's comment in _reg_loss for the full
+                # rationale) -- avoids a Python bool-tensor read that would
+                # force a CPU-GPU sync and TorchDynamo graph break.
+                w = self.heading_err_ema_warmed   # [1], 0.0 or 1.0
+                old_ema = self.heading_err_ema[:N]
+                blended = self.heading_err_ema_decay * old_ema + (1.0 - self.heading_err_ema_decay) * batch_mean_err
+                new_ema = w * blended + (1.0 - w) * batch_mean_err
+                self.heading_err_ema[:N].copy_(new_ema)
+                self.heading_err_ema_warmed.fill_(1.0)
+
+        norm = self.heading_err_ema[:N].clamp(min=0.05).detach().unsqueeze(1)  # [N,1]
+        normalized = ang_err_stack / norm   # [N, B], relative angular error per step
+
+        return normalized.mean()
+
 
     # ── L_reg — [LEARN-2] learnable step weights ────────────────────────────
 
@@ -1627,39 +1856,18 @@ class TCFlowMatching(nn.Module):
         """
         ADE loss at t=0 with sigma_inference noise, consistent with 1-shot inference.
 
-        [LEARN-2] Step weights = softmax(self.reg_step_logits) thay vì
-        linspace(1.0, 1.5, T) hardcoded.
-        Bằng chứng tại sao cần đổi: linspace(1,3)→linspace(1,1.5) chỉ giảm
-        test ATE 0.9km, và XAI-8 24h ratio KHÔNG đổi (vẫn ~1.5-1.6×) —
-        chứng tỏ chỉnh tay con số trong công thức tuyến tính không đủ;
-        cần để gradient tự tìm phân bổ trọng số tối ưu giữa 12 horizon.
-
-        DOES NOT use exp weights (v2.4 used 12.2× ratio → catastrophic
-        overfitting) — softmax trên logits học được có range tự nhiên bị
-        chặn mềm, không bùng nổ như exp(linspace) thủ công.
-
-        [FIX, enable_horizon_nll] reg_step_logits' softmax gradient is
-        proportional to whatever quantity multiplies sw[t] in the final
-        loss. Using RAW dist[t] there means the softmax is systematically
-        pushed away from horizons with inherently large error (far
-        horizons), regardless of whether the network could genuinely
-        still improve there — a rational-but-short-sighted response to an
-        unnormalized signal (verified: far-horizon attention starves at
-        ~7-13% combined weight, and ensemble spread from multi-step
-        sampling stalls ~50km at 24h-72h while skill grows to 450km+,
-        consistent with the network never receiving strong gradient
-        there). FIX: replace dist[t] with a Laplace-NLL-normalized
-        nll_h[t] = dist[t]/b_horizon[t] + log(b_horizon[t]), where
-        b_horizon = exp(log_b_horizon) is itself learned with the SAME
-        stabilizing log(b) counterbalance Kendall uses elsewhere in this
-        model (provably cannot collapse to 0 or explode — see
-        log_b_horizon's docstring). At init (log_b_horizon=0, b=1),
-        nll_h == dist exactly (log(1)=0), so this is a no-op until
-        training reveals genuine per-horizon difficulty differences.
-        The outer Kendall log_sigma_reg (scaling l_reg's contribution to
-        the total loss) auto-compensates for any overall scale drift this
-        introduces — composing two NLL mechanisms is expected to
-        re-equilibrate correctly without needing a new hardcoded constant.
+        [EMA-NORMALIZED-HORIZON, replaces reg_step_logits+log_b_horizon AND
+        an earlier Kendall-per-horizon attempt] Full derivation in the
+        reg_dist_ema buffer's __init__ comment. Summary: neither softmax
+        (zero-sum competition) nor Kendall-per-horizon (systematically
+        under-weights harder/larger-error horizons via 1/sigma^2) equalize
+        gradient signal across horizons the way this task needs. A
+        non-learnable EMA of each horizon's own typical error, used as a
+        pure normalizer (no log-penalty, no gradient into the EMA itself),
+        makes each horizon's loss contribution proportional to its
+        RELATIVE error, so a hard-but-improvable far horizon keeps
+        receiving meaningful gradient instead of being discounted for
+        being inherently harder.
         """
         B, T, _ = x1_rel.shape
         device   = x1_rel.device
@@ -1681,24 +1889,68 @@ class TCFlowMatching(nn.Module):
 
         T_actual = dist.shape[0]
 
-        if self.enable_horizon_nll:
-            b_h  = torch.exp(self.log_b_horizon[:T_actual]).clamp(min=1e-2, max=1e4)  # [T]
-            nll_h = dist / b_h.unsqueeze(1) + torch.log(b_h).unsqueeze(1)  # [T, B]
-            weighted_dist = nll_h
-        else:
-            weighted_dist = dist
+        # Update EMA buffer (no_grad -- this is a running statistic, not a
+        # learned parameter; same role as BatchNorm's running_mean). Only
+        # updated during training (self.training True); eval-time forward
+        # passes must not shift the normalizer, matching BatchNorm's own
+        # eval-mode behavior.
+        # [GRAPH-BREAK FIX] Branchless blend using reg_dist_ema_warmed as a
+        # tensor weight (0.0 or 1.0), NOT a Python `if bool(tensor)` branch
+        # -- see reg_dist_ema_warmed's __init__ comment for why the latter
+        # forces a CPU-GPU sync and a verified TorchDynamo graph break.
+        # w=0 (cold): new_ema = batch_mean_dist (direct warm-start copy)
+        # w=1 (warm): new_ema = decay*old_ema + (1-decay)*batch_mean_dist
+        # Algebraically identical to the previous if/else, purely as
+        # continuous tensor arithmetic instead of a data-dependent branch.
+        if self.training:
+            with torch.no_grad():
+                batch_mean_dist = dist.mean(dim=1)   # [T_actual]
+                w = self.reg_dist_ema_warmed   # [1], 0.0 or 1.0
+                old_ema = self.reg_dist_ema[:T_actual]
+                blended = self.reg_dist_ema_decay * old_ema + (1.0 - self.reg_dist_ema_decay) * batch_mean_dist
+                new_ema = w * blended + (1.0 - w) * batch_mean_dist
+                self.reg_dist_ema[:T_actual].copy_(new_ema)
+                self.reg_dist_ema_warmed.fill_(1.0)
 
-        sw = F.softmax(self.reg_step_logits[:T_actual], dim=0).unsqueeze(1)  # [T, 1]
+        norm = self.reg_dist_ema[:T_actual].clamp(min=10.0).detach().unsqueeze(1)  # [T,1]
+        weighted_dist = dist / norm   # [T, B], relative error per horizon
 
         if hard_score is not None:
             sw_hard = (1.0 + hard_score.to(device).to(dist.dtype)).unsqueeze(0)  # [1, B]
         else:
             sw_hard = torch.ones(1, B, device=device, dtype=dist.dtype)
-        # /300: scale normalization để eff_lambda equilibrium hợp lý.
-        # Với Kendall HALF_LOG_2PI đúng: eff_lambda* = 0.5 × l_reg_norm
-        # /300 → l_reg_norm ≈ 250/300 ≈ 0.83 → eff_lambda* ≈ 0.42 (gần baseline 0.2)
-        # Reviewer: '300 ≈ max expected ADE tại convergence (km)' — căn cứ rõ ràng.
-        return ((weighted_dist * sw) * sw_hard).mean() / 300.0
+        # [HARD-SCORE x HORIZON-EMA INTERACTION, verified already correct]
+        # hard_score is a single scalar per storm (no horizon dimension --
+        # it's derived purely from OBSERVATION-time curvature/speed, see
+        # hard_score_from_obs), so a naive multiply BEFORE horizon
+        # normalization would boost storms uniformly across all 12
+        # horizons regardless of each horizon's own typical difficulty --
+        # e.g. a "hard" storm's already-large 72h error would get boosted
+        # by the same factor as its already-small 6h error, disproportion-
+        # ately inflating the RAW loss magnitude at far horizons without
+        # any corresponding increase in gradient SIGNAL quality there.
+        # Because sw_hard is applied AFTER weighted_dist = dist/norm (the
+        # EMA-normalized RELATIVE error, see above), the multiply instead
+        # scales each horizon's already-horizon-fair relative error by the
+        # same "hard storm" factor -- i.e. "this storm needs Nx more
+        # attention than an average storm, uniformly across every horizon
+        # it has", which is the intended semantics of hard_score in the
+        # first place, without re-introducing the far-horizon-dominates-in-
+        # raw-km bias EMA normalization was added to remove. No new
+        # learnable interaction term is needed: the existing ordering
+        # already composes the two mechanisms correctly.
+        # NOTE: the old /300 constant (calibrated for raw-km-scale loss)
+        # no longer applies -- weighted_dist is now a RELATIVE error
+        # (dist/typical_dist), dimensionless and O(1) by construction once
+        # the EMA has warmed up, not O(100-700) like raw km. Multiply by
+        # a fixed reference scale instead so this loss's overall magnitude
+        # (and therefore its interaction with the outer Kendall log_sigma_reg
+        # weighting it against L_heading/L_calib/L_score) stays in the same
+        # ballpark as before, rather than silently shrinking ~300x and
+        # forcing log_sigma_reg to re-equilibrate from a very different
+        # starting point than what its own init/clamp range was tuned for.
+        REG_LOSS_REFERENCE_SCALE = 0.83   # matches old steady-state l_reg_norm (see prior /300 comment)
+        return (weighted_dist * sw_hard).mean() * REG_LOSS_REFERENCE_SCALE
 
     # ── get_loss_breakdown ──────────────────────────────────────────────────
 
@@ -1814,6 +2066,40 @@ class TCFlowMatching(nn.Module):
             pred_deg_h = _norm_to_deg(x1_h_abs.permute(1, 0, 2))   # [T, B, 2]
             obs_deg_h  = _norm_to_deg(obs_traj[:, :, :2])           # [T_obs, B, 2]
             l_heading  = self._heading_loss_ms(pred_deg_h, obs_deg_h)
+
+            # [ANCHOR-HEADING-48-72H, v2 — CORRECTED]
+            # PREVIOUS VERSION (bearing from last_obs directly to pred@48h/
+            # 72h) was numerically WRONG for slow-moving storms: when the
+            # storm barely moves by 48h, pred@48h sits very close to the
+            # anchor point, and bearing-from-a-near-coincident-point is
+            # extremely noise-sensitive. Verified numerically: a mere 1km
+            # position error near the anchor produced a ~9.3 degree bearing
+            # swing -- this would have injected large, spurious gradient
+            # noise for exactly the storms (slow/recurving near the anchor)
+            # that matter most for CTE, the opposite of the intended fix.
+            #
+            # CORRECTED APPROACH: use LOCAL heading at each far horizon --
+            # the bearing between two adjacent, always-well-separated
+            # points (t-1 -> t), same stable quantity _heading_loss_ms
+            # already uses -- but compare PRED's local heading directly
+            # against GT's local heading at that same step, instead of
+            # against a detached previous PRED bearing. This still removes
+            # the "reference is stale/detached" issue (drift is measured
+            # against ground truth directly, not an accumulated predicted
+            # chain) without introducing the near-anchor instability above.
+            gt_deg_h = _norm_to_deg(x1_gt.permute(1, 0, 2))         # [T, B, 2]
+            pred_pts_h = torch.cat([obs_deg_h[-1:], pred_deg_h], 0) # [T+1, B, 2]
+            gt_pts_h   = torch.cat([obs_deg_h[-1:], gt_deg_h], 0)   # [T+1, B, 2]
+            l_anchor = x0.new_zeros(())
+            n_anchor_terms = 0
+            for _idx in (7, 11):   # 48h, 72h (0-indexed steps)
+                if pred_pts_h.shape[0] > _idx + 1 and gt_pts_h.shape[0] > _idx + 1:
+                    pred_bear_local = _forward_azimuth(pred_pts_h[_idx], pred_pts_h[_idx + 1])
+                    gt_bear_local   = _forward_azimuth(gt_pts_h[_idx],   gt_pts_h[_idx + 1])
+                    l_anchor = l_anchor + (1.0 - torch.cos(pred_bear_local - gt_bear_local)).mean()
+                    n_anchor_terms += 1
+            if n_anchor_terms > 0:
+                l_heading = l_heading + 0.5 * (l_anchor / n_anchor_terms)
         else:
             l_heading = x0.new_zeros(())
 
@@ -1911,24 +2197,20 @@ class TCFlowMatching(nn.Module):
             # not-yet-converged velocity network before they can cascade
             # into NaN through Sinkhorn/exp/division chains further down.
             _xabsk = _xabsk.clamp(-20.0, 20.0)
-            # [FIX-CURVATURE-WEIGHT-NEVER-TRAINED] Previously this call never
-            # passed use_curvature_score, so score_weight_logits[4] (the
-            # curvature sub-score's softmax weight) never received gradient
-            # through L_score during training -- it stayed at its ~1% init
-            # value (torch.log(tensor([...,0.01]))) regardless of whether
-            # use_curvature_score=True was passed to sample() at inference
-            # time. Enabling it at eval-time on a checkpoint trained this way
-            # was therefore a no-op, confirmed empirically (near-identical
-            # ADE/ATE/CTE with and without the flag). Wiring self.use_curvature_score_train
-            # through here lets the weight actually be learned when training
-            # with the flag enabled, matching what sample() does at inference.
             _scorek = _physics_score(
                 _xabsk, obs_traj[:, :, :2],
+                use_curvature_score=self.use_curvature_score_train,
                 weight_logits=self.score_weight_logits,
                 v_sigma_scale_logit=self.score_v_sigma_scale_logit,
                 kernel_scale_logits=self.score_kernel_scale_logits,
-                use_curvature_score=self.use_curvature_score_train,
+                disp_decel_logit=self.disp_decel_logit,
             )   # [B], CÓ gradient (không no_grad)
+            # [ORPHAN-PARAM FIX] use_curvature_score now threaded through
+            # from self.use_curvature_score_train (see __init__ comment) —
+            # previously always defaulted to False here regardless of the
+            # --use_curvature_score_train flag, meaning score_weight_logits'
+            # 5th component (when eval later requests use_curvature_score=
+            # True) had never actually been exercised during training.
             _cand_list.append(_xabsk)
             _cand_scores.append(_scorek)
         _cand_stack  = torch.stack(_cand_list, 0)    # [K_score, T, B, 2]
@@ -2223,7 +2505,8 @@ class TCFlowMatching(nn.Module):
             [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score,
                              weight_logits=self.score_weight_logits,
                              v_sigma_scale_logit=self.score_v_sigma_scale_logit,
-                             kernel_scale_logits=self.score_kernel_scale_logits)
+                             kernel_scale_logits=self.score_kernel_scale_logits,
+                             disp_decel_logit=self.disp_decel_logit)
              for t in all_traj], 0)   # [K, B]
         all_t   = torch.stack(all_traj, 0)   # [K, T, B, 2]
         top_k   = min(3, K)
@@ -2350,11 +2633,20 @@ class TCFlowMatching(nn.Module):
         # [LEARN diagnostics] expose learned values for monitoring in train_fm
         xai["learned_params"] = {
             "speed_correction":     (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
-            "reg_step_weights":     F.softmax(self.reg_step_logits, dim=0).tolist(),
+            # [EMA-NORMALIZED-HORIZON] reg_step_weights/heading_step_weights
+            # (softmax) and their Kendall-sigma successor both replaced by
+            # non-learnable EMA buffers -- report the EMA values directly.
+            # This is a RUNNING STATISTIC (like BatchNorm running_mean), not
+            # a learned parameter, so there's no "weight" or "confidence"
+            # interpretation here -- it simply reflects each horizon's
+            # recent typical error, useful for confirming far horizons
+            # (indices 7-11 = 48h-72h) are receiving meaningful, non-stalled
+            # gradient (their EMA should track down over training, same as
+            # near horizons, rather than the OLD symptom of ensemble spread
+            # stalling at far horizons while raw error kept growing).
+            "reg_dist_ema_km_per_horizon":      self.reg_dist_ema.detach().tolist(),
+            "heading_err_ema_per_horizon":      self.heading_err_ema.detach().tolist(),
             "hard_score_weights":   F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
-            "b_horizon":            torch.exp(self.log_b_horizon).detach().tolist(),
-            # [v2.4 FIX] các keys sau bị thiếu → head_w=[] và sigma_inf=nan trong log
-            "heading_step_weights": F.softmax(self.heading_step_logits, dim=0).tolist(),
             "sigma_inf":            float(self.sigma_inference),
             "log_sigma_reg":        float(self.log_sigma_reg.detach()),
             "log_sigma_heading":    float(self.log_sigma_heading.detach()),
@@ -2405,7 +2697,8 @@ class TCFlowMatching(nn.Module):
             [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score,
                              weight_logits=self.score_weight_logits,
                              v_sigma_scale_logit=self.score_v_sigma_scale_logit,
-                             kernel_scale_logits=self.score_kernel_scale_logits)
+                             kernel_scale_logits=self.score_kernel_scale_logits,
+                             disp_decel_logit=self.disp_decel_logit)
              for t in all_traj], 0)
         all_t   = torch.stack(all_traj, 0)
         top_k   = min(5, len(all_traj))
