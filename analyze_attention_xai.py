@@ -129,16 +129,38 @@ def load_fm(checkpoint_path: str, device):
 def classify_storm_turning(obs_traj: torch.Tensor, gt_traj: torch.Tensor,
                             turn_threshold_deg: float = 25.0) -> str:
     """Same logic as the single-seed script -- see that file's docstring
-    for the rationale behind the 25-degree cutoff."""
+    for the rationale behind the 25-degree cutoff.
+
+    [BUG FOUND AND FIXED] _forward_azimuth returns bearings in RADIANS
+    (standard atan2 convention). The previous version took the raw
+    difference between two such radian values (`d = bearings[i+1] -
+    bearings[i]`, itself already correctly in radians) and then called
+    `math.radians(d)` on it before wrapping with atan2/degrees -- i.e.
+    treating an already-radian value as if it were in degrees and
+    converting it AGAIN, shrinking it by a factor of ~57.3 (180/pi).
+    Verified numerically: a genuine 30-degree turn was reduced to
+    ~0.52 "degrees" by this bug. Confirmed directly from a real run:
+    all 449 test-set storms across all 3 seeds were classified as
+    "straight" with zero "recurving" records anywhere in the attention
+    summary output -- consistent with total_turn being suppressed ~57x
+    below the 25-degree threshold for every storm, not with the test set
+    genuinely containing zero recurving storms (implausible for a South
+    China Sea / NW Pacific tropical cyclone track dataset). Fixed by
+    converting each bearing to degrees ONCE, immediately after
+    _forward_azimuth, before taking any differences.
+    """
     full_traj = torch.cat([obs_traj[:, :2], gt_traj[:, :2]], dim=0)
     deg = _norm_to_deg(full_traj.unsqueeze(1)).squeeze(1)
     if deg.shape[0] < 3:
         return "unknown"
-    bearings = [float(_forward_azimuth(deg[i], deg[i + 1]))
-                for i in range(deg.shape[0] - 1)]
+    bearings_deg = [math.degrees(float(_forward_azimuth(deg[i], deg[i + 1])))
+                     for i in range(deg.shape[0] - 1)]
     total_turn = 0.0
-    for i in range(len(bearings) - 1):
-        d = bearings[i + 1] - bearings[i]
+    for i in range(len(bearings_deg) - 1):
+        d = bearings_deg[i + 1] - bearings_deg[i]
+        # Wrap to [-180, 180] so e.g. a bearing change from 179 to -179
+        # degrees (a 2-degree turn crossing the wrap boundary) isn't
+        # miscounted as a 358-degree turn.
         d = math.degrees(math.atan2(math.sin(math.radians(d)), math.cos(math.radians(d))))
         total_turn += abs(d)
     return "recurving" if total_turn >= turn_threshold_deg else "straight"
