@@ -1,35 +1,62 @@
 """
-analyze_attention_xai.py
+analyze_xai_multi_seed.py
 =========================
-Chạy SAU KHI đã có checkpoint TC-FlowMatching đã train xong. Trích 2 nguồn
-diễn giải riêng biệt từ VelocityTransformer:
-  1. cross-attention weight (xem [XAI-ATTN] trong flow_matching_model.py)
-  2. FiLM gamma/beta deviation (xem [XAI-FILM]) -- vì HORIZON-FILM tiêm
-     context vào query side (x_emb) NGOÀI đường cross-attention tới memory,
-     cross_attn một mình không còn kể hết câu chuyện horizon-conditioning
-     nữa; cần cả 2 nguồn để tránh bỏ sót cơ chế nào đang thực sự "làm việc".
-Phân nhóm storm theo mức độ turning (recurving vs straight-moving), rồi
-tổng hợp + vẽ hình cho phần Results của bài báo.
+Chạy 1 LẦN cho NHIỀU checkpoint FM (ví dụ 3 seed) cùng lúc. Giải quyết đúng
+3 lỗ hổng đã xác định khi chỉ chạy 1 seed:
+
+  1. CỠ MẪU: 1 seed không đủ để biết một pattern (ví dụ "gamma deviation
+     cao ở 6h") là thật hay chỉ là đặc thù của 1 lần khởi tạo ngẫu nhiên.
+     Script này tự động tính MEAN ± STD qua N seed cho mỗi horizon, thay vì
+     báo cáo 1 điểm dữ liệu duy nhất.
+
+  2. SUY LUẬN NHÂN QUẢ: "deviation cao ở horizon X" không tự động nghĩa là
+     "model học được điều gì có ích ở đó" -- cần đối chiếu với ADE/ATE/CTE
+     THẬT tại đúng horizon đó. Script này tự chạy evaluate() đầy đủ cho mỗi
+     seed VÀ ghép nối với FiLM deviation cùng horizon, để bạn (hoặc reviewer)
+     tự nhìn thấy có tương quan hay không, thay vì suy diễn từ 1 con số.
+
+  3. TÍNH TÁI LẬP: mỗi checkpoint được đánh giá độc lập, seed RNG cố định
+     trước mỗi model.sample() call (giống evaluate_multi_model.py's
+     set_seed() convention), để kết quả không phụ thuộc thứ tự checkpoint
+     được liệt kê trên CLI.
+
+CẢ 2 NGUỒN DIỄN GIẢI (không chỉ 1):
+  - FiLM gamma/beta deviation (nhanh, không cần test set, chỉ đọc tham số
+    model) -- xem [XAI-FILM] trong flow_matching_model.py
+  - Cross-attention weight (chậm hơn, cần chạy qua test set) -- xem
+    [XAI-ATTN]. Bật/tắt qua --skip_attention.
 
 USAGE
 -----
-python analyze_attention_xai.py \
+python analyze_xai_multi_seed.py \
     --dataset_root /kaggle/input/datasets/kaggle1234uitvn/tc-ofm \
-    --checkpoint   /kaggle/working/runs/fm_v5_seed2/best_model.pth \
-    --output_dir   /kaggle/working/xai_analysis \
+    --checkpoints \
+        seed0=/path/best_model_fm_seed0.pth \
+        seed1=/path/best_model_fm_seed1.pth \
+        seed2=/path/best_model_fm_seed2.pth \
+    --output_dir /kaggle/working/xai_multi_seed \
     --gpu_num 0
 
-Kết quả:
-  - attn_by_horizon.csv       : bảng số liệu thô (storm, horizon, attn_context, attn_time, group)
-  - attn_summary.csv          : trung bình theo horizon x group -- dùng điền vào Table trong bài
-  - attn_heatmap.png          : hình vẽ dùng trực tiếp cho Figure trong Results
-  - film_deviation.csv        : gamma/beta deviation theo horizon -- KHÔNG phụ thuộc storm
-                                 (film_gamma/beta là tham số MODEL, không phải per-sample),
-                                 dùng cho 1 hình/bảng riêng minh họa horizon nào học "lệch"
-                                 khỏi context gốc nhiều nhất
+KẾT QUẢ
+-------
+  film_deviation_per_seed.csv     : 1 dòng / (seed, horizon) -- dữ liệu thô
+  film_deviation_summary.csv      : mean±std qua seed, theo horizon
+  film_deviation_summary.png      : hình có error band (mean ± std)
+
+  attn_by_horizon_per_seed.csv    : 1 dòng / (seed, storm, horizon)  [nếu không --skip_attention]
+  attn_summary_across_seeds.csv   : mean±std qua seed, theo (group, horizon)
+  attn_summary_across_seeds.png   : hình có error band
+
+  eval_by_horizon_per_seed.csv    : ADE/ATE/CTE THẬT theo (seed, horizon) -- để đối chiếu
+  eval_summary_across_seeds.csv   : mean±std ADE/ATE/CTE theo horizon
+  film_vs_metric_correlation.csv  : Pearson correlation giữa gamma/beta
+                                     deviation và ADE tại từng horizon, qua
+                                     N=12 horizon điểm dữ liệu -- CHỈ đủ ý
+                                     nghĩa nếu >=3 seed (n quá nhỏ để suy ra
+                                     gì chắc chắn dù vậy; xem cảnh báo in ra)
 """
 from __future__ import annotations
-import sys, os, argparse, math
+import sys, os, argparse, math, random
 import numpy as np
 import pandas as pd
 import torch
@@ -37,15 +64,34 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from Model.data.loader_training import data_loader
 from Model.flow_matching_model import (
-    TCFlowMatching, _norm_to_deg, _forward_azimuth, _unwrap,
+    TCFlowMatching, _norm_to_deg, _haversine_deg, _forward_azimuth, _unwrap,
 )
 
-
 HORIZON_HOURS = [6 * (i + 1) for i in range(12)]   # [6, 12, ..., 72] for pred_len=12
+HORIZON_STEPS = {h: i for i, h in enumerate(HORIZON_HOURS)}   # 0-indexed step per horizon
+
+
+def set_seed(s: int = 42):
+    """Mirrors evaluate_multi_model.py's set_seed() convention -- called
+    before EACH checkpoint's evaluation so results don't depend on the
+    order checkpoints are listed on the CLI."""
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
 
 
 def move(batch, device):
     return [x.to(device) if torch.is_tensor(x) else x for x in batch]
+
+
+def parse_checkpoint_args(pairs: list) -> dict:
+    out = {}
+    for p in pairs:
+        if "=" not in p:
+            raise ValueError(f"--checkpoints entries must be name=path, got: {p}")
+        name, path = p.split("=", 1)
+        out[name] = path
+    return out
 
 
 def load_fm(checkpoint_path: str, device):
@@ -55,32 +101,37 @@ def load_fm(checkpoint_path: str, device):
     state = ck.get("model_state", ck.get("model")) or ck
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
-        print(f"  [load_fm] missing keys (expected if resuming across the "
+        print(f"    [load_fm] missing keys (expected across the "
               f"reg_step_logits/log_b_horizon -> reg_dist_ema architecture "
               f"change): {missing}")
     if unexpected:
-        print(f"  [load_fm] unexpected keys: {unexpected}")
+        print(f"    [load_fm] unexpected keys: {unexpected}")
+
+    # Same EMA-vs-SWA handling as evaluate_multi_model.py's load_fm --
+    # ck["model"] IS the SWA average when is_swa=True (no separate EMA
+    # applied); otherwise apply the EMA shadow if present, matching
+    # train_flowmatching.py's own eval-time convention.
+    is_swa = ck.get("is_swa", False)
+    if ck.get("ema") and not is_swa:
+        sd = model.state_dict()
+        applied = 0
+        for k, v in ck["ema"].items():
+            if k in sd:
+                sd[k].copy_(v.to(device)); applied += 1
+        print(f"    [load_fm] Applied EMA shadow weights ({applied} tensors).")
+    elif is_swa:
+        print(f"    [load_fm] Checkpoint is an SWA average -- using as-is.")
+
     model.to(device).eval()
-    return model
+    return model, ck
 
 
 def classify_storm_turning(obs_traj: torch.Tensor, gt_traj: torch.Tensor,
                             turn_threshold_deg: float = 25.0) -> str:
-    """
-    Phân loại 1 storm là 'recurving' hay 'straight' dựa trên tổng độ đổi
-    hướng (heading change) TRÊN TOÀN BỘ observation + ground-truth window,
-    không chỉ observation -- vì ta muốn biết storm này CÓ THỰC SỰ recurve
-    trong khung dự báo hay không, không chỉ đã recurve trước đó.
-
-    turn_threshold_deg=25.0: một cutoff hợp lý cho "turning đáng kể" (một
-    storm đi thẳng tây/tây bắc thường đổi hướng vài độ mỗi 6h; 25 độ tích
-    lũy trên toàn trajectory là ngưỡng phân biệt rõ ràng loại rẽ ngoặt so
-    với nhiễu đường đi tự nhiên). Đây LÀ một hằng số tay chọn -- nếu kết
-    quả nhạy cảm với giá trị này, hãy thử quét vài ngưỡng (15/25/35) để
-    xem pattern có ổn định không trước khi chốt số liệu cho bài báo.
-    """
-    full_traj = torch.cat([obs_traj[:, :2], gt_traj[:, :2]], dim=0)   # [T_obs+T_pred, 2]
-    deg = _norm_to_deg(full_traj.unsqueeze(1)).squeeze(1)              # [T, 2]
+    """Same logic as the single-seed script -- see that file's docstring
+    for the rationale behind the 25-degree cutoff."""
+    full_traj = torch.cat([obs_traj[:, :2], gt_traj[:, :2]], dim=0)
+    deg = _norm_to_deg(full_traj.unsqueeze(1)).squeeze(1)
     if deg.shape[0] < 3:
         return "unknown"
     bearings = [float(_forward_azimuth(deg[i], deg[i + 1]))
@@ -93,18 +144,28 @@ def classify_storm_turning(obs_traj: torch.Tensor, gt_traj: torch.Tensor,
     return "recurving" if total_turn >= turn_threshold_deg else "straight"
 
 
+def extract_film_deviation(model) -> pd.DataFrame:
+    """Same as the single-seed script's extract_film_deviation, minus the
+    file-writing/plotting (done once, across all seeds, by the caller)."""
+    vel = model.velocity if hasattr(model, "velocity") else model.module.velocity
+    gamma_w = vel.film_gamma.weight.detach().cpu()
+    beta_w = vel.film_beta.weight.detach().cpu()
+    gamma_dev = (gamma_w - 1.0).norm(dim=-1).numpy()
+    beta_dev = beta_w.norm(dim=-1).numpy()
+    return pd.DataFrame({
+        "horizon_h": HORIZON_HOURS[:len(gamma_dev)],
+        "gamma_deviation": gamma_dev,
+        "beta_deviation": beta_dev,
+    })
+
+
 @torch.no_grad()
-def collect_attention_records(model, loader, device):
-    """
-    Chạy sample(..., return_attn=True) trên toàn bộ test set, trả về
-    DataFrame dạng thô: 1 dòng / (storm, horizon).
-    """
+def collect_attention_records(model, loader, device, turn_threshold_deg: float):
+    """Same as the single-seed script's collect_attention_records."""
     records = []
-    n_batches = 0
     for bi, batch in enumerate(loader):
         bl = move(list(batch), device)
-        obs = bl[0]
-        gt  = bl[1]
+        obs = bl[0]; gt = bl[1]
         try:
             tyid_list = bl[15]
         except IndexError:
@@ -114,19 +175,13 @@ def collect_attention_records(model, loader, device):
             _, _, _, xai = model.sample(bl, num_ensemble=20, return_xai=True,
                                          return_attn=True, use_curvature_score=True)
         except Exception as e:
-            print(f"  batch {bi}: sample error, skipped ({e})")
+            print(f"    batch {bi}: sample error, skipped ({e})")
             continue
-
         if "cross_attn" not in xai:
-            print(f"  batch {bi}: no cross_attn in xai -- check return_attn wiring")
             continue
 
-        # [num_layers, B, pred_len, 2] -> average over layers for a single
-        # summary weight per (storm, horizon); per-layer detail is kept in
-        # the raw tensor if you want to inspect individual layers later.
         attn = xai["cross_attn"].mean(dim=0)   # [B, pred_len, 2]
         B = attn.shape[0]
-
         for b in range(B):
             if tyid_list is not None and b < len(tyid_list) and \
                isinstance(tyid_list[b], dict) and "old" in tyid_list[b]:
@@ -134,143 +189,142 @@ def collect_attention_records(model, loader, device):
                 storm_key = f"{info['old'][1]}_{info['old'][0]}"
             else:
                 storm_key = f"UNKNOWN_batch{bi}_{b}"
-
-            group = classify_storm_turning(obs[:, b, :], gt[:, b, :])
-
+            group = classify_storm_turning(obs[:, b, :], gt[:, b, :], turn_threshold_deg)
             for h_idx, h_hours in enumerate(HORIZON_HOURS):
                 if h_idx >= attn.shape[1]:
                     break
                 records.append({
-                    "storm": storm_key,
-                    "horizon_h": h_hours,
-                    "attn_time":    float(attn[b, h_idx, 0]),
+                    "storm": storm_key, "horizon_h": h_hours,
+                    "attn_time": float(attn[b, h_idx, 0]),
                     "attn_context": float(attn[b, h_idx, 1]),
                     "group": group,
                 })
-        n_batches += 1
-
-    print(f"  Processed {n_batches} batches, {len(records)} (storm, horizon) records.")
     return pd.DataFrame(records)
 
 
-def make_summary_and_plot(df: pd.DataFrame, output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
+@torch.no_grad()
+def evaluate_ade_by_horizon(model, loader, device) -> pd.DataFrame:
+    """
+    Chạy đúng 1 lần sample() bình thường (không TTA, KHÔNG return_attn --
+    tách biệt khỏi collect_attention_records để không double-sample nếu
+    cả hai đang chạy cùng lúc) trên toàn bộ test set, trả về ADE THẬT theo
+    horizon. Dùng để đối chiếu với FiLM/attention deviation -- nếu
+    deviation cao ở đâu mà ADE cũng thấp (tốt) ở đó, có cơ sở để nói FiLM
+    "đóng góp" ở horizon đó; nếu không, deviation cao không tự động có
+    nghĩa gì về chất lượng dự đoán.
+    """
+    records = []
+    for bi, batch in enumerate(loader):
+        bl = move(list(batch), device)
+        gt = bl[1]
+        try:
+            pred, _, _ = model.sample(bl, num_ensemble=20, use_curvature_score=True)
+        except Exception as e:
+            print(f"    batch {bi}: sample error, skipped ({e})")
+            continue
+        T = min(pred.shape[0], gt.shape[0])
+        pd_ = _norm_to_deg(pred[:T]); gd = _norm_to_deg(gt[:T, :, :2])
+        dist = _haversine_deg(pd_, gd)   # [T, B]
+        for h_idx, h_hours in enumerate(HORIZON_HOURS):
+            if h_idx >= T:
+                break
+            for b in range(dist.shape[1]):
+                records.append({"horizon_h": h_hours, "ade": float(dist[h_idx, b])})
+    return pd.DataFrame(records)
 
-    df.to_csv(os.path.join(output_dir, "attn_by_horizon.csv"), index=False)
 
-    summary = (df.groupby(["group", "horizon_h"])["attn_context"]
-                 .agg(["mean", "std", "count"])
-                 .reset_index())
-    summary.to_csv(os.path.join(output_dir, "attn_summary.csv"), index=False)
-    print("\n  Summary (mean context-vector attention by group x horizon):")
-    print(summary.to_string(index=False))
+def summarize_across_seeds(per_seed_df: pd.DataFrame, value_cols: list,
+                            group_cols: list) -> pd.DataFrame:
+    """
+    Tính mean±std QUA SEED (không phải qua storm/sample trong 1 seed) cho
+    mỗi tổ hợp group_cols. Bước bắt buộc: trước tiên average trong-seed
+    (mỗi seed đóng góp đúng 1 con số cho mỗi group), rồi mới tính std
+    GIỮA các seed -- nếu tính std trực tiếp trên toàn bộ pooled records
+    (mọi storm của mọi seed trộn lẫn), std đó phản ánh biến thiên giữa
+    CÁC STORM trong 1 seed, không phải biến thiên giữa CÁC SEED (câu hỏi
+    thật sự cần trả lời: "pattern này có ổn định qua các lần train khác
+    nhau không"). Hai câu hỏi khác nhau, hai con số std khác nhau.
+    """
+    per_seed_mean = (per_seed_df.groupby(["seed"] + group_cols)[value_cols]
+                      .mean().reset_index())
+    summary = (per_seed_mean.groupby(group_cols)[value_cols]
+               .agg(["mean", "std", "count"]))
+    summary.columns = ["_".join(c) for c in summary.columns]
+    return summary.reset_index()
 
+
+def compute_film_vs_ade_correlation(film_summary: pd.DataFrame,
+                                     ade_summary: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pearson correlation giữa FiLM deviation (mean qua seed) và ADE (mean
+    qua seed), theo horizon -- N=12 điểm dữ liệu (1 mỗi horizon).
+
+    CẢNH BÁO QUAN TRỌNG: N=12 là RẤT NHỎ cho một phép tính tương quan --
+    correlation coefficient ở n=12 có confidence interval rất rộng, và
+    KHÔNG chứng minh nhân quả kể cả khi |r| cao. Đây là một con số MÔ TẢ
+    (descriptive), không phải một phép kiểm định giả thuyết (hypothesis
+    test) -- không nên dùng để khẳng định "FiLM giúp cải thiện ADE",
+    chỉ nên dùng để nói "có/không có xu hướng đồng biến quan sát được"
+    một cách thận trọng, và luôn báo cáo kèm n và p-value.
+    """
+    merged = film_summary.merge(ade_summary, on="horizon_h", suffixes=("_film", "_ade"))
+    from scipy import stats
+    results = []
+    for col in ["gamma_deviation_mean", "beta_deviation_mean"]:
+        if col in merged.columns and "ade_mean" in merged.columns:
+            r, p = stats.pearsonr(merged[col], merged["ade_mean"])
+            results.append({"film_metric": col, "vs": "ade_mean",
+                             "pearson_r": r, "p_value": p, "n_horizons": len(merged)})
+    return pd.DataFrame(results)
+
+
+def plot_with_error_band(summary_df: pd.DataFrame, x_col: str,
+                          series: list, output_path: str, title: str,
+                          xlabel: str, ylabel: str, group_col: str = None):
+    """Generic mean±std line plot with shaded error band."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(7, 4))
-        for group in sorted(df["group"].unique()):
-            sub = summary[summary["group"] == group]
-            ax.plot(sub["horizon_h"], sub["mean"], marker="o", label=group)
-            ax.fill_between(sub["horizon_h"],
-                             sub["mean"] - sub["std"], sub["mean"] + sub["std"],
-                             alpha=0.15)
-        ax.set_xlabel("Forecast horizon (hours)")
-        ax.set_ylabel("Mean cross-attention weight on context vector")
-        ax.set_title("Attention to context vector vs. time embedding, by horizon and storm type")
-        ax.legend()
-        ax.grid(alpha=0.3)
-        fig.tight_layout()
-        fig_path = os.path.join(output_dir, "attn_heatmap.png")
-        fig.savefig(fig_path, dpi=200)
-        print(f"\n  Figure saved: {fig_path}")
     except ImportError:
-        print("\n  matplotlib not available -- skipped figure, CSVs still saved.")
+        print(f"    matplotlib not available -- skipped {output_path}")
+        return
 
-    # Quick textual takeaway to help drafting the paper paragraph.
-    straight_72 = summary[(summary.group == "straight") & (summary.horizon_h == 72)]
-    recurv_72   = summary[(summary.group == "recurving") & (summary.horizon_h == 72)]
-    straight_6  = summary[(summary.group == "straight") & (summary.horizon_h == 6)]
-    recurv_6    = summary[(summary.group == "recurving") & (summary.horizon_h == 6)]
-    print("\n  ── Quick read for drafting the paper paragraph ──────────────")
-    if len(straight_6) and len(recurv_6):
-        print(f"  At 6h : straight={straight_6['mean'].iloc[0]:.3f}  "
-              f"recurving={recurv_6['mean'].iloc[0]:.3f}")
-    if len(straight_72) and len(recurv_72):
-        print(f"  At 72h: straight={straight_72['mean'].iloc[0]:.3f}  "
-              f"recurving={recurv_72['mean'].iloc[0]:.3f}")
-    print("  If these differ noticeably (e.g. >0.05 absolute) and the gap")
-    print("  widens with horizon -> Scenario A (clear pattern) in the paper.")
-    print("  If they stay close across all horizons -> Scenario B (report")
-    print("  as a negative/limitation result, do not oversell in Introduction).")
-
-
-def extract_film_deviation(model, output_dir: str):
-    """
-    [XAI-FILM] film_gamma/film_beta là nn.Embedding của VelocityTransformer
-    -- tham số MODEL, không phụ thuộc batch/storm nào, nên chỉ cần đọc
-    trực tiếp từ checkpoint đã load, không cần chạy qua test set.
-    Deviation = khoảng cách L2 từ điểm khởi tạo zero-impact (gamma=1, beta=0).
-    Horizon nào có deviation cao = model đã học "viết lại" context nhiều
-    hơn cho horizon đó so với việc chỉ dùng context gốc không đổi.
-    """
-    vel = model.velocity if hasattr(model, "velocity") else model.module.velocity
-    gamma_w = vel.film_gamma.weight.detach().cpu()   # [pred_len, d_model]
-    beta_w  = vel.film_beta.weight.detach().cpu()
-
-    gamma_dev = (gamma_w - 1.0).norm(dim=-1).numpy()
-    beta_dev  = beta_w.norm(dim=-1).numpy()
-
-    df_film = pd.DataFrame({
-        "horizon_h": HORIZON_HOURS[:len(gamma_dev)],
-        "gamma_deviation": gamma_dev,
-        "beta_deviation": beta_dev,
-    })
-    df_film.to_csv(os.path.join(output_dir, "film_deviation.csv"), index=False)
-    print("\n  FiLM gamma/beta deviation by horizon (0 = still at init, "
-          "i.e. this horizon has NOT learned to modify the shared context):")
-    print(df_film.to_string(index=False))
-
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.plot(df_film["horizon_h"], df_film["gamma_deviation"], marker="o", label="gamma deviation (scale)")
-        ax.plot(df_film["horizon_h"], df_film["beta_deviation"], marker="s", label="beta deviation (shift)")
-        ax.set_xlabel("Forecast horizon (hours)")
-        ax.set_ylabel("L2 deviation from zero-impact init")
-        ax.set_title("How much each horizon has learned to modify the shared context (FiLM)")
-        ax.legend()
-        ax.grid(alpha=0.3)
-        fig.tight_layout()
-        fig_path = os.path.join(output_dir, "film_deviation.png")
-        fig.savefig(fig_path, dpi=200)
-        print(f"\n  Figure saved: {fig_path}")
-    except ImportError:
-        print("\n  matplotlib not available -- skipped figure, CSV still saved.")
-
-    return df_film
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    if group_col:
+        for g in sorted(summary_df[group_col].unique()):
+            sub = summary_df[summary_df[group_col] == g].sort_values(x_col)
+            for mean_col, std_col, label in series:
+                lbl = f"{label} ({g})"
+                ax.plot(sub[x_col], sub[mean_col], marker="o", label=lbl)
+                ax.fill_between(sub[x_col], sub[mean_col] - sub[std_col],
+                                 sub[mean_col] + sub[std_col], alpha=0.15)
+    else:
+        sub = summary_df.sort_values(x_col)
+        for mean_col, std_col, label in series:
+            ax.plot(sub[x_col], sub[mean_col], marker="o", label=label)
+            ax.fill_between(sub[x_col], sub[mean_col] - sub[std_col],
+                             sub[mean_col] + sub[std_col], alpha=0.15)
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.set_title(title)
+    ax.legend(); ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    print(f"    Figure saved: {output_path}")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset_root", required=True)
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--output_dir", default="xai_analysis")
+    p.add_argument("--checkpoints", nargs="+", required=True,
+                    help="One or more name=path pairs, e.g. seed0=/path/ckpt.pth")
+    p.add_argument("--output_dir", default="xai_multi_seed")
     p.add_argument("--gpu_num", default="0")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--obs_len", type=int, default=8)
     p.add_argument("--pred_len", type=int, default=12)
-    # [CONFIRMED against loader_training.py / trajectoriesWithMe_unet_training.py]
-    # Every field below is read via getattr(args, name, default) inside
-    # data_loader / TrajectoryDataset.__init__, so all of them are optional
-    # here too -- these --flags exist only so the values can be overridden
-    # from the command line if a checkpoint was trained with non-default
-    # settings; the defaults below match TrajectoryDataset's own defaults.
+    p.add_argument("--seed", type=int, default=42,
+                    help="RNG seed reset before EACH checkpoint's evaluation, "
+                         "so results don't depend on checkpoint listing order.")
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--other_modal", default="gph")
     p.add_argument("--delim", default=" ")
@@ -281,40 +335,152 @@ def main():
     p.add_argument("--min_pct_in_scs", type=float, default=15.0)
     p.add_argument("--turn_threshold_deg", type=float, default=25.0)
     p.add_argument("--skip_attention", action="store_true", default=False,
-                    help="Skip the per-storm cross-attention analysis (slow, "
-                         "requires running the full test set) and only "
-                         "extract FiLM deviation (fast, model-only).")
+                    help="Skip cross-attention analysis (slow, needs full "
+                         "test-set pass). FiLM deviation always runs "
+                         "(fast, model-only) regardless of this flag.")
+    p.add_argument("--skip_ade_eval", action="store_true", default=False,
+                    help="Skip the ADE-by-horizon evaluation used for the "
+                         "FiLM-vs-ADE correlation check. Skipping this means "
+                         "you get deviation numbers with real std across "
+                         "seeds, but no evidence about whether that "
+                         "deviation actually correlates with prediction "
+                         "quality -- only skip if you already have ADE "
+                         "numbers from elsewhere (e.g. evaluate_multi_model.py).")
     args = p.parse_args()
 
     device = torch.device(f"cuda:{args.gpu_num}" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}")
-
-    model = load_fm(args.checkpoint, device)
-    print(f"  Loaded checkpoint: {args.checkpoint}")
-
     os.makedirs(args.output_dir, exist_ok=True)
-    extract_film_deviation(model, args.output_dir)
 
-    if args.skip_attention:
-        print("\n  --skip_attention set -- skipping cross-attention analysis.")
+    ckpt_map = parse_checkpoint_args(args.checkpoints)
+    n_seeds = len(ckpt_map)
+    print(f"\n  Checkpoints ({n_seeds}):")
+    for name, path in ckpt_map.items():
+        print(f"    {name}: {path}")
+    if n_seeds < 3:
+        print(f"\n  ⚠ Only {n_seeds} checkpoint(s) provided. Mean±std across "
+              f"seeds will be reported, but with fewer than 3 seeds the std "
+              f"itself is a weak estimate -- treat any resulting pattern as "
+              f"preliminary, not confirmed, until more seeds are available.")
+
+    loader = None
+    if not args.skip_attention or not args.skip_ade_eval:
+        _, loader = data_loader(args, {"root": args.dataset_root, "type": "test"}, test=True)
+        print(f"  Test data: {len(loader)} batches")
+
+    all_film = []
+    all_attn = []
+    all_ade = []
+
+    for seed_name, ckpt_path in ckpt_map.items():
+        print(f"\n{'='*70}\n  Processing {seed_name}: {ckpt_path}\n{'='*70}")
+        set_seed(args.seed)
+        try:
+            model, ck = load_fm(ckpt_path, device)
+        except Exception as e:
+            print(f"  ⚠ Failed to load {ckpt_path}: {e}")
+            continue
+
+        # 1) FiLM deviation -- fast, always runs.
+        film_df = extract_film_deviation(model)
+        film_df["seed"] = seed_name
+        all_film.append(film_df)
+        print(f"    FiLM deviation extracted ({len(film_df)} horizons).")
+
+        # 2) Cross-attention -- slow, optional.
+        if not args.skip_attention:
+            set_seed(args.seed)
+            attn_df = collect_attention_records(model, loader, device, args.turn_threshold_deg)
+            if not attn_df.empty:
+                attn_df["seed"] = seed_name
+                all_attn.append(attn_df)
+                print(f"    Attention records collected ({len(attn_df)} rows).")
+            else:
+                print(f"    ⚠ No attention records collected for {seed_name}.")
+
+        # 3) ADE by horizon -- for the FiLM-vs-quality correlation check.
+        if not args.skip_ade_eval:
+            set_seed(args.seed)
+            ade_df = evaluate_ade_by_horizon(model, loader, device)
+            if not ade_df.empty:
+                ade_df["seed"] = seed_name
+                all_ade.append(ade_df)
+                print(f"    ADE-by-horizon evaluated "
+                      f"(overall mean ADE={ade_df['ade'].mean():.1f}km).")
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not all_film:
+        print("\n  No FiLM data collected from any checkpoint -- aborting.")
         return
 
-    # [FIX] data_loader's real signature in this project is
-    # data_loader(args, {"root": ..., "type": "test"}, test=True) --
-    # NOT the (dataset_root, obs_len=, pred_len=, ...) signature initially
-    # assumed. Confirmed against train_flowmatching.py's own call sites
-    # (trd, trl = data_loader(args, {...}, test=False); etc.) before
-    # finalizing this script, rather than guessing.
-    _, test_loader = data_loader(args, {"root": args.dataset_root, "type": "test"}, test=True)
+    # ── FiLM deviation: raw + summary across seeds ──────────────────────
+    film_all = pd.concat(all_film, ignore_index=True)
+    film_all.to_csv(os.path.join(args.output_dir, "film_deviation_per_seed.csv"), index=False)
 
-    df = collect_attention_records(model, test_loader, device)
-    if df.empty:
-        print("  No records collected -- check that return_attn is wired "
-              "correctly in flow_matching_model.py and that the checkpoint "
-              "loaded without errors.")
-        return
+    film_summary = summarize_across_seeds(
+        film_all, ["gamma_deviation", "beta_deviation"], ["horizon_h"])
+    film_summary.to_csv(os.path.join(args.output_dir, "film_deviation_summary.csv"), index=False)
+    print(f"\n{'='*70}\n  FiLM deviation summary (mean±std across {n_seeds} seeds)\n{'='*70}")
+    print(film_summary.to_string(index=False))
 
-    make_summary_and_plot(df, args.output_dir)
+    plot_with_error_band(
+        film_summary, "horizon_h",
+        [("gamma_deviation_mean", "gamma_deviation_std", "gamma deviation"),
+         ("beta_deviation_mean", "beta_deviation_std", "beta deviation")],
+        os.path.join(args.output_dir, "film_deviation_summary.png"),
+        f"FiLM deviation by horizon (mean±std across {n_seeds} seeds)",
+        "Forecast horizon (hours)", "L2 deviation from zero-impact init")
+
+    # ── Attention: raw + summary across seeds ────────────────────────────
+    if all_attn:
+        attn_all = pd.concat(all_attn, ignore_index=True)
+        attn_all.to_csv(os.path.join(args.output_dir, "attn_by_horizon_per_seed.csv"), index=False)
+
+        attn_summary = summarize_across_seeds(
+            attn_all, ["attn_context", "attn_time"], ["group", "horizon_h"])
+        attn_summary.to_csv(os.path.join(args.output_dir, "attn_summary_across_seeds.csv"), index=False)
+        print(f"\n{'='*70}\n  Attention summary (mean±std across {n_seeds} seeds)\n{'='*70}")
+        print(attn_summary.to_string(index=False))
+
+        plot_with_error_band(
+            attn_summary, "horizon_h",
+            [("attn_context_mean", "attn_context_std", "attn to context")],
+            os.path.join(args.output_dir, "attn_summary_across_seeds.png"),
+            f"Cross-attention to context vector (mean±std across {n_seeds} seeds)",
+            "Forecast horizon (hours)", "Mean attention weight on context vector",
+            group_col="group")
+
+    # ── ADE by horizon: raw + summary across seeds ───────────────────────
+    ade_summary = None
+    if all_ade:
+        ade_all = pd.concat(all_ade, ignore_index=True)
+        ade_all.to_csv(os.path.join(args.output_dir, "eval_by_horizon_per_seed.csv"), index=False)
+
+        ade_summary = summarize_across_seeds(ade_all, ["ade"], ["horizon_h"])
+        ade_summary.to_csv(os.path.join(args.output_dir, "eval_summary_across_seeds.csv"), index=False)
+        print(f"\n{'='*70}\n  ADE-by-horizon summary (mean±std across {n_seeds} seeds)\n{'='*70}")
+        print(ade_summary.to_string(index=False))
+
+    # ── FiLM vs ADE correlation (only if both available and >=3 seeds) ──
+    if ade_summary is not None:
+        try:
+            corr_df = compute_film_vs_ade_correlation(film_summary, ade_summary)
+            corr_df.to_csv(os.path.join(args.output_dir, "film_vs_metric_correlation.csv"), index=False)
+            print(f"\n{'='*70}\n  FiLM-deviation vs ADE correlation (n_horizons=12, "
+                  f"n_seeds={n_seeds})\n{'='*70}")
+            print(corr_df.to_string(index=False))
+            print("\n  ⚠ IMPORTANT: n=12 horizon points is a small sample for a "
+                  "correlation. A high |r| here is a DESCRIPTIVE observation, "
+                  "not proof that FiLM deviation causes better ADE -- report "
+                  "with this caveat, alongside the p-value, if used in the paper.")
+        except ImportError:
+            print("\n  scipy not available -- skipped FiLM-vs-ADE correlation "
+                  "(pip install scipy to enable).")
+
+    print(f"\n  All outputs saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
