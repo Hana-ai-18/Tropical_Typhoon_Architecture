@@ -127,7 +127,7 @@ def load_fm(checkpoint_path: str, device):
 
 
 def classify_storm_turning(obs_traj: torch.Tensor, gt_traj: torch.Tensor,
-                            turn_threshold_deg: float = 45.0) -> str:
+                            turn_threshold_deg: float = 240.0) -> str:
     """Same logic as the single-seed script -- see that file's docstring
     for the rationale behind the cutoff.
 
@@ -149,22 +149,32 @@ def classify_storm_turning(obs_traj: torch.Tensor, gt_traj: torch.Tensor,
     converting each bearing to degrees ONCE, immediately after
     _forward_azimuth, before taking any differences.
 
-    [THRESHOLD RE-CALIBRATED] After the above fix, a second real run
-    confirmed the OPPOSITE problem at threshold=25: with the bug fixed,
-    total_turn is now computed correctly, and at threshold=25 EVERY
-    single one of the 449 test-set storms (across all 3 seeds) fell into
-    "recurving" -- confirmed directly from that run's output. This means
-    25 degrees of accumulated heading change over an 18-increment window
-    (8 obs + 12 pred = 20 points) is too LOW a bar: ordinary track noise
-    in a real storm's path is enough to exceed it, so the threshold was
-    not actually separating "genuinely recurving" storms from
-    "essentially straight-moving with natural path wobble" -- it was
-    accepting nearly everything as recurving. Default raised to 45
-    degrees as a more conservative starting point, but see
-    print_turn_distribution() below: rather than guessing a single
-    number, run that function first on your actual dataset and pick a
-    threshold that visibly splits the distribution into two groups,
-    instead of trusting either 25 or 45 blindly.
+    [THRESHOLD RE-CALIBRATED, SECOND PASS -- with actual distribution data]
+    After the fix above, a first re-calibration attempt raised the
+    default to 45 degrees as a placeholder guess, pending confirmation
+    from print_turn_distribution(). That confirmation has now run on the
+    real 449-storm test set: min=71.7, 25th pct=175.3, median=238.9,
+    75th pct=350.6, max=973.2 degrees of accumulated turn. Every one of
+    the 5 candidate thresholds tested (25/35/45/55/65) still classified
+    100% of storms as "recurving", because ALL of them sit far below
+    even the observed MINIMUM (71.7 degrees) -- this is not a bug in
+    the fixed formula, it reflects real physical behavior: over an
+    18-increment window (8 observed + 12 predicted 6-hour steps), no
+    tropical cyclone track in this basin moves in a perfectly straight
+    line -- natural path wobble alone accounts for several degrees of
+    accumulated turn per step (verified: even the "straightest" storm
+    in this dataset averages ~4 deg/step, the median storm ~13 deg/step
+    -- both physically plausible for real best-track data). Default
+    raised again, this time to the DATASET'S OWN MEDIAN (238.9, rounded
+    to 240) -- the only choice that is guaranteed to produce a genuine
+    ~50/50 split by construction, comparing "more turning than typical
+    for this dataset" against "less turning than typical", rather than
+    an arbitrary degree value picked without reference to the data's
+    actual scale. If a different comparison is wanted -- e.g. isolating
+    only the most sharply recurving storms as a smaller, more extreme
+    group -- the 75th percentile (350.6, rounded to 350) is the next
+    natural candidate, tested directly against real data via
+    print_turn_distribution() rather than guessed.
     """
     full_traj = torch.cat([obs_traj[:, :2], gt_traj[:, :2]], dim=0)
     deg = _norm_to_deg(full_traj.unsqueeze(1)).squeeze(1)
@@ -498,7 +508,20 @@ def main():
     p.add_argument("--threshold", type=float, default=0.002)
     p.add_argument("--filter_region", action="store_true", default=False)
     p.add_argument("--min_pct_in_scs", type=float, default=15.0)
-    p.add_argument("--turn_threshold_deg", type=float, default=45.0)
+    p.add_argument("--turn_threshold_deg", type=float, default=240.0,
+                    help="Recurving-vs-straight cutoff, in degrees of "
+                         "total accumulated heading change over the "
+                         "obs+pred window. Default 240 = the observed "
+                         "MEDIAN of a real 449-storm test-set run "
+                         "(min=71.7, 25th=175.3, median=238.9, "
+                         "75th=350.6, max=973.2 degrees) -- chosen to "
+                         "guarantee a genuine ~50/50 split by "
+                         "construction. Run with --skip_ade_eval "
+                         "--skip_attention first to see this "
+                         "distribution printed for YOUR dataset before "
+                         "trusting this default, since it depends on "
+                         "obs_len/pred_len and the specific storms in "
+                         "your test split.")
     p.add_argument("--skip_attention", action="store_true", default=False,
                     help="Skip cross-attention analysis (slow, needs full "
                          "test-set pass). FiLM deviation always runs "
