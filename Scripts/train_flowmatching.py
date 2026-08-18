@@ -205,9 +205,28 @@ class SWAHandler:
         self.active = True; self.start_ep = ep
         for pg in opt.param_groups: pg["lr"] = self.swa_lr
         m = _unwrap(model)
+        # [BUG FOUND, SAME CLASS AS EMAModel's earlier fix]
+        # reg_dist_ema/heading_err_ema (and their *_warmed companion flags)
+        # are running STATISTICS of per-horizon prediction error, updated
+        # by their own no_grad EMA rule inside _reg_loss/_heading_loss_ms
+        # (same role as BatchNorm's running_mean) -- NOT learned weights
+        # that should be smoothed across checkpoints the way SWA smooths
+        # the rest of the model. EMAModel already excludes these by name
+        # (_HORIZON_EMA_BUFFER_NAMES) for exactly this reason, but
+        # SWAHandler used a plain dtype filter with no equivalent
+        # exclusion, so SWA-averaging these buffers would corrupt the
+        # per-horizon error-difficulty signal (averaging together error
+        # magnitudes from potentially quite different points across the
+        # SWA-active window) instead of leaving it as the live, single
+        # most-recent-batch statistic it is designed to be. Mirrors
+        # EMAModel's exclusion set exactly so both mechanisms agree on
+        # what counts as "real" model state vs. a running diagnostic.
+        _excluded = {"reg_dist_ema", "heading_err_ema",
+                     "reg_dist_ema_warmed", "heading_err_ema_warmed"}
         self.avg_state = {k: v.detach().clone().float()
                           for k, v in m.state_dict().items()
-                          if v.dtype.is_floating_point}
+                          if v.dtype.is_floating_point
+                          and k.rsplit(".", 1)[-1] not in _excluded}
         self.n_updates = 1
         print(f"  *** SWA ACTIVATED @ ep{ep} (lr → {self.swa_lr:.1e}) ***")
 
@@ -503,13 +522,26 @@ def evaluate(model, loader, device, tag: str = "",
             lp = xai.get("learned_params", {})
             if lp:
                 sc_str  = ",".join(f"{v:.2f}" for v in lp.get("speed_correction", [])[:4])
-                rw_str  = ",".join(f"{v:.3f}" for v in lp.get("reg_step_weights", [])[:4])
-               
-                rw_full = lp.get("reg_step_weights", [])
-                rw_far  = ",".join(f"{v:.3f}" for v in rw_full[7:12]) if len(rw_full) >= 12 else "?"
-                bh_str  = ",".join(f"{v:.1f}" for v in lp.get("b_horizon", [])[:12])
+                # [BUG FOUND] These previously read "reg_step_weights",
+                # "b_horizon", and "heading_step_weights" -- keys that no
+                # longer exist in learned_params after EMA-NORMALIZED-
+                # HORIZON replaced the old softmax-weight mechanism (see
+                # flow_matching_model.py's get_xai/learned_params dict,
+                # which now exposes "reg_dist_ema_km_per_horizon" and
+                # "heading_err_ema_per_horizon" instead). Confirmed
+                # directly from the seed2 training log: reg_w and
+                # b_horizon printed as empty ([] and [?]) for all 220
+                # epochs, because .get(old_key, []) always fell through to
+                # the empty-list default. Updated to read the current key
+                # names; values now reflect the true per-horizon EMA error
+                # (km for reg, dimensionless relative angular error for
+                # heading) rather than a defunct softmax weight.
+                rw_full = lp.get("reg_dist_ema_km_per_horizon", [])
+                rw_str  = ",".join(f"{v:.1f}" for v in rw_full[:4])
+                rw_far  = ",".join(f"{v:.1f}" for v in rw_full[7:12]) if len(rw_full) >= 12 else "?"
+                hdw_full = lp.get("heading_err_ema_per_horizon", [])
+                hdw_str = ",".join(f"{v:.3f}" for v in hdw_full[:4])
                 hw_str  = ",".join(f"{v:.3f}" for v in lp.get("hard_score_weights", []))
-                hdw_str = ",".join(f"{v:.3f}" for v in lp.get("heading_step_weights", [])[:4])
                 sig_inf = lp.get("sigma_inf", float("nan"))
                 ls_r    = lp.get("log_sigma_reg",     float("nan"))
                 ls_h    = lp.get("log_sigma_heading",  float("nan"))
@@ -518,11 +550,11 @@ def evaluate(model, loader, device, tag: str = "",
                 el_h    = lp.get("eff_lambda_heading", float("nan"))
                 el_c    = lp.get("eff_lambda_calib",   float("nan"))
                 print(f"  [LEARN] speed_corr(12h-24h)=[{sc_str}]"
-                      f"  reg_w(12h-24h)=[{rw_str}]")
-                print(f"  [LEARN] reg_w(48h-72h,idx7-11)=[{rw_far}]"
-                      f"  b_horizon(6h..72h)=[{bh_str}]")
+                      f"  reg_ema_km(6h-24h)=[{rw_str}]")
+                print(f"  [LEARN] reg_ema_km(48h-72h,idx7-11)=[{rw_far}]"
+                      f"  heading_ema(6h-24h)=[{hdw_str}]")
                 print(f"  [LEARN] hard_w(curv,spdvar,dirchg,obsspd)=[{hw_str}]"
-                      f"  head_w(12h-24h)=[{hdw_str}]  sigma_inf={sig_inf:.4f}")
+                      f"  sigma_inf={sig_inf:.4f}")
                 print(f"  [LEARN] log_sigma: reg={ls_r:.3f}  heading={ls_h:.3f}  calib={ls_c:.3f}"
                       f"  |  eff_lambda: reg={el_r:.3f}  heading={el_h:.3f}  calib={el_c:.3f}")
 
@@ -701,6 +733,27 @@ def main(args):
               f"(often 10-50x). If you expected a GPU here, check Kaggle's "
               f"Accelerator setting for this session.")
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # [SAFETY GUARD] exist_ok=True above means re-running with the same
+    # --output_dir (e.g. default seed=42 with no --ablation_name, since
+    # the seed suffix is only appended when seed != 42) silently starts
+    # writing into a directory that may already contain a previous run's
+    # checkpoints -- every _save() call uses the same fixed filenames
+    # (best_model.pth, last_model.pth, etc.), so a second run overwrites
+    # the first with no warning. This does not block the run (a fresh
+    # directory is the common case and should proceed silently), it only
+    # flags the specific situation where stale checkpoints already exist
+    # and --resume was NOT requested, since that combination is the one
+    # most likely to be an accidental overwrite rather than an intended
+    # fresh start.
+    _existing_best = os.path.join(args.output_dir, "best_model.pth")
+    if os.path.exists(_existing_best) and not args.resume:
+        print(f"  ⚠ WARNING: {_existing_best} already exists and --resume "
+              f"was not passed -- this run will OVERWRITE it as training "
+              f"progresses. If this is unintentional (e.g. seed=42 reused "
+              f"the default --output_dir from a previous run), stop now "
+              f"and pass a distinct --output_dir or --resume the prior run.")
+
   
     _wall_start = time.time()
     best_ckpt      = os.path.join(args.output_dir, "best_model.pth")
@@ -711,10 +764,20 @@ def main(args):
     print("=" * 72)
     print("  TC-FlowMatching v2.1-XAI")
     print(f"  [AUG-C]  Recurvature ±20° (PROVEN -7.1km CTE in v2.5)")
-    print(f"  [L_HDG]  L_heading bug fixed, weight={args.lambda_heading}")
-    print(f"  [CALIB]  Speed calibration at inference (clip 0.85-1.15)")
+    print(f"  [L_HDG]  L_heading: EMA-normalized-horizon weighting, weight={args.lambda_heading}")
+    # [BUG FOUND, same class as the training-loop summary print fixed
+    # earlier] This line described speed calibration as a fixed
+    # clip(0.85, 1.15) correction, but speed_calibrate_pred's own
+    # docstring documents why that was replaced: XAI-8 showed the needed
+    # correction varies substantially by horizon (roughly 0.77 at 12h,
+    # 0.62 at 24h, 1.06 at 48h, 1.04 at 72h), which a single shared clip
+    # range cannot satisfy simultaneously -- it is now a per-horizon
+    # LEARNED scale, not a fixed clip. Confirmed against the training
+    # logs too: speed_corr values there (e.g. 0.994/0.997/0.998/0.998)
+    # are learned parameters, not clipped constants.
+    print(f"  [CALIB]  Speed calibration at inference (per-horizon LEARNED, not fixed clip)")
     print(f"  [NO-D]   AUG-D removed (proven +4.5km ATE worse)")
-    print(f"  KEEP:    sigma_inf={args.sigma_inference} FIXED, L_reg linear, OT")
+    print(f"  KEEP:    sigma_inf={args.sigma_inference} FIXED, L_reg EMA-normalized-horizon, OT")
     print("=" * 72)
 
     
@@ -923,9 +986,29 @@ def main(args):
 
     nstep = len(trl)
     print(f"\n  TRAINING ({nstep} steps/ep × {args.num_epochs} ep)")
-    print(f"  Aug: shift±5km(25%) + speed×[0.85,1.15](20%) + recurv±20°(20%) + no-aug(35%)")
-    print(f"  Loss: L_CFM + L_reg(linear) + L_heading_ms(4steps,decay=0.5)")
-    print(f"  Inf:  1-shot sigma=0.04 + speed_calibrate(±15%) + top3 physics")
+    # [BUG FOUND] These three summary lines previously hardcoded a
+    # description of augmentation/loss/inference that had drifted out of
+    # sync with the actual code: augment_batch's real distribution is
+    # A=25% (shift), B=20% (speed scale), C=20% (recurvature), D-E=25%
+    # (no-op), F=10% (Gaussian noise) -- six branches, not the
+    # "shift+speed+recurv+no-aug(35%)" four-branch description previously
+    # printed here (which also omitted branch F entirely and mislabeled
+    # the no-op share as 35% instead of the correct 25%). Likewise,
+    # "L_heading_ms(4steps,decay=0.5)" describes the OLD fixed-decay
+    # heading loss that has since been replaced by EMA-NORMALIZED-HORIZON
+    # weighting across the full 12-step horizon (see _heading_loss_ms's
+    # docstring in flow_matching_model.py). A hardcoded print string has
+    # no way to track code changes made in a different file, so it will
+    # silently go stale again the next time augment_batch or the loss
+    # design changes -- flagging this explicitly rather than just fixing
+    # the current text, since the SAME mismatch could recur.
+    print(f"  Aug: shift±5km(25%) + speed×[0.85,1.15](20%) + recurv±20°(20%) "
+          f"+ no-aug(25%) + noise±3km(10%)"
+          f"{'  [recurv DISABLED via --disable_aug_c]' if args.disable_aug_c else ''}")
+    print(f"  Loss: L_CFM + L_reg(EMA-normalized-horizon) "
+          f"+ L_heading(EMA-normalized-horizon, full 12-step)")
+    print(f"  Inf:  1-shot sigma=0.04 + speed_calibrate(learned) + top3 physics"
+          f"{' + curvature_score' if args.use_curvature_score_train else ''}")
     print()
 
     for ep in range(start_ep, start_ep + args.num_epochs):
@@ -1056,7 +1139,25 @@ def main(args):
         # loss/gradient sanitized this epoch), not a divisor.
         train_loss = sum_loss / nstep
         _, lr_vel_used = get_lrs(opt)
-        sched.step()
+        # [BUG FOUND, SWA-LR-OVERRIDE] sched.step() previously ran
+        # unconditionally every epoch, including AFTER swa.activate() had
+        # already set every param_group's lr to args.swa_lr (2e-6). The
+        # cosine scheduler has no knowledge that SWA just overrode its LR,
+        # so calling .step() on it recomputes LR according to the
+        # scheduler's OWN unchanged schedule -- confirmed directly in the
+        # training logs (both seed0 and seed1): SWA activates at ep90 with
+        # "lr -> 2.0e-06", and by ep92 (one scheduler step later) lr is
+        # back to ~1.4e-04, roughly 70x higher. This defeats the entire
+        # purpose of SWA, which requires a low, STABLE lr to average
+        # weights around a single local minimum -- instead the optimizer
+        # kept taking large steps for the rest of training, and SWA's
+        # score never surpassed the pre-SWA best in either seed (up to
+        # 3301 updates, still behind best) despite running for the last
+        # ~40% of the configured epoch budget. Root-caused, not guessed:
+        # traced from the exact LR values printed in both training logs
+        # to this line before making the fix.
+        if not swa.active:
+            sched.step()
 
         sanitize_s = (f"  sanitized={n_sanitized_batches}/{nstep}"
                       if n_sanitized_batches > 0 else "")
@@ -1107,9 +1208,31 @@ def main(args):
                 print(f"  ✅ Best! score={best_score:.2f}"
                       f"  ADE={r['ADE']:.1f} ATE={r['ATE']:.1f} CTE={r['CTE']:.1f}")
             else:
-                if rel_ep >= args.min_ep: patience_cnt += args.val_freq
-                print(f"  No improve {patience_cnt}/{args.patience} (best={best_score:.1f})")
-                if rel_ep >= args.min_ep and patience_cnt >= args.patience:
+                # [BUG FOUND, PATIENCE-VS-SWA] patience_cnt previously
+                # incremented unconditionally on every no-improvement
+                # epoch, including while swa.active is True. Now that the
+                # sched.step()/swa LR-override bug above is fixed, SWA
+                # genuinely needs a stretch of epochs with weights
+                # averaging around a stable minimum before its score has
+                # a chance to surpass best_score -- during that stretch,
+                # ordinary per-epoch validation noise can easily produce
+                # several consecutive "no improve" epochs even though SWA
+                # is working exactly as intended. Letting patience run
+                # during this window risks early-stopping SWA before it
+                # has had a fair chance, which is what the training logs
+                # showed happening in practice (early stop at ep110, only
+                # ~20 epochs after SWA activated at ep90 -- barely enough
+                # time for a handful of SWA updates, let alone
+                # convergence). Patience now only accumulates for
+                # non-SWA epochs; once SWA is active, its own separate
+                # [SWA] score-vs-best comparison (printed at swa
+                # checkpoints elsewhere in this loop) is the relevant
+                # signal, not this counter.
+                if rel_ep >= args.min_ep and not swa.active:
+                    patience_cnt += args.val_freq
+                print(f"  No improve {patience_cnt}/{args.patience} (best={best_score:.1f})"
+                      f"{'  [SWA active -- patience frozen]' if swa.active else ''}")
+                if rel_ep >= args.min_ep and not swa.active and patience_cnt >= args.patience:
                     print(f"  ⛔ Early stop @ ep{ep}")
                     break
 
@@ -1325,9 +1448,27 @@ def _auto_eval(args, best_ckpt: str, device):
   
     eval_json = None
     if os.path.exists(eval_dir):
+        # [BUG FOUND, PATH MISMATCH] Previously filtered for files starting
+        # with "eval_test" -- but evaluate_full.py actually writes files
+        # named "eval_fm_test_ep{N}.json" (confirmed directly from training
+        # logs: both seed0 and seed1 print "Saved →
+        # .../eval/eval_fm_test_ep70.json" immediately before this block
+        # runs, yet the very next line unconditionally reports "Không tìm
+        # thấy eval JSON" in both logs). "eval_fm_test_ep70.json" does NOT
+        # start with "eval_test" (it starts with "eval_fm_"), so the old
+        # filter matched zero files on every single run, silently skipping
+        # the statistical significance test step every time regardless of
+        # whether evaluate_full.py succeeded. Broadened to match any
+        # filename containing "test" and ending in ".json" under eval_dir,
+        # which covers the confirmed real pattern (eval_fm_test_ep*.json)
+        # without over-fitting to one exact prefix in case the model-type
+        # portion of the filename varies (e.g. a different --model_type
+        # producing eval_lstm_test_ep*.json, eval_sttrans_test_ep*.json,
+        # etc., for other scripts/checkpoints that might write into the
+        # same eval_dir).
         jsons = sorted([
             os.path.join(eval_dir, f) for f in os.listdir(eval_dir)
-            if f.startswith("eval_test") and f.endswith(".json")
+            if "test" in f and f.endswith(".json")
         ])
         if jsons:
             eval_json = jsons[-1]  # file mới nhất
@@ -1394,8 +1535,22 @@ def _auto_eval(args, best_ckpt: str, device):
 
 if __name__ == "__main__":
     args = get_args()
-    np.random.seed(42); torch.manual_seed(42)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(42)
+    # [BUG FOUND] This previously hardcoded seed=42 BEFORE main() runs its
+    # own args.seed-based seeding (random.seed(args.seed) etc., near the
+    # top of main()) -- meaning any code that touches global RNG state
+    # between this point and main()'s own seeding (e.g. a library import
+    # triggered lazily, or torch.compile's internal setup) would see
+    # seed=42's state regardless of --seed. main()'s own seeding call
+    # immediately overwrites this for everything AFTER it runs, so
+    # results reported from training itself were not affected -- but this
+    # is dead, misleading code (a global seed=42 that has no effect once
+    # main() starts) and a latent bug if anything before main() ever
+    # becomes RNG-sensitive. Seed with the ACTUAL requested value instead
+    # of a hardcoded constant, consistent with the rest of this file's
+    # principle of not using hand-picked constants where a real value is
+    # available.
+    np.random.seed(args.seed); torch.manual_seed(args.seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed)
     if args.dataset_root == "TCND_vn":
         _auto = "/kaggle/input/datasets/kaggle1234uitvn/tc-ofm"
         if os.path.isdir(_auto):

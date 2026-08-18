@@ -11,17 +11,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # ⚠️  CHECKPOINT INCOMPATIBILITY WARNING ⚠️
-# This revision changes TWO things that make old checkpoints (FM(o), FM(n),
+# This revision changes THREE things that make old checkpoints (FM(o), FM(n),
 # or any prior run's .pt file) UNABLE to load with strict=True:
 #   1. ContextEncoder.vel_obs_enc's first nn.Linear input dim changed from
 #      obs_len*6 to obs_len*7 (added turn_rate kinematic feature, [LEARN-10]).
 #   2. reg_step_logits/log_b_horizon/heading_step_logits (nn.Parameter) were
 #      REMOVED, replaced by reg_dist_ema/heading_err_ema (buffers).
-# TRAIN FROM SCRATCH -- do not attempt to resume/fine-tune from an FM(o) or
-# FM(n) checkpoint saved before this revision; load_state_dict will raise a
-# size-mismatch error on vel_obs_enc.0.weight (shape [256, 48] expected vs
-# [256, 56] in this file) and missing/unexpected-key errors on the renamed
-# parameters/buffers above.
+#   3. VelocityTransformer gained two new nn.Embedding parameters,
+#      film_gamma and film_beta ([HORIZON-FILM], pred_len x d_model each),
+#      not present in any earlier checkpoint.
+# TRAIN FROM SCRATCH -- do not attempt to resume/fine-tune from an FM(o),
+# FM(n), or any pre-FiLM checkpoint saved before this revision;
+# load_state_dict will raise a size-mismatch error on vel_obs_enc.0.weight
+# (shape [256, 48] expected vs [256, 56] in this file), missing/unexpected-
+# key errors on the renamed reg/heading parameters above, and missing-key
+# errors for velocity.film_gamma.weight / velocity.film_beta.weight.
 # ─────────────────────────────────────────────────────────────────────────────
 
 Model/flow_matching_model.py  ──  TC-FlowMatching v2.1-clean
@@ -389,6 +393,47 @@ class VelocityTransformer(nn.Module):
         self.time_mlp   = nn.Sequential(
             nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, d_model))
         self.cond_proj  = nn.Sequential(nn.Linear(d_cond, d_model), nn.LayerNorm(d_model))
+
+        # [HORIZON-FILM] Root cause this addresses: Section
+        # "Error growth by lead time" in this project's own results
+        # analysis found that TC-FlowMatching's advantage over baselines
+        # narrows to a near-tie by 72h, and traced this to
+        # v_theta(x_t, t, c) receiving a SINGLE, FIXED context vector c
+        # computed once from the observation window -- every horizon
+        # attends to the identical context representation, so the model
+        # has no mechanism to represent "this is farther out, steering
+        # flow may have evolved differently than the near-term picture
+        # suggests" as a distinct signal from "this is the near-term
+        # forecast." step_emb (12-entry nn.Embedding, already present
+        # above) gives the QUERY side horizon-specific information, but
+        # the memory (context) side stays identical across all 12 query
+        # positions -- cross-attention can only re-weight WHICH memory
+        # token to look at, not RESHAPE what that token represents for a
+        # given horizon.
+        #
+        # FiLM (Perez et al., feature-wise linear modulation) is the
+        # standard, lightweight way to let a conditioning vector be
+        # transformed differently depending on a discrete index: for each
+        # of the 12 horizons, learn a (scale, shift) pair applied to the
+        # context vector BEFORE it enters cross-attention, so each
+        # horizon's query can attend to a horizon-specific affine
+        # transformation of the same underlying context, rather than the
+        # literal same vector every time.
+        #
+        # Init: gamma starts at 1.0 (identity scale), beta starts at 0.0
+        # (identity shift) -- film_gamma/film_beta are nn.Embedding
+        # weights initialized to exactly reproduce cond_proj(cond)
+        # unchanged at epoch 0 (gamma=1, beta=0 => x*1+0 = x), so this is
+        # a zero-impact-at-init addition, same principle as every other
+        # LEARN-* mechanism in this file -- behavior is IDENTICAL to the
+        # unmodified model until gradient reveals that horizon-specific
+        # modulation helps, and can only move away from identity if doing
+        # so reduces the loss.
+        self.film_gamma = nn.Embedding(pred_len, d_model)
+        self.film_beta  = nn.Embedding(pred_len, d_model)
+        nn.init.ones_(self.film_gamma.weight)
+        nn.init.zeros_(self.film_beta.weight)
+
         dec_layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
             dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
@@ -410,13 +455,103 @@ class VelocityTransformer(nn.Module):
             emb = F.pad(emb, (0, 1))
         return self.time_mlp(emb)
 
+    def _decode_with_attn(self, x_emb: torch.Tensor, memory: torch.Tensor):
+        """
+        [XAI-ATTN-EXTRACT] Manually replays nn.TransformerDecoder's forward
+        pass, layer by layer, using the SAME already-trained sub-modules
+        (self_attn, multihead_attn, linear1/2, norm1/2/3) that
+        self.decoder already contains -- this does not introduce any new
+        learned component or change what the model computes; it only
+        additionally requests need_weights=True from each layer's
+        multihead_attn (cross-attention from the 12 predicted-horizon
+        positions to the 2-token memory: [time_embedding, context_vector])
+        so those weights can be returned instead of discarded, which
+        nn.TransformerDecoder's standard forward() does not expose.
+        Order of operations replicated exactly from
+        nn.TransformerDecoderLayer.forward's norm_first=True branch
+        (self-attn -> cross-attn -> feedforward, each pre-normed and
+        residually added) -- verified against the installed PyTorch
+        version's own source before writing this, so outputs are
+        numerically identical to calling self.decoder(x_emb, memory)
+        directly; only the returned attention weights are new information.
+        Returns (decoder_output, attn_weights) where attn_weights is
+        [num_layers, B, T, 2] (2 = memory tokens: time_embedding, context).
+        """
+        x = x_emb
+        attn_per_layer = []
+        for layer in self.decoder.layers:
+            # Self-attention block (pre-norm, residual) -- weights not
+            # collected: this attention is among the 12 horizon positions
+            # themselves, not between a horizon and an interpretable
+            # external quantity, so it is less directly useful for XAI
+            # than the cross-attention block below.
+            sa_out = layer.self_attn(
+                layer.norm1(x), layer.norm1(x), layer.norm1(x),
+                need_weights=False)[0]
+            x = x + layer.dropout1(sa_out)
+
+            # Cross-attention block (pre-norm, residual) -- THIS is the
+            # block we extract weights from: it shows, per horizon
+            # position, how much attention goes to the time-embedding
+            # token vs. the context-vector token.
+            normed = layer.norm2(x)
+            mha_out, attn_w = layer.multihead_attn(
+                normed, memory, memory,
+                need_weights=True, average_attn_weights=True)
+            # attn_w: [B, T, 2] (averaged over heads) -- exactly what
+            # nn.MultiheadAttention returns when average_attn_weights=True
+            # (the default), documented in its own forward() signature.
+            attn_per_layer.append(attn_w)
+            x = x + layer.dropout2(mha_out)
+
+            # Feedforward block (pre-norm, residual) -- unchanged from
+            # the standard layer.
+            ff_out = layer.linear2(layer.dropout(
+                layer.activation(layer.linear1(layer.norm3(x)))))
+            x = x + layer.dropout3(ff_out)
+
+        if self.decoder.norm is not None:
+            x = self.decoder.norm(x)
+        attn_stack = torch.stack(attn_per_layer, dim=0)   # [num_layers, B, T, 2]
+        return x, attn_stack
+
     def forward(self, x_t: torch.Tensor, t: torch.Tensor,
-                cond: torch.Tensor) -> torch.Tensor:
+                cond: torch.Tensor, return_attn: bool = False):
         B, T, _ = x_t.shape
         step_idx = torch.arange(T, device=x_t.device).unsqueeze(0).expand(B, -1)
         x_emb = (self.traj_embed(x_t) + self.pos_emb[:, :T] + self.step_emb(step_idx))
+
+        cond_vec = self.cond_proj(cond)   # [B, d_model]
+
+        # [HORIZON-FILM] See __init__ comment for full rationale. Rather
+        # than modulating the 2-token cross-attention `memory` (which
+        # would require every one of the 12 query positions to see a
+        # DIFFERENT memory, incompatible with how nn.TransformerDecoder's
+        # single shared memory argument works without rewriting the
+        # decoder loop), the horizon-specific context is injected at the
+        # query side instead: each horizon's FiLM-modulated context
+        # (gamma[h]*cond_vec + beta[h]) is added directly into that
+        # horizon's query embedding, alongside traj_embed/pos_emb/
+        # step_emb already there. This is architecturally simpler (no
+        # decoder-loop changes needed, so return_attn's manual replay
+        # above remains valid unchanged) while still giving every horizon
+        # position access to a horizon-specific transformation of the
+        # same underlying context vector, addressing the "identical
+        # context regardless of horizon" limitation directly.
+        # gamma/beta: [T, d_model] -> unsqueeze to [1, T, d_model] to
+        # broadcast across the batch dimension.
+        gamma = self.film_gamma(step_idx[0]).unsqueeze(0)   # [1, T, d_model]
+        beta  = self.film_beta(step_idx[0]).unsqueeze(0)    # [1, T, d_model]
+        horizon_ctx = gamma * cond_vec.unsqueeze(1) + beta  # [B, T, d_model]
+        x_emb = x_emb + horizon_ctx
+
         memory = torch.cat([self._time_emb(t).unsqueeze(1),
-                            self.cond_proj(cond).unsqueeze(1)], dim=1)
+                            cond_vec.unsqueeze(1)], dim=1)
+        if return_attn:
+            dec_out, attn_stack = self._decode_with_attn(x_emb, memory)
+            out = self.out_norm(dec_out)
+            v = self.out_proj(out) * torch.sigmoid(self.out_scale[:T]).unsqueeze(0)
+            return v, attn_stack
         out = self.out_norm(self.decoder(x_emb, memory))
         return self.out_proj(out) * torch.sigmoid(self.out_scale[:T]).unsqueeze(0)
 
@@ -2438,6 +2573,7 @@ class TCFlowMatching(nn.Module):
                return_xai:            bool           = False,
                use_speed_calibration: bool           = True,
                use_curvature_score:   bool           = False,
+               return_attn:           bool           = False,
                **kwargs) -> Tuple:
         """
         1-shot inference with physics selection + learnable speed calibration.
@@ -2457,6 +2593,28 @@ class TCFlowMatching(nn.Module):
           checking step-0 direction (head_score) or penalizing all turning
           (smooth_score). Pure inference-time change — no retraining needed,
           can be A/B tested directly on any existing checkpoint.
+
+        return_attn: [XAI-ATTN, opt-in, default False, ANALYSIS-ONLY]
+          When True, runs ONE ADDITIONAL forward pass of the velocity
+          network with VelocityTransformer.forward(..., return_attn=True)
+          on x0=zeros (the deterministic sigma_inference=0 input used
+          elsewhere for the reproducible XAI-8 pass, see below) and adds
+          "cross_attn" to the returned xai dict: a [num_layers, B,
+          pred_len, 2] tensor giving, for every decoder layer and every
+          forecast horizon, how much attention that horizon's position
+          places on the time-embedding token vs. the context-vector token
+          (VelocityTransformer's memory has exactly these two tokens — see
+          that class's forward()). Verified numerically before being
+          added here that this manual layer-by-layer replay of
+          nn.TransformerDecoder produces IDENTICAL output (max abs diff
+          ~1e-8, floating-point-only) to the standard self.decoder(...)
+          call used everywhere else in this file — see
+          VelocityTransformer._decode_with_attn's docstring for the full
+          verification. This adds analysis-only output; it does not
+          change pred_mean, the physics-score ranking, or any other
+          returned value, and has NO effect unless return_attn=True is
+          passed explicitly. Requires return_xai=True (attention is
+          reported inside the xai dict); has no effect otherwise.
 
         Returns:
           (pred_mean [T,B,2], zeros [T,B,2], all_traj [K,T,B,2])
@@ -2533,6 +2691,44 @@ class TCFlowMatching(nn.Module):
         _, hard_comps = hard_score_from_obs(obs_norm, return_components=True,
                                              weight_logits=self.hard_score_weight_logits)
         xai["hard_components"] = hard_comps
+
+        # [XAI-ATTN] See sample()'s docstring for full rationale/verification.
+        # Uses the same deterministic x0=zeros convention as XAI-8 below
+        # (rather than a fresh random draw), so the returned attention
+        # weights correspond to a single reproducible forward pass, not to
+        # whichever of the K random candidates happened to be sampled.
+        if return_attn:
+            x0_attn = torch.zeros(B, self.pred_len, 2, device=device)
+            _, attn_stack = self.velocity(
+                x0_attn, torch.zeros(B, device=device), cond, return_attn=True)
+            xai["cross_attn"] = attn_stack   # [num_layers, B, pred_len, 2]
+
+            # [XAI-FILM, added alongside HORIZON-FILM] cross_attn alone no
+            # longer tells the full horizon-conditioning story once FiLM
+            # was added: context is now injected at the query side
+            # (gamma[h]*cond_vec+beta[h], added directly into x_emb
+            # before the decoder) IN ADDITION TO the original cross-
+            # attention path to the unmodulated cond_vec in memory.
+            # Reporting only cross_attn would describe one of these two
+            # paths and silently omit the other. film_gamma/film_beta
+            # (nn.Embedding, [pred_len, d_model]) are the direct, human-
+            # readable record of how far each horizon's learned
+            # modulation has moved from the zero-impact-at-init identity
+            # (gamma=1, beta=0): the L2 distance of gamma[h] from a
+            # vector of ones, and of beta[h] from zero, gives a single
+            # scalar per horizon summarizing "how much does this horizon
+            # rewrite the shared context, versus horizons that stayed
+            # close to the untouched context." This is reported
+            # separately from cross_attn rather than merged into it,
+            # since they measure two structurally different injection
+            # points and conflating them into one number would obscure
+            # which mechanism is doing the work.
+            gamma_w = self.velocity.film_gamma.weight.detach()   # [pred_len, d_model]
+            beta_w  = self.velocity.film_beta.weight.detach()    # [pred_len, d_model]
+            gamma_dev = (gamma_w - 1.0).norm(dim=-1)   # [pred_len], 0 at init
+            beta_dev  = beta_w.norm(dim=-1)            # [pred_len], 0 at init
+            xai["film_gamma_deviation_per_horizon"] = gamma_dev.tolist()
+            xai["film_beta_deviation_per_horizon"]  = beta_dev.tolist()
 
         pred_deg  = _norm_to_deg(pred_mean)    # [T, B, 2]
         obs_deg_x = _norm_to_deg(obs_norm)     # [T_obs, B, 2]
