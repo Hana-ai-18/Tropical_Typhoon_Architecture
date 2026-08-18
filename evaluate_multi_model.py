@@ -643,7 +643,9 @@ def evaluate_one_model(model, loader, device, model_name: str,
                         seed: str = "unknown",
                         n_ensemble: int = 20,
                         ddim_steps: Optional[int] = None,
-                        use_curvature_score: bool = False) -> List[Dict]:
+                        use_curvature_score: bool = False,
+                        use_tta: bool = False,
+                        n_tta: int = 5) -> List[Dict]:
     """
     Returns a list of PER-LEAD-TIME records:
       {"model": name, "seed": seed, "storm": storm_key, "window": idx,
@@ -725,9 +727,51 @@ def evaluate_one_model(model, loader, device, model_name: str,
                 # checkpoint. Previously this script always left it at the
                 # sample() default (False); now CLI-configurable via
                 # --use_curvature_score so it can actually be tried.
-                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble,
-                                           ddim_steps=ddim_steps,
-                                           use_curvature_score=use_curvature_score)
+                # [ADD-TTA] train_flowmatching.py's evaluate() always runs
+                # its final "[TEST+TTA]" pass through this exact TTA
+                # procedure before reporting FM's final ADE/ATE/CTE -- but
+                # this script's evaluate_one_model() previously had NO TTA
+                # path at all, only ever calling model.sample() on the raw
+                # observation window. That mismatch (confirmed: not a
+                # difference in the ATE/CTE formula itself -- ate_cte_full
+                # here and train_flowmatching.py's _ate_cte were verified
+                # numerically identical, diff=0.0 on synthetic test data)
+                # is why FM numbers from this script could differ from
+                # what training's own final log line reported, by an
+                # amount roughly consistent with TTA's typical effect
+                # size (a few km, e.g. one logged run: ADE 328.6->328.0
+                # from TTA alone). Ported here verbatim from
+                # train_flowmatching.py's evaluate(): scales the
+                # observation window's trajectory around its last point by
+                # [0.875, 0.9375, 1.0, 1.0625, 1.125], samples FM on each,
+                # and averages with the unscaled (1.0) prediction weighted
+                # 2x relative to each scaled variant -- so this script's
+                # FM numbers can now genuinely match training's final
+                # reported numbers when --use_tta is passed.
+                if use_tta:
+                    anchor = obs[-1:, :, :2].detach()
+                    scales = [0.875, 0.9375, 1.0, 1.0625, 1.125][:n_tta]
+                    preds_t, weights_t = [], []
+                    for sc in scales:
+                        obs_s = obs.clone()
+                        obs_s[..., :2] = anchor + (obs[..., :2] - anchor) * sc
+                        bl_s = list(bl); bl_s[0] = obs_s
+                        try:
+                            p, _, _ = model.sample(bl_s, num_ensemble=n_ensemble,
+                                                    ddim_steps=ddim_steps,
+                                                    use_curvature_score=use_curvature_score)
+                            preds_t.append(p)
+                            weights_t.append(2.0 if abs(sc - 1.0) < 1e-6 else 1.0)
+                        except Exception:
+                            continue
+                    if not preds_t:
+                        continue
+                    tw = sum(weights_t)
+                    pred = sum(w / tw * p for w, p in zip(weights_t, preds_t))
+                else:
+                    pred, _, _ = model.sample(bl, num_ensemble=n_ensemble,
+                                               ddim_steps=ddim_steps,
+                                               use_curvature_score=use_curvature_score)
             elif is_mmstn or is_phys_diff or is_tc_diffuser:
                 # No num_ensemble passed -- see is_ensemble_model comment
                 # above. Each model's sample() uses its own pre-configured
@@ -861,6 +905,23 @@ def main():
                         "the model's own docstring to need no retraining, directly "
                         "A/B-testable on any existing checkpoint. Has no effect on "
                         "non-FM models. Default off, matching sample()'s own default.")
+    p.add_argument("--use_tta", action="store_true", default=False,
+                   help="[ADD-TTA] FM-only. Enables the same test-time "
+                        "augmentation train_flowmatching.py's evaluate() "
+                        "always runs before its final '[TEST+TTA]' report: "
+                        "averages FM's prediction over 5 observation-window "
+                        "scales (weighted, 1.0 scale counted 2x). Without "
+                        "this flag, this script's FM numbers reflect a "
+                        "single unscaled pass only, which is why they can "
+                        "differ from training's own final printed ADE/ATE/"
+                        "CTE by a few km even on the identical checkpoint -- "
+                        "pass --use_tta to match that final number. No "
+                        "effect on non-FM models. Runs ~5x slower for FM "
+                        "when enabled (one sample() call per scale).")
+    p.add_argument("--n_tta", type=int, default=5,
+                   help="Number of TTA scales to use (max 5, the number "
+                        "train_flowmatching.py's evaluate() supports); "
+                        "only relevant when --use_tta is set.")
     p.add_argument("--test_year", type=int, default=None)
 
     p.add_argument("--fm_checkpoints",       nargs="+", default=None,
@@ -1054,7 +1115,8 @@ def main():
         recs = evaluate_one_model(model, loader, device, display_name,
                                    seed=seed, n_ensemble=args.n_ensemble,
                                    ddim_steps=args.ddim_steps,
-                                   use_curvature_score=args.use_curvature_score)
+                                   use_curvature_score=args.use_curvature_score,
+                                   use_tta=args.use_tta, n_tta=args.n_tta)
         all_records.extend(recs)
 
         # [FIX] ate/cte là None ở lead_time=1 (6h) theo convention đã sửa
