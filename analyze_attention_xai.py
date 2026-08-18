@@ -225,22 +225,57 @@ def collect_attention_records(model, loader, device, turn_threshold_deg: float):
 
 
 @torch.no_grad()
-def evaluate_ade_by_horizon(model, loader, device) -> pd.DataFrame:
+def evaluate_ade_by_horizon(model, loader, device, use_tta: bool = False,
+                             n_tta: int = 5) -> pd.DataFrame:
     """
-    Chạy đúng 1 lần sample() bình thường (không TTA, KHÔNG return_attn --
-    tách biệt khỏi collect_attention_records để không double-sample nếu
-    cả hai đang chạy cùng lúc) trên toàn bộ test set, trả về ADE THẬT theo
-    horizon. Dùng để đối chiếu với FiLM/attention deviation -- nếu
-    deviation cao ở đâu mà ADE cũng thấp (tốt) ở đó, có cơ sở để nói FiLM
-    "đóng góp" ở horizon đó; nếu không, deviation cao không tự động có
-    nghĩa gì về chất lượng dự đoán.
+    Chạy sample() trên toàn bộ test set, trả về ADE THẬT theo horizon.
+    Dùng để đối chiếu với FiLM/attention deviation -- nếu deviation cao ở
+    đâu mà ADE cũng thấp (tốt) ở đó, có cơ sở để nói FiLM "đóng góp" ở
+    horizon đó; nếu không, deviation cao không tự động có nghĩa gì về
+    chất lượng dự đoán.
+
+    [TTA-CONSISTENCY NOTE] Mặc định KHÔNG dùng TTA -- đây là quyết định
+    thiết kế có chủ đích: mục đích của hàm này KHÔNG PHẢI báo cáo ADE
+    chính thức cho bảng kết quả (đó là việc của evaluate_multi_model.py's
+    --use_tta), mà chỉ để đối chiếu TƯƠNG ĐỐI giữa các horizon trong
+    cùng 1 checkpoint. Vì vậy con số ADE tuyệt đối ở đây sẽ CAO HƠN một
+    chút so với con số TTA đã báo cáo chính thức (verified: một lần chạy
+    thực tế cho ADE 323.1/321.1/328.0km ở đây so với 322.96±3.07 từ
+    evaluate_multi_model.py --use_tta trên cùng checkpoint) -- đây là
+    lệch dự kiến, không phải bug. Correlation với FiLM deviation vẫn có
+    ý nghĩa tương đối đúng dù thiếu TTA (vì TTA tác động tương đối đồng
+    đều lên mọi horizon, không làm lệch pattern TƯƠNG ĐỐI giữa chúng),
+    nhưng --use_tta được thêm ở đây để bạn có lựa chọn dùng CÙNG một
+    con số ADE cho cả bảng chính (Table 1) lẫn phần đối chiếu XAI này,
+    tránh reviewer thắc mắc vì sao 2 nơi báo cáo ADE khác nhau cho cùng
+    1 checkpoint. Bật --use_tta ở đây sẽ làm toàn bộ quá trình chạy
+    chậm hơn ~5x (một sample() call cho mỗi trong 5 scale quan sát).
     """
     records = []
     for bi, batch in enumerate(loader):
         bl = move(list(batch), device)
         gt = bl[1]
         try:
-            pred, _, _ = model.sample(bl, num_ensemble=20, use_curvature_score=True)
+            if use_tta:
+                obs = bl[0]; anchor = obs[-1:, :, :2].detach()
+                scales = [0.875, 0.9375, 1.0, 1.0625, 1.125][:n_tta]
+                preds_t, weights_t = [], []
+                for sc in scales:
+                    obs_s = obs.clone()
+                    obs_s[..., :2] = anchor + (obs[..., :2] - anchor) * sc
+                    bl_s = list(bl); bl_s[0] = obs_s
+                    try:
+                        p, _, _ = model.sample(bl_s, num_ensemble=20, use_curvature_score=True)
+                        preds_t.append(p)
+                        weights_t.append(2.0 if abs(sc - 1.0) < 1e-6 else 1.0)
+                    except Exception:
+                        continue
+                if not preds_t:
+                    continue
+                tw = sum(weights_t)
+                pred = sum(w / tw * p for w, p in zip(weights_t, preds_t))
+            else:
+                pred, _, _ = model.sample(bl, num_ensemble=20, use_curvature_score=True)
         except Exception as e:
             print(f"    batch {bi}: sample error, skipped ({e})")
             continue
@@ -368,6 +403,21 @@ def main():
                          "deviation actually correlates with prediction "
                          "quality -- only skip if you already have ADE "
                          "numbers from elsewhere (e.g. evaluate_multi_model.py).")
+    p.add_argument("--use_tta", action="store_true", default=False,
+                    help="Apply TTA (test-time augmentation, same 5-scale "
+                         "procedure as evaluate_multi_model.py --use_tta) to "
+                         "the ADE-by-horizon evaluation. Off by default -- "
+                         "this evaluation's purpose is relative comparison "
+                         "across horizons within a checkpoint, not an "
+                         "official ADE number, so the absolute values will "
+                         "run a bit higher than TTA numbers reported "
+                         "elsewhere without this flag (expected, not a "
+                         "bug -- see evaluate_ade_by_horizon's docstring). "
+                         "Enable this if you want the SAME ADE numbers used "
+                         "here and in your main results table. ~5x slower "
+                         "when enabled.")
+    p.add_argument("--n_tta", type=int, default=5,
+                    help="Number of TTA scales (max 5); only used when --use_tta is set.")
     args = p.parse_args()
 
     device = torch.device(f"cuda:{args.gpu_num}" if torch.cuda.is_available() else "cpu")
@@ -423,7 +473,8 @@ def main():
         # 3) ADE by horizon -- for the FiLM-vs-quality correlation check.
         if not args.skip_ade_eval:
             set_seed(args.seed)
-            ade_df = evaluate_ade_by_horizon(model, loader, device)
+            ade_df = evaluate_ade_by_horizon(model, loader, device,
+                                              use_tta=args.use_tta, n_tta=args.n_tta)
             if not ade_df.empty:
                 ade_df["seed"] = seed_name
                 all_ade.append(ade_df)
