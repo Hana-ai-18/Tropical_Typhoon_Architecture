@@ -127,9 +127,9 @@ def load_fm(checkpoint_path: str, device):
 
 
 def classify_storm_turning(obs_traj: torch.Tensor, gt_traj: torch.Tensor,
-                            turn_threshold_deg: float = 25.0) -> str:
+                            turn_threshold_deg: float = 45.0) -> str:
     """Same logic as the single-seed script -- see that file's docstring
-    for the rationale behind the 25-degree cutoff.
+    for the rationale behind the cutoff.
 
     [BUG FOUND AND FIXED] _forward_azimuth returns bearings in RADIANS
     (standard atan2 convention). The previous version took the raw
@@ -148,6 +148,23 @@ def classify_storm_turning(obs_traj: torch.Tensor, gt_traj: torch.Tensor,
     China Sea / NW Pacific tropical cyclone track dataset). Fixed by
     converting each bearing to degrees ONCE, immediately after
     _forward_azimuth, before taking any differences.
+
+    [THRESHOLD RE-CALIBRATED] After the above fix, a second real run
+    confirmed the OPPOSITE problem at threshold=25: with the bug fixed,
+    total_turn is now computed correctly, and at threshold=25 EVERY
+    single one of the 449 test-set storms (across all 3 seeds) fell into
+    "recurving" -- confirmed directly from that run's output. This means
+    25 degrees of accumulated heading change over an 18-increment window
+    (8 obs + 12 pred = 20 points) is too LOW a bar: ordinary track noise
+    in a real storm's path is enough to exceed it, so the threshold was
+    not actually separating "genuinely recurving" storms from
+    "essentially straight-moving with natural path wobble" -- it was
+    accepting nearly everything as recurving. Default raised to 45
+    degrees as a more conservative starting point, but see
+    print_turn_distribution() below: rather than guessing a single
+    number, run that function first on your actual dataset and pick a
+    threshold that visibly splits the distribution into two groups,
+    instead of trusting either 25 or 45 blindly.
     """
     full_traj = torch.cat([obs_traj[:, :2], gt_traj[:, :2]], dim=0)
     deg = _norm_to_deg(full_traj.unsqueeze(1)).squeeze(1)
@@ -164,6 +181,25 @@ def classify_storm_turning(obs_traj: torch.Tensor, gt_traj: torch.Tensor,
         d = math.degrees(math.atan2(math.sin(math.radians(d)), math.cos(math.radians(d))))
         total_turn += abs(d)
     return "recurving" if total_turn >= turn_threshold_deg else "straight"
+
+
+def compute_total_turn(obs_traj: torch.Tensor, gt_traj: torch.Tensor) -> float:
+    """Same accumulated-heading-change computation as
+    classify_storm_turning, but returns the raw number instead of a
+    thresholded label -- used by print_turn_distribution() to let you
+    inspect the actual distribution before picking a threshold."""
+    full_traj = torch.cat([obs_traj[:, :2], gt_traj[:, :2]], dim=0)
+    deg = _norm_to_deg(full_traj.unsqueeze(1)).squeeze(1)
+    if deg.shape[0] < 3:
+        return float("nan")
+    bearings_deg = [math.degrees(float(_forward_azimuth(deg[i], deg[i + 1])))
+                     for i in range(deg.shape[0] - 1)]
+    total_turn = 0.0
+    for i in range(len(bearings_deg) - 1):
+        d = bearings_deg[i + 1] - bearings_deg[i]
+        d = math.degrees(math.atan2(math.sin(math.radians(d)), math.cos(math.radians(d))))
+        total_turn += abs(d)
+    return total_turn
 
 
 def extract_film_deviation(model) -> pd.DataFrame:
@@ -290,6 +326,78 @@ def evaluate_ade_by_horizon(model, loader, device, use_tta: bool = False,
     return pd.DataFrame(records)
 
 
+def print_turn_distribution(loader, device, thresholds_to_test: list,
+                             output_dir: str) -> pd.DataFrame:
+    """
+    [THRESHOLD RE-CALIBRATED] Root cause of the earlier "everything is
+    recurving" outcome: 25 degrees of accumulated heading change is too
+    low a bar for this dataset -- confirmed by a real run where ALL 449
+    test-set storms exceeded it. Rather than guessing a "better" number
+    (40, 45, 60...) and hoping it happens to split the data well, this
+    prints the ACTUAL distribution of total_turn across every storm in
+    the test set once, so the threshold can be picked by looking at
+    where the distribution genuinely has two clusters (or, if it's
+    unimodal with no natural split, that itself is useful information --
+    it would mean "recurving vs straight" as a binary label may not be
+    the right framing for this dataset at all, and a continuous turn-rate
+    variable might serve the paper's argument better than a threshold).
+
+    Runs ONCE (turn angle only depends on ground-truth trajectories, not
+    on any model's predictions), independent of which/how many FM
+    checkpoints are being evaluated -- so this is not repeated per seed.
+    """
+    turns = []
+    for batch in loader:
+        bl = move(list(batch), device)
+        obs = bl[0]; gt = bl[1]
+        for b in range(obs.shape[1]):
+            t = compute_total_turn(obs[:, b, :], gt[:, b, :])
+            if not math.isnan(t):
+                turns.append(t)
+
+    turns = np.array(turns)
+    df = pd.DataFrame({"total_turn_deg": turns})
+    df.to_csv(os.path.join(output_dir, "turn_distribution.csv"), index=False)
+
+    print(f"\n{'='*70}\n  Turn-angle distribution across {len(turns)} test-set storms\n{'='*70}")
+    print(f"  min={turns.min():.1f}  25th pct={np.percentile(turns,25):.1f}  "
+          f"median={np.median(turns):.1f}  75th pct={np.percentile(turns,75):.1f}  "
+          f"max={turns.max():.1f}")
+    print(f"\n  How many storms would be labeled 'recurving' at each threshold:")
+    for th in thresholds_to_test:
+        n_recurv = int((turns >= th).sum())
+        pct = 100.0 * n_recurv / max(len(turns), 1)
+        print(f"    threshold={th:5.1f}°:  {n_recurv:4d}/{len(turns)} "
+              f"({pct:5.1f}%) labeled recurving")
+    print(f"\n  A threshold that produces something close to a 50/50 (or at "
+          f"least neither ~0% nor ~100%) split is more likely to yield a "
+          f"meaningful comparison than one that puts nearly everything in "
+          f"one bucket -- pick --turn_threshold_deg accordingly, or inspect "
+          f"turn_distribution.csv directly (e.g. plot a histogram) if none "
+          f"of the tested values look like a clean split.")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(turns, bins=30, edgecolor="black", alpha=0.7)
+        for th in thresholds_to_test:
+            ax.axvline(th, linestyle="--", alpha=0.6, label=f"{th}°")
+        ax.set_xlabel("Total accumulated heading change (degrees)")
+        ax.set_ylabel("Number of storms")
+        ax.set_title("Distribution of total turning angle across test-set storms")
+        ax.legend()
+        fig.tight_layout()
+        fig_path = os.path.join(output_dir, "turn_distribution.png")
+        fig.savefig(fig_path, dpi=200)
+        print(f"\n  Figure saved: {fig_path}")
+    except ImportError:
+        pass
+
+    return df
+
+
 def summarize_across_seeds(per_seed_df: pd.DataFrame, value_cols: list,
                             group_cols: list) -> pd.DataFrame:
     """
@@ -390,7 +498,7 @@ def main():
     p.add_argument("--threshold", type=float, default=0.002)
     p.add_argument("--filter_region", action="store_true", default=False)
     p.add_argument("--min_pct_in_scs", type=float, default=15.0)
-    p.add_argument("--turn_threshold_deg", type=float, default=25.0)
+    p.add_argument("--turn_threshold_deg", type=float, default=45.0)
     p.add_argument("--skip_attention", action="store_true", default=False,
                     help="Skip cross-attention analysis (slow, needs full "
                          "test-set pass). FiLM deviation always runs "
@@ -439,6 +547,18 @@ def main():
     if not args.skip_attention or not args.skip_ade_eval:
         _, loader = data_loader(args, {"root": args.dataset_root, "type": "test"}, test=True)
         print(f"  Test data: {len(loader)} batches")
+
+    # [THRESHOLD RE-CALIBRATED] Run once before any per-seed processing --
+    # turn angle only depends on ground-truth trajectories, independent
+    # of which checkpoint is loaded. Prints the actual distribution and
+    # how many storms each candidate threshold would label "recurving",
+    # so --turn_threshold_deg can be picked from real data instead of a
+    # guess. Only runs if the attention analysis (the only consumer of
+    # the recurving/straight label) is actually going to run.
+    if not args.skip_attention and loader is not None:
+        print_turn_distribution(loader, device,
+                                 thresholds_to_test=[25.0, 35.0, 45.0, 55.0, 65.0],
+                                 output_dir=args.output_dir)
 
     all_film = []
     all_attn = []
