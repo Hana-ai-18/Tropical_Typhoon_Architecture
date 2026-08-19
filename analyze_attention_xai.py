@@ -41,11 +41,11 @@ KẾT QUẢ
 -------
   film_deviation_per_seed.csv     : 1 dòng / (seed, horizon) -- dữ liệu thô
   film_deviation_summary.csv      : mean±std qua seed, theo horizon
-  film_deviation_summary.png      : hình có error band (mean ± std)
+  film_deviation_summary.pdf      : hình có error band (mean ± std)
 
   attn_by_horizon_per_seed.csv    : 1 dòng / (seed, storm, horizon)  [nếu không --skip_attention]
   attn_summary_across_seeds.csv   : mean±std qua seed, theo (group, horizon)
-  attn_summary_across_seeds.png   : hình có error band
+  attn_summary_across_seeds.pdf   : hình có error band
 
   eval_by_horizon_per_seed.csv    : ADE/ATE/CTE THẬT theo (seed, horizon) -- để đối chiếu
   eval_summary_across_seeds.csv   : mean±std ADE/ATE/CTE theo horizon
@@ -399,7 +399,7 @@ def print_turn_distribution(loader, device, thresholds_to_test: list,
         ax.set_title("Distribution of total turning angle across test-set storms")
         ax.legend()
         fig.tight_layout()
-        fig_path = os.path.join(output_dir, "turn_distribution.png")
+        fig_path = os.path.join(output_dir, "turn_distribution.pdf")
         fig.savefig(fig_path, dpi=200)
         print(f"\n  Figure saved: {fig_path}")
     except ImportError:
@@ -646,7 +646,7 @@ def main():
         film_summary, "horizon_h",
         [("gamma_deviation_mean", "gamma_deviation_std", "gamma deviation"),
          ("beta_deviation_mean", "beta_deviation_std", "beta deviation")],
-        os.path.join(args.output_dir, "film_deviation_summary.png"),
+        os.path.join(args.output_dir, "film_deviation_summary.pdf"),
         f"FiLM deviation by horizon (mean±std across {n_seeds} seeds)",
         "Forecast horizon (hours)", "L2 deviation from zero-impact init")
 
@@ -664,7 +664,7 @@ def main():
         plot_with_error_band(
             attn_summary, "horizon_h",
             [("attn_context_mean", "attn_context_std", "attn to context")],
-            os.path.join(args.output_dir, "attn_summary_across_seeds.png"),
+            os.path.join(args.output_dir, "attn_summary_across_seeds.pdf"),
             f"Cross-attention to context vector (mean±std across {n_seeds} seeds)",
             "Forecast horizon (hours)", "Mean attention weight on context vector",
             group_col="group")
