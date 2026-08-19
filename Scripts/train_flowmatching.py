@@ -736,6 +736,24 @@ def get_args():
     p.add_argument("--disable_hard_reg",       action="store_true", default=False,
                    help="Ablation: disable hard_score_weight_logits uniform "
                         "regularizer (same as --lambda_hard_reg 0.0)")
+    p.add_argument("--disable_film",           action="store_true", default=False,
+                   help="Ablation: disable HORIZON-FILM (freeze "
+                        "velocity.film_gamma at 1.0 and velocity.film_beta "
+                        "at 0.0 throughout training, so horizon_ctx = "
+                        "1.0*cond_vec + 0.0 = cond_vec, identical to the "
+                        "pre-FiLM baseline where every horizon receives the "
+                        "SAME unmodulated context). Since film_gamma/beta "
+                        "are initialized to exactly this identity transform "
+                        "(nn.init.ones_/zeros_, see flow_matching_model.py's "
+                        "VelocityTransformer.__init__), freezing them at "
+                        "their own init values -- rather than removing the "
+                        "parameters or changing the architecture -- is the "
+                        "correct way to ablate FiLM: it isolates whether "
+                        "LEARNING a horizon-specific context modulation "
+                        "helps, with everything else (parameter count, "
+                        "forward-pass structure, gradient flow through the "
+                        "rest of the network) held identical to the full "
+                        "model.")
     p.add_argument("--ablation_name",          type=str, default="")
     return p.parse_args()
 
@@ -845,6 +863,28 @@ def main(args):
         sigma_inference=args.sigma_inference,
         use_curvature_score_train=args.use_curvature_score_train,
     ).to(device)
+
+    if args.disable_film:
+        # [ABLATION: --disable_film] film_gamma/film_beta are initialized
+        # to exactly the identity transform (gamma=1, beta=0 -- see
+        # VelocityTransformer.__init__ in flow_matching_model.py), so
+        # freezing them at those init values here reproduces the pre-FiLM
+        # baseline exactly: horizon_ctx = 1.0*cond_vec + 0.0 = cond_vec,
+        # identical for every horizon, same as before HORIZON-FILM was
+        # added. requires_grad_(False) stops gradient updates without
+        # removing the parameters or changing the forward-pass structure,
+        # so this isolates the effect of LEARNING horizon-specific context
+        # modulation while keeping parameter count, architecture, and
+        # gradient flow through the rest of the network identical to the
+        # full model -- the correct way to ablate a zero-impact-at-init
+        # mechanism (verified for FiLM's init values via
+        # nn.init.ones_/zeros_, matching every other LEARN-* mechanism's
+        # own zero-impact-at-init convention in this file).
+        model.velocity.film_gamma.weight.requires_grad_(False)
+        model.velocity.film_beta.weight.requires_grad_(False)
+        print("  [ABLATION] --disable_film: film_gamma/beta frozen at "
+              "identity (1.0/0.0) — model behaves as if HORIZON-FILM was "
+              "never added.")
 
     model_cfg = dict(
         pred_len=args.pred_len,        obs_len=args.obs_len,
