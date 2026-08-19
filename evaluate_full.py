@@ -1008,7 +1008,10 @@ def ensemble_size_eval(model, loader, device,
 
 def k_n_joint_sweep(model, loader, device,
                      k_values: list = [1, 5, 10, 20, 30],
-                     n_values: list = [1, 4, 8, 10, 12, 16, 20]) -> Dict:
+                     n_values: list = [1, 4, 8, 10, 12, 16, 20],
+                     use_tta: bool = True,
+                     n_tta: int = 5,
+                     use_curvature_score: bool = True) -> Dict:
     """
     [NEW] Joint sweep over ensemble size K (number of candidate
     trajectories re-ranked by the physics score) AND ODE integration
@@ -1025,21 +1028,47 @@ def k_n_joint_sweep(model, loader, device,
     numbers is actually the jointly-optimal point rather than a
     reasonable-looking pair of independently-chosen defaults.
 
+    [BUG FOUND AND FIXED] The first version of this function called
+    model.sample(bl, num_ensemble=k) with NEITHER test-time augmentation
+    NOR use_curvature_score=True -- both of which the project's main
+    reported numbers (evaluate_multi_model.py's --use_tta path, which
+    produces multi_model_test.json) DO use. Verified directly on real
+    output: at K=20 (the value evaluate_multi_model.py's headline FM row
+    was run at), this function's cells reported ADE=326.2-327.5 km across
+    N=8-20, while the main evaluation's pooled FM ADE was 322.96 km -- a
+    consistent ~3-4 km gap in the same direction as TTA's known effect
+    size (TTA typically shaves a few km off ADE by averaging over 5
+    observation-window scales; see evaluate_multi_model.py's own
+    docstring for the exact mechanism). This was NOT the person
+    misunderstanding the two evaluations -- it was this function
+    genuinely using a different (weaker) inference configuration than
+    the main reported table, which is a real apples-to-oranges
+    comparison bug, now fixed by defaulting both use_tta and
+    use_curvature_score to True (matching evaluate_multi_model.py's
+    reported configuration) so K,N sweep cells are directly comparable
+    to the main table's numbers at the same K. Both remain overridable
+    via arguments if a faster, TTA-off sweep is wanted for a quick check
+    (pass use_tta=False) -- but that should be reported as a distinctly
+    different, non-comparable configuration if used, not silently mixed
+    with TTA-on main-table numbers.
+
     Reuses the EXACT same per-batch computation as both source functions
     (haversine ADE, forward-azimuth ATE/CTE decomposition, pairwise
     ensemble spread) rather than re-deriving it, so results here are
     numerically consistent with both ensemble_size_eval()'s K-only sweep
     and ode_steps_sweep()'s N-only sweep -- the K=?,N=? cells that match
-    those functions' fixed axis should reproduce the same numbers
-    (mean_diff should be near-zero across all runs, since the model,
-    checkpoint, K, and N are all held identical -- the only remaining
-    source of any nonzero difference is fresh random ensemble sampling
-    at those particular (K,N) cells).
+    those functions' fixed axis should reproduce similar numbers (small
+    remaining differences are expected: ensemble_size_eval()/
+    ode_steps_sweep() do NOT use TTA/curvature_score either, so a cell
+    here directly comparable to them requires use_tta=False,
+    use_curvature_score=False to isolate the K,N effect alone from the
+    TTA/curvature_score effect).
 
-    Compute cost is O(len(k_values) x len(n_values) x len(loader)) --
-    with the default 5x7=35 cells, expect roughly 35x a single
-    ensemble_size_eval() call's runtime. Print progress per cell so a
-    long-running sweep's status is visible.
+    Compute cost is O(len(k_values) x len(n_values) x len(loader) x
+    (n_tta if use_tta else 1)) -- with the default 5x7=35 cells and
+    use_tta=True (5x), expect roughly 175x a single ensemble_size_eval()
+    call's runtime. Print progress per cell so a long-running sweep's
+    status is visible.
     """
     model.eval()
     raw = _unwrap(model)
@@ -1048,11 +1077,15 @@ def k_n_joint_sweep(model, loader, device,
               "(không phải FM) — ADE/ATE/CTE sẽ GIỐNG HỆT nhau ở mọi (K,N), "
               "spread sẽ luôn NaN. Đây là kết quả đúng (baseline không có "
               "khái niệm ensemble hay ODE integration steps), không phải lỗi.")
+    print(f"  k_n_joint_sweep config: use_tta={use_tta} (n_tta={n_tta})  "
+          f"use_curvature_score={use_curvature_score}"
+          f"{'  ⚠ TTA/curvature OFF — cells NOT directly comparable to main table' if not (use_tta and use_curvature_score) else '  (matches evaluate_multi_model.py main table config)'}")
 
     orig_steps = getattr(raw, "n_inference_steps", 1)
     results = {}   # (K, N) -> {...}
     total_cells = len(k_values) * len(n_values)
     cell_idx = 0
+    tta_scales = [0.875, 0.9375, 1.0, 1.0625, 1.125][:n_tta]
 
     for n_steps in n_values:
         for k in k_values:
@@ -1069,7 +1102,25 @@ def k_n_joint_sweep(model, loader, device,
                 gt = bl[1]
                 try:
                     raw.n_inference_steps = n_steps
-                    pred, _, all_t = model.sample(bl, num_ensemble=k)
+                    if use_tta:
+                        obs = bl[0]
+                        anchor = obs[-1:, :, :2].detach()
+                        preds_t, weights_t, all_t = [], [], None
+                        for sc in tta_scales:
+                            obs_s = obs.clone()
+                            obs_s[..., :2] = anchor + (obs[..., :2] - anchor) * sc
+                            bl_s = list(bl); bl_s[0] = obs_s
+                            p, _, at = model.sample(bl_s, num_ensemble=k,
+                                                     use_curvature_score=use_curvature_score)
+                            preds_t.append(p)
+                            weights_t.append(2.0 if abs(sc - 1.0) < 1e-6 else 1.0)
+                            if abs(sc - 1.0) < 1e-6:
+                                all_t = at   # spread only from the unscaled pass
+                        tw = sum(weights_t)
+                        pred = sum(w / tw * p for w, p in zip(weights_t, preds_t))
+                    else:
+                        pred, _, all_t = model.sample(bl, num_ensemble=k,
+                                                       use_curvature_score=use_curvature_score)
                     raw.n_inference_steps = orig_steps
                 except Exception as e:
                     raw.n_inference_steps = orig_steps
@@ -1235,7 +1286,10 @@ def run_k_n_joint_sweep_multi_seed(checkpoints: List[str], dataset_root: str,
         print(f"  Data: {len(loader)} batches")
 
         model.eval()
-        results = k_n_joint_sweep(model, loader, device, k_values=k_values, n_values=n_values)
+        results = k_n_joint_sweep(model, loader, device, k_values=k_values, n_values=n_values,
+                                   use_tta=getattr(args, "use_tta", True),
+                                   n_tta=getattr(args, "n_tta", 5),
+                                   use_curvature_score=getattr(args, "use_curvature_score", True))
         per_seed_results[seed] = results
 
         del model
@@ -1555,7 +1609,27 @@ def main():
                         "inference-time change on an already-trained "
                         "checkpoint — no retraining needed. Default False "
                         "preserves prior behavior exactly. No-op for "
-                        "baseline models (accepted via **kwargs, ignored).")
+                        "baseline models (accepted via **kwargs, ignored). "
+                        "⚠ evaluate_multi_model.py's main reported table "
+                        "(multi_model_test.json) uses True for FM -- pass "
+                        "this flag explicitly when running --k_n_sweep if "
+                        "you want K,N cells directly comparable to that "
+                        "table (verified gap without it: ~3-4 km higher "
+                        "ADE at K=20 vs the main table's pooled FM ADE).")
+    p.add_argument("--use_tta", action="store_true", default=False,
+                   help="[TTA, opt-in for evaluate_full.py's own default "
+                        "commands] Enables the same 5-scale test-time "
+                        "augmentation as evaluate_multi_model.py's --use_tta "
+                        "(see that script's docstring for the exact "
+                        "mechanism). Applies to --k_n_sweep. Default False "
+                        "here preserves this script's OTHER modes' prior "
+                        "behavior unchanged -- but note the main reported "
+                        "table (multi_model_test.json) WAS generated with "
+                        "TTA on, so pass this flag explicitly for "
+                        "--k_n_sweep cells to be directly comparable to it.")
+    p.add_argument("--n_tta", type=int, default=5,
+                   help="Number of TTA scales (max 5); only used when "
+                        "--use_tta is set, for --k_n_sweep.")
     p.add_argument("--ddim_steps", type=int, default=None,
                    help="[MULTI-STEP, opt-in] Number of Euler integration "
                         "steps for sampling (overrides checkpoint's "
@@ -1845,7 +1919,10 @@ def main():
               f"  ({len(args.k_values) * len(args.n_values)} cells)...")
         kn_results = k_n_joint_sweep(model, loader, device,
                                       k_values=args.k_values,
-                                      n_values=args.n_values)
+                                      n_values=args.n_values,
+                                      use_tta=getattr(args, "use_tta", True),
+                                      n_tta=getattr(args, "n_tta", 5),
+                                      use_curvature_score=getattr(args, "use_curvature_score", True))
         # JSON keys must be strings -- (K,N) tuples serialized as "K,N",
         # matching the multi-seed branch's convention above so both
         # single- and multi-checkpoint runs produce the same schema for
