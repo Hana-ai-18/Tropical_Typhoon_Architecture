@@ -195,6 +195,27 @@ class SWAHandler:
         self.start_ep  = None
         self.n_updates = 0
         self.avg_state = {}
+        # [SWA-STAGNATION-COUNTER] Root cause this addresses: once SWA
+        # activates, patience_cnt is frozen at 0 for as long as swa.active
+        # is True (see the training loop's "No improve X/40 [SWA active
+        # -- patience frozen]" branch) -- this was the deliberate fix for
+        # a DIFFERENT problem (SWA being early-stopped before it had a
+        # fair chance, confirmed in prior logs: activated ep90, stopped
+        # ep110). But freezing patience has no upper bound of its own: if
+        # SWA genuinely never surpasses best_score again, training now
+        # runs to the full --num_epochs budget regardless, since nothing
+        # else can trigger early stop while swa.active. Observed directly
+        # in a real run: SWA activated ep90, and by ep140 (50 epochs and
+        # ~14000 updates later) still had not beaten the pre-SWA best
+        # (best=213.29 at ep110, SWA still at 213.6-213.9 range at ep140),
+        # with val_ADE essentially flat (244.1-244.9km) the entire time --
+        # a real training-time trade-off from the earlier fix, not a bug
+        # in it. This counter tracks consecutive SWA-checkpoints that
+        # failed to beat best_score, giving the training loop a way to
+        # stop SWA-stagnation without reintroducing the original problem
+        # (a fixed, generous threshold, checked only at SWA validation
+        # points -- not on every ordinary epoch the way patience_cnt is).
+        self.stagnant_swa_checks = 0
 
     def should_activate(self, ade_history: List[float],
                          window: int = 3, threshold: float = 1.5) -> bool:
@@ -678,6 +699,18 @@ def get_args():
     p.add_argument("--swa_window",             default=3,      type=int)
     p.add_argument("--swa_threshold",          default=1.5,    type=float)
     p.add_argument("--swa_min_ep",             default=50,     type=int)
+    # [SWA-STAGNATION-COUNTER] See SWAHandler.stagnant_swa_checks'
+    # __init__ comment: once SWA activates, patience_cnt freezes at 0 for
+    # the entire SWA phase, so nothing else can trigger early stop -- this
+    # is a SEPARATE, coarser patience checked only at SWA validation
+    # points (every val_freq epochs), not every ordinary epoch. Default
+    # 12 checks * val_freq=5 = ~60 epochs of SWA stagnation tolerated
+    # before stopping -- generous enough that SWA still gets a fair shot
+    # (confirmed against real logs: prior early-stopping at only ~20
+    # epochs post-activation was too aggressive), but bounded so a run
+    # doesn't silently consume the full --num_epochs budget once SWA has
+    # genuinely plateaued.
+    p.add_argument("--swa_patience",           default=12,     type=int)
     # Test
     p.add_argument("--tta_test",               default=True,   action="store_true")
     p.add_argument("--n_tta",                  default=5,      type=int)
@@ -1267,6 +1300,7 @@ def main(args):
             print(f"  [SWA] score={swa_score:.2f} ({swa.n_updates} updates) vs best={best_score:.2f}")
             if swa_score < best_score:
                 best_score = swa_score; patience_cnt = 0
+                swa.stagnant_swa_checks = 0
                 swa.save_avg_state(swa_ckpt, ep, best_score,
                                    extra={"val_ade": r_swa["ADE"],
                                           "val_ate": r_swa["ATE"],
@@ -1274,6 +1308,25 @@ def main(args):
                                    model_cfg=model_cfg)
                 import shutil; shutil.copy(swa_ckpt, best_ckpt)
                 print(f"  ✅ SWA best! score={best_score:.2f} ADE={r_swa['ADE']:.1f}")
+            else:
+                # [SWA-STAGNATION STOP] See SWAHandler.stagnant_swa_checks'
+                # __init__ comment for the full rationale: patience_cnt is
+                # frozen at 0 while swa.active, so nothing else in this
+                # loop can trigger early stop once SWA starts -- without
+                # this counter, a SWA phase that genuinely stopped
+                # improving would run to the full --num_epochs budget.
+                # args.swa_patience is checked only here, at SWA
+                # validation points (every val_freq epochs), not on every
+                # ordinary training epoch -- a deliberately coarser signal
+                # than patience_cnt, matching how infrequently SWA's own
+                # averaged weights actually change enough to matter.
+                swa.stagnant_swa_checks += 1
+                print(f"  [SWA] stagnant {swa.stagnant_swa_checks}/{args.swa_patience} "
+                      f"SWA-checks since last SWA improvement")
+                if swa.stagnant_swa_checks >= args.swa_patience:
+                    print(f"  ⛔ Early stop @ ep{ep} (SWA stagnant for "
+                          f"{swa.stagnant_swa_checks} consecutive checks)")
+                    break
 
     _wall_total = time.time() - _wall_start
     print(f"\n  Training wall-clock: {_wall_total/3600:.2f}h ({_wall_total:.0f}s)")
