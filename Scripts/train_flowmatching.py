@@ -1244,12 +1244,25 @@ def main(args):
               f"  t={time.perf_counter()-t0_ep:.0f}s"
               f"{sanitize_s}")
 
+        # [PATCH-SEED-IN-CKPT] Seed trước đây chỉ được ghi vào
+        # footprint.json/auto_eval_summary.json (file JSON riêng, cùng
+        # thư mục output_dir), KHÔNG có trong chính file .pth. Nếu 2 file
+        # JSON đó bị mất/không giữ lại (ví dụ chỉ copy .pth ra khỏi
+        # Kaggle), seed của checkpoint không thể khôi phục được -- đã xảy
+        # ra thực tế với 7/9 ablation checkpoint ban đầu (evaluate script
+        # phải in "seed=unknown"). Vá: thêm "seed" và "ablation_name"
+        # trực tiếp vào payload .pth qua tham số `extra` sẵn có của
+        # _save() (không đụng vào model_cfg, vì model_cfg được dùng để
+        # TCFlowMatching(**model_cfg) tái tạo kiến trúc -- thêm seed vào
+        # đó sẽ làm vỡ lời gọi constructor ở nơi khác).
+        _ckpt_id_extra = {"seed": args.seed,
+                           "ablation_name": args.ablation_name or "full"}
         _save(last_ckpt, ep, model, opt, sched, best_score, ema, scaler,
-              model_cfg=model_cfg)
+              extra=_ckpt_id_extra, model_cfg=model_cfg)
         if ep % 5 == 0:
             ep_ckpt = os.path.join(args.output_dir, f"ckpt_ep{ep:03d}.pth")
             _save(ep_ckpt, ep, model, opt, sched, best_score, ema, scaler,
-                  model_cfg=model_cfg)
+                  extra=_ckpt_id_extra, model_cfg=model_cfg)
             print(f"  💾 {ep_ckpt}")
         if rel_ep % args.val_freq == 0:
             run_xai_this = (rel_ep % 10 == 0)
@@ -1276,7 +1289,8 @@ def main(args):
                 best_score = score; patience_cnt = 0
                 _save(best_ckpt, ep, model, opt, sched, best_score, ema, scaler,
                       extra={"val_ade": r["ADE"], "val_ate": r["ATE"],
-                             "val_cte": r["CTE"], "patience_cnt": 0},
+                             "val_cte": r["CTE"], "patience_cnt": 0,
+                             **_ckpt_id_extra},
                       model_cfg=model_cfg)
                 print(f"  ✅ Best! score={best_score:.2f}"
                       f"  ADE={r['ADE']:.1f} ATE={r['ATE']:.1f} CTE={r['CTE']:.1f}")
@@ -1321,7 +1335,8 @@ def main(args):
             if r_h["combined_score"] < best_hard and r_h["n_hard"] >= 10:
                 best_hard = r_h["combined_score"]
                 _save(hard_best_ckpt, ep, model, opt, sched, best_hard, ema, scaler,
-                      extra={"hard_val_ade": r_h["ADE"], "selection_criterion": "hard_val"},
+                      extra={"hard_val_ade": r_h["ADE"], "selection_criterion": "hard_val",
+                             **_ckpt_id_extra},
                       model_cfg=model_cfg)
                 print(f"  💎 Hard-best! score={best_hard:.2f} ADE={r_h['ADE']:.1f}")
 
@@ -1344,7 +1359,8 @@ def main(args):
                 swa.save_avg_state(swa_ckpt, ep, best_score,
                                    extra={"val_ade": r_swa["ADE"],
                                           "val_ate": r_swa["ATE"],
-                                          "val_cte": r_swa["CTE"]},
+                                          "val_cte": r_swa["CTE"],
+                                          **_ckpt_id_extra},
                                    model_cfg=model_cfg)
                 import shutil; shutil.copy(swa_ckpt, best_ckpt)
                 print(f"  ✅ SWA best! score={best_score:.2f} ADE={r_swa['ADE']:.1f}")
