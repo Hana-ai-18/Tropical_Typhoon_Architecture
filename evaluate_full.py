@@ -1095,6 +1095,14 @@ def k_n_joint_sweep(model, loader, device,
             by_lt_ade = defaultdict(list)
             by_lt_ate = defaultdict(list)
             by_lt_cte = defaultdict(list)
+            # [FIX spread_skill_ratio] Accumulate per-horizon spread AND
+            # per-horizon ensemble-mean squared error, over ALL horizons
+            # (not just the final 72h step like `all_spread` above), so we
+            # can compute a proper spread/RMSE ratio -- identical
+            # definition to _crps_ensemble()'s ss_ratio -- per (K,N) cell
+            # without needing to re-run training or re-generate samples.
+            by_lt_spread   = defaultdict(list)   # lead_time(int) -> [spread_b, ...] (one value per batch-step)
+            by_lt_ens_sqerr = defaultdict(list)  # lead_time(int) -> [se_b, ...]      ("skill" = |ensemble_mean - gt|^2)
             t0 = time.time()
 
             for batch in loader:
@@ -1158,6 +1166,27 @@ def k_n_joint_sweep(model, loader, device,
                             dab = _haversine_deg(last[a:a+1], last[b:b+1]).squeeze(0)
                             all_spread.append(float(dab.mean()))
 
+                    # [FIX spread_skill_ratio] Same pairwise-spread and
+                    # ensemble-mean-vs-GT logic as _crps_ensemble() above,
+                    # but computed PER HORIZON (not just the final step)
+                    # and accumulated across batches, so build_k_n_table()
+                    # can report a proper spread/RMSE ratio per (K,N) cell.
+                    T_all = min(all_t.shape[1], gt.shape[0])
+                    all_t_deg = _norm_to_deg(all_t[:, :T_all, :, :2])   # [K, T_all, B, 2]
+                    gd_all = _norm_to_deg(gt[:T_all, :, :2])            # [T_all, B, 2]
+                    for tt in range(T_all):
+                        lt = tt + 1  # 1-indexed lead time, matches by_lt_ade keys above
+                        step_k = all_t_deg[:, tt]                        # [K, B, 2]
+                        idx1 = torch.randperm(Kb)[:min(Kb, 10)]
+                        idx2 = torch.randperm(Kb)[:min(Kb, 10)]
+                        for a, b in zip(idx1.tolist(), idx2.tolist()):
+                            if a != b:
+                                dab = _haversine_deg(step_k[a:a+1], step_k[b:b+1]).squeeze(0)
+                                by_lt_spread[lt].append(float(dab.mean()))
+                        ens_mean = step_k.mean(0, keepdim=True)          # [1, B, 2]
+                        se = (_haversine_deg(ens_mean, gd_all[tt:tt+1]) ** 2)  # [1, B]
+                        by_lt_ens_sqerr[lt].append(float(se.mean()))
+
             elapsed = time.time() - t0
             by_lead_time = {}
             all_lts = sorted(set(by_lt_ade.keys()) | set(by_lt_ate.keys()) | set(by_lt_cte.keys()))
@@ -1169,18 +1198,40 @@ def k_n_joint_sweep(model, loader, device,
                     "n":   len(by_lt_ade.get(lt, [])),
                 }
 
+            # [FIX spread_skill_ratio] Build the proper per-horizon ratio
+            # spread(tau) / sqrt(mean squared error of ensemble mean at tau)
+            # -- identical definition to _crps_ensemble()'s ss_ratio, ideal
+            # value ~1.0 -- then average across horizons for a single
+            # per-cell scalar that select_kn.py can read directly instead
+            # of falling back to the coarse spread/ADE proxy.
+            ss_ratio_by_lt = {}
+            for lt in sorted(set(by_lt_spread.keys()) | set(by_lt_ens_sqerr.keys())):
+                sp = float(np.mean(by_lt_spread[lt])) if by_lt_spread.get(lt) else float("nan")
+                mse = float(np.mean(by_lt_ens_sqerr[lt])) if by_lt_ens_sqerr.get(lt) else float("nan")
+                rmse = np.sqrt(mse) if mse == mse else float("nan")  # nan-safe
+                ss_ratio_by_lt[lt] = sp / (rmse + 1e-6) if rmse == rmse else float("nan")
+            valid_ratios = [v for v in ss_ratio_by_lt.values() if v == v]  # drop nan
+            spread_skill_ratio_mean = float(np.mean(valid_ratios)) if valid_ratios else float("nan")
+
             results[(k, n_steps)] = {
                 "K": k, "N": n_steps,
                 "ADE": float(np.mean(all_ade)) if all_ade else float("nan"),
                 "ATE": float(np.mean(all_ate)) if all_ate else float("nan"),
                 "CTE": float(np.mean(all_cte)) if all_cte else float("nan"),
                 "spread": float(np.mean(all_spread)) if all_spread else float("nan"),
+                # [NEW] proper spread/RMSE ratio, ideal ~1.0 -- this is the
+                # field select_kn.py's Step A (calibration-first N choice)
+                # is designed to read; previously absent, causing the
+                # "no N reaches min_skill_ratio=0.5" fallback.
+                "spread_skill_ratio": spread_skill_ratio_mean,
+                "spread_skill_ratio_by_lead_time": ss_ratio_by_lt,
                 "time_s": elapsed, "n": len(all_ade),
                 "by_lead_time": by_lead_time,
             }
             r = results[(k, n_steps)]
             print(f"    ADE={r['ADE']:.2f}  ATE={r['ATE']:.2f}  CTE={r['CTE']:.2f}  "
-                  f"spread={r['spread']:.2f}km  t={elapsed:.1f}s")
+                  f"spread={r['spread']:.2f}km  spread_skill_ratio={r['spread_skill_ratio']:.3f}  "
+                  f"t={elapsed:.1f}s")
 
     return results
 
@@ -1197,7 +1248,12 @@ def build_k_n_table(results: Dict) -> List[Dict]:
         rows.append({
             "K": k, "N": n,
             "ADE": entry["ADE"], "ATE": entry["ATE"], "CTE": entry["CTE"],
-            "spread": entry["spread"], "time_s": entry["time_s"], "n": entry["n"],
+            "spread": entry["spread"],
+            # [FIX spread_skill_ratio] propagate the new field through the
+            # flattened table too, so any downstream CSV export or manual
+            # inspection also sees it (not just the raw (K,N)-keyed dict).
+            "spread_skill_ratio": entry.get("spread_skill_ratio", float("nan")),
+            "time_s": entry["time_s"], "n": entry["n"],
         })
     return rows
 
@@ -1303,13 +1359,39 @@ def run_k_n_joint_sweep_multi_seed(checkpoints: List[str], dataset_root: str,
         for k in k_values:
             key = (k, n_steps)
             entry = {}
-            for field in ("ADE", "ATE", "CTE", "spread", "time_s", "n"):
+            # [FIX spread_skill_ratio] Added "spread_skill_ratio" to the
+            # merged field list -- without this, the per-seed value
+            # computed above by k_n_joint_sweep() would be silently
+            # dropped during the multi-seed merge, and select_kn.py would
+            # still see no "spread_skill_ratio" key in the final JSON
+            # (same failure mode as before, just one step later in the
+            # pipeline). "spread_skill_ratio_by_lead_time" (a dict, not a
+            # scalar) is intentionally NOT included in this mean/std loop
+            # -- it is copied through as-is from the first seed instead,
+            # a few lines below, since np.mean over per-seed dicts isn't
+            # meaningful without a separate per-horizon merge.
+            for field in ("ADE", "ATE", "CTE", "spread", "spread_skill_ratio",
+                          "time_s", "n"):
                 vals = [per_seed_results[s][key][field] for s in per_seed_results
                         if key in per_seed_results[s]
                         and not np.isnan(per_seed_results[s][key].get(field, float("nan")))]
                 entry[field] = float(np.mean(vals)) if vals else float("nan")
-                if field in ("ADE", "ATE", "CTE", "spread"):
+                if field in ("ADE", "ATE", "CTE", "spread", "spread_skill_ratio"):
                     entry[f"{field}_std"] = float(np.std(vals)) if len(vals) > 1 else 0.0
+            # Per-horizon spread_skill_ratio, averaged across seeds at each
+            # lead time (kept separate from the scalar merge above because
+            # its value is a dict, not a float).
+            per_lt_lists = defaultdict(list)
+            for s in per_seed_results:
+                if key not in per_seed_results[s]:
+                    continue
+                for lt, val in per_seed_results[s][key].get(
+                        "spread_skill_ratio_by_lead_time", {}).items():
+                    if val == val:  # not nan
+                        per_lt_lists[lt].append(val)
+            entry["spread_skill_ratio_by_lead_time"] = {
+                lt: float(np.mean(vs)) for lt, vs in per_lt_lists.items()
+            }
             entry["n_seeds"] = n_seeds
             entry["K"] = k
             entry["N"] = n_steps
