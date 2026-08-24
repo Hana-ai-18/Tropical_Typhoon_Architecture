@@ -228,7 +228,8 @@ def extract_film_deviation(model) -> pd.DataFrame:
 
 
 @torch.no_grad()
-def collect_attention_records(model, loader, device, turn_threshold_deg: float):
+def collect_attention_records(model, loader, device, turn_threshold_deg: float,
+                               n_ensemble: int = 20, ddim_steps: int = None):
     """Same as the single-seed script's collect_attention_records."""
     records = []
     for bi, batch in enumerate(loader):
@@ -240,7 +241,8 @@ def collect_attention_records(model, loader, device, turn_threshold_deg: float):
             tyid_list = None
 
         try:
-            _, _, _, xai = model.sample(bl, num_ensemble=20, return_xai=True,
+            _, _, _, xai = model.sample(bl, num_ensemble=n_ensemble, ddim_steps=ddim_steps,
+                                         return_xai=True,
                                          return_attn=True, use_curvature_score=True)
         except Exception as e:
             print(f"    batch {bi}: sample error, skipped ({e})")
@@ -272,7 +274,8 @@ def collect_attention_records(model, loader, device, turn_threshold_deg: float):
 
 @torch.no_grad()
 def evaluate_ade_by_horizon(model, loader, device, use_tta: bool = False,
-                             n_tta: int = 5) -> pd.DataFrame:
+                             n_tta: int = 5, n_ensemble: int = 20,
+                             ddim_steps: int = None) -> pd.DataFrame:
     """
     Chạy sample() trên toàn bộ test set, trả về ADE THẬT theo horizon.
     Dùng để đối chiếu với FiLM/attention deviation -- nếu deviation cao ở
@@ -311,7 +314,8 @@ def evaluate_ade_by_horizon(model, loader, device, use_tta: bool = False,
                     obs_s[..., :2] = anchor + (obs[..., :2] - anchor) * sc
                     bl_s = list(bl); bl_s[0] = obs_s
                     try:
-                        p, _, _ = model.sample(bl_s, num_ensemble=20, use_curvature_score=True)
+                        p, _, _ = model.sample(bl_s, num_ensemble=n_ensemble,
+                                                ddim_steps=ddim_steps, use_curvature_score=True)
                         preds_t.append(p)
                         weights_t.append(2.0 if abs(sc - 1.0) < 1e-6 else 1.0)
                     except Exception:
@@ -321,7 +325,8 @@ def evaluate_ade_by_horizon(model, loader, device, use_tta: bool = False,
                 tw = sum(weights_t)
                 pred = sum(w / tw * p for w, p in zip(weights_t, preds_t))
             else:
-                pred, _, _ = model.sample(bl, num_ensemble=20, use_curvature_score=True)
+                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble,
+                                           ddim_steps=ddim_steps, use_curvature_score=True)
         except Exception as e:
             print(f"    batch {bi}: sample error, skipped ({e})")
             continue
@@ -549,6 +554,27 @@ def main():
                          "when enabled.")
     p.add_argument("--n_tta", type=int, default=5,
                     help="Number of TTA scales (max 5); only used when --use_tta is set.")
+    # [PATCH] Trước đây num_ensemble=20 bị hard-code trong 3 lời gọi
+    # model.sample() bên trong collect_attention_records() và
+    # evaluate_ade_by_horizon(), không đọc được từ dòng lệnh -- nghĩa
+    # là dù bảng so sánh chính (evaluate_multi_model.py) dùng K*,N* nào
+    # đã chọn từ sweep validation, XAI vẫn luôn chạy ở K=20 cố định,
+    # N=mặc định checkpoint. Thêm 2 flag dưới để đồng bộ XAI với đúng
+    # K*,N* đã chốt cho bảng chính -- nếu không truyền, giữ nguyên hành
+    # vi cũ (K=20, N=mặc định checkpoint) để không phá code cũ.
+    p.add_argument("--n_ensemble", type=int, default=20,
+                    help="K dùng cho MỌI lời gọi model.sample() trong file "
+                         "này (attention collection + ADE-by-horizon eval). "
+                         "PHẢI khớp K* đã chọn từ sweep validation "
+                         "(select_kn.py) để XAI nhất quán với bảng chính. "
+                         "Mặc định 20 = hành vi cũ trước khi vá.")
+    p.add_argument("--ddim_steps", type=int, default=None,
+                    help="N (số bước Euler ODE) dùng cho MỌI lời gọi "
+                         "model.sample() trong file này. Mặc định None = "
+                         "dùng N lưu sẵn trong checkpoint (hành vi cũ trước "
+                         "khi vá, KHÔNG phải N* đã chọn từ sweep -- PHẢI tự "
+                         "truyền N* tường minh nếu muốn nhất quán với bảng "
+                         "chính).")
     args = p.parse_args()
 
     device = torch.device(f"cuda:{args.gpu_num}" if torch.cuda.is_available() else "cpu")
@@ -605,7 +631,8 @@ def main():
         # 2) Cross-attention -- slow, optional.
         if not args.skip_attention:
             set_seed(args.seed)
-            attn_df = collect_attention_records(model, loader, device, args.turn_threshold_deg)
+            attn_df = collect_attention_records(model, loader, device, args.turn_threshold_deg,
+                                                 n_ensemble=args.n_ensemble, ddim_steps=args.ddim_steps)
             if not attn_df.empty:
                 attn_df["seed"] = seed_name
                 all_attn.append(attn_df)
@@ -617,7 +644,8 @@ def main():
         if not args.skip_ade_eval:
             set_seed(args.seed)
             ade_df = evaluate_ade_by_horizon(model, loader, device,
-                                              use_tta=args.use_tta, n_tta=args.n_tta)
+                                              use_tta=args.use_tta, n_tta=args.n_tta,
+                                              n_ensemble=args.n_ensemble, ddim_steps=args.ddim_steps)
             if not ade_df.empty:
                 ade_df["seed"] = seed_name
                 all_ade.append(ade_df)
