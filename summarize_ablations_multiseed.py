@@ -78,10 +78,28 @@ CHECKPOINT_PATTERNS = {
 
 def run_one_ablation(ablation_runner_path: str, name: str, pattern: str,
                       seeds: list, dataset_root: str, split: str,
-                      n_ensemble: int, output_dir: str) -> dict:
+                      n_ensemble: int, output_dir: str,
+                      use_tta: bool = False, n_tta: int = 5,
+                      use_curvature_score: bool = False,
+                      ddim_steps: int = None) -> dict:
     """Gọi ablation_runner.py --mode multi_seed cho 1 ablation, trả về
     dict aggregated (đã có sẵn cấu trúc mean/std đúng chuẩn từ
-    run_multi_seed trong ablation_runner.py)."""
+    run_multi_seed trong ablation_runner.py).
+
+    [ADD-TTA] use_tta/n_tta/use_curvature_score/ddim_steps được truyền
+    thẳng xuống ablation_runner.py's --mode multi_seed (đã patch để hỗ
+    trợ đúng 4 flag này, cùng tên/mặc định với evaluate_multi_model.py
+    -- xem ablation_runner.py's run_multi_seed() docstring). Trước khi
+    có patch này, mọi lệnh gọi từ hàm này đều CHẠY THIẾU TTA so với
+    bảng kết quả chính (multi_model_test.json, luôn được tạo bằng
+    --use_tta trong evaluate_multi_model.py), khiến 9 con số ablation +
+    dòng FULL không so sánh công bằng được với bảng chính -- cùng loại
+    lỗi apples-to-oranges đã tìm thấy và sửa ở evaluate_full.py's
+    k_n_joint_sweep(). Mặc định vẫn TẮT (use_tta=False) để không âm
+    thầm đổi hành vi của bất kỳ lệnh gọi cũ nào chưa truyền các tham
+    số này; bật qua --use_tta ở CLI của CHÍNH script này (xem main()
+    bên dưới) khi muốn ablation table khớp cấu hình với bảng chính.
+    """
     sub_out = os.path.join(output_dir, name)
     os.makedirs(sub_out, exist_ok=True)
     cmd = [
@@ -94,6 +112,12 @@ def run_one_ablation(ablation_runner_path: str, name: str, pattern: str,
         "--n_ensemble", str(n_ensemble),
         "--output_dir", sub_out,
     ]
+    if use_tta:
+        cmd += ["--use_tta", "--n_tta", str(n_tta)]
+    if use_curvature_score:
+        cmd += ["--use_curvature_score"]
+    if ddim_steps is not None:
+        cmd += ["--ddim_steps", str(ddim_steps)]
     print(f"\n{'='*70}\nAblation: {name}\n{'='*70}")
     print(" ".join(cmd))
     ret = subprocess.run(cmd, capture_output=False)
@@ -122,6 +146,35 @@ def main():
     ap.add_argument("--ablation_runner", required=True,
                      help="Đường dẫn tới ablation_runner.py")
     ap.add_argument("--output_dir", default="ablation_summary")
+    # [ADD-TTA] Same flag names/defaults as evaluate_multi_model.py and
+    # (now) ablation_runner.py's own CLI, passed straight through to
+    # run_one_ablation() -> ablation_runner.py's --mode multi_seed for
+    # every one of the 9 ablations + FULL. Default OFF (False/None) so
+    # existing invocations without these flags reproduce the exact same
+    # command lines as before this patch -- pass --use_tta here once to
+    # make every ablation in this run use the identical inference-time
+    # configuration as the main results table, rather than adding the
+    # flag separately to each of the 10 subprocess calls by hand.
+    ap.add_argument("--use_tta", action="store_true", default=False,
+                     help="Enable test-time augmentation for every "
+                          "ablation run (FM only), matching "
+                          "evaluate_multi_model.py's --use_tta and the "
+                          "main results table's configuration. Without "
+                          "this, ablation ADE/ATE/CTE are NOT directly "
+                          "comparable to a --use_tta main table.")
+    ap.add_argument("--n_tta", type=int, default=5,
+                     help="Number of TTA scales; only relevant with "
+                          "--use_tta.")
+    ap.add_argument("--use_curvature_score", action="store_true", default=False,
+                     help="Enable the 5th physics-score re-ranking "
+                          "component for every ablation run (FM only). "
+                          "Pure inference-time change, no retraining "
+                          "needed.")
+    ap.add_argument("--ddim_steps", type=int, default=None,
+                     help="Override ODE integration steps at inference "
+                          "for every ablation run (FM only). None "
+                          "(default) defers to each checkpoint's own "
+                          "trained value.")
     ap.add_argument("--full_name", default="FULL",
                      help="Tên hiển thị cho full model trong bảng so sánh "
                           "cuối (thường dùng lại 3 checkpoint FM chính, "
@@ -163,7 +216,10 @@ def main():
     for name, pattern in CHECKPOINT_PATTERNS.items():
         res = run_one_ablation(args.ablation_runner, name, pattern,
                                 args.seeds, args.dataset_root, args.split,
-                                args.n_ensemble, args.output_dir)
+                                args.n_ensemble, args.output_dir,
+                                use_tta=args.use_tta, n_tta=args.n_tta,
+                                use_curvature_score=args.use_curvature_score,
+                                ddim_steps=args.ddim_steps)
         if res:
             all_results[name] = res
 
