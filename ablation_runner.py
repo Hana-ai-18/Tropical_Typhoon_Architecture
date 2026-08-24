@@ -735,12 +735,43 @@ def summarize_ablations(ablation_dir: str) -> Dict:
 def run_multi_seed(checkpoint_pattern: str,
                    seeds: List[int],
                    loader, device,
-                   n_ensemble: int = 20) -> Dict:
+                   n_ensemble: int = 20,
+                   use_tta: bool = False,
+                   n_tta: int = 5,
+                   use_curvature_score: bool = False,
+                   ddim_steps: Optional[int] = None) -> Dict:
     """
     Evaluate model across multiple seeds and aggregate mean ± std.
     checkpoint_pattern: e.g. "runs/seed{seed}/best_model.pth"
+
+    [ADD-TTA, for parity with evaluate_multi_model.py's evaluate_one_model()]
+    Previously this function only ever called model.sample(bl,
+    num_ensemble=n_ensemble) on the raw observation window -- no TTA, no
+    curvature-score re-ranking, no ddim_steps override. That meant every
+    ablation number produced by this function (and therefore by
+    summarize_ablations_multiseed.py, which calls this via `--mode
+    multi_seed`) was NOT directly comparable to the main results table
+    (multi_model_test.json), which evaluate_multi_model.py's
+    evaluate_one_model() always produces WITH --use_tta -- an
+    apples-to-oranges gap of the same kind previously found and fixed in
+    evaluate_full.py's k_n_joint_sweep() (see that function's docstring
+    for the confirmed ~3-4 km ADE effect size of this exact mismatch).
+    The TTA procedure below is copied verbatim from
+    evaluate_multi_model.py's evaluate_one_model() (itself ported from
+    train_flowmatching.py's evaluate()): scales the observation window's
+    trajectory around its last point by [0.875, 0.9375, 1.0, 1.0625,
+    1.125], samples FM on each scale, and averages with the unscaled
+    (1.0) prediction weighted 2x relative to each scaled variant.
+    use_curvature_score and ddim_steps are likewise plumbed through
+    unchanged, so ablation runs can be configured with the EXACT same
+    inference-time settings as the main table -- pass
+    --use_tta/--n_tta/--use_curvature_score/--ddim_steps through to this
+    function's caller in main() to enable them (all default to the
+    previous, TTA-off behavior, so this is opt-in and does not silently
+    change any already-reported numbers).
     """
     seed_results = []
+    tta_scales = [0.875, 0.9375, 1.0, 1.0625, 1.125][:n_tta]
     for seed in seeds:
         ck_path = checkpoint_pattern.format(seed=seed)
         if not os.path.exists(ck_path):
@@ -758,8 +789,31 @@ def run_multi_seed(checkpoint_pattern: str,
             for batch in loader:
                 bl = [x.to(device) if torch.is_tensor(x) else x for x in batch]
                 gt = bl[1]
+                obs = bl[0]
                 try:
-                    pred, _, _ = model.sample(bl, num_ensemble=n_ensemble)
+                    if use_tta:
+                        anchor = obs[-1:, :, :2].detach()
+                        preds_t, weights_t = [], []
+                        for sc in tta_scales:
+                            obs_s = obs.clone()
+                            obs_s[..., :2] = anchor + (obs[..., :2] - anchor) * sc
+                            bl_s = list(bl); bl_s[0] = obs_s
+                            try:
+                                p, _, _ = model.sample(bl_s, num_ensemble=n_ensemble,
+                                                        ddim_steps=ddim_steps,
+                                                        use_curvature_score=use_curvature_score)
+                                preds_t.append(p)
+                                weights_t.append(2.0 if abs(sc - 1.0) < 1e-6 else 1.0)
+                            except Exception:
+                                continue
+                        if not preds_t:
+                            continue
+                        tw = sum(weights_t)
+                        pred = sum(w / tw * p for w, p in zip(weights_t, preds_t))
+                    else:
+                        pred, _, _ = model.sample(bl, num_ensemble=n_ensemble,
+                                                   ddim_steps=ddim_steps,
+                                                   use_curvature_score=use_curvature_score)
                 except Exception:
                     continue
                 T   = min(pred.shape[0], gt.shape[0])
@@ -891,6 +945,44 @@ def main():
     p.add_argument("--dataset_root",      type=str, default=None)
     p.add_argument("--split",             default="test")
     p.add_argument("--n_ensemble",        type=int, default=20)
+    # [ADD-TTA] Same flags, same names, same defaults as
+    # evaluate_multi_model.py's CLI, so a single copy-pasted invocation
+    # (e.g. from a shell history or a paper's reproducibility appendix)
+    # works unchanged against either script. All four default to the
+    # previous behavior (TTA off, curvature score off, checkpoint's own
+    # trained ddim_steps) -- pass them explicitly to make ablation runs
+    # match the main results table's inference-time configuration; see
+    # run_multi_seed()'s docstring for why this matters for --mode
+    # multi_seed specifically.
+    p.add_argument("--use_tta", action="store_true", default=False,
+                   help="FM-only, --mode multi_seed only. Enables the same "
+                        "test-time augmentation evaluate_multi_model.py's "
+                        "evaluate_one_model() uses when --use_tta is passed "
+                        "there (5 observation-window scales, 1.0 scale "
+                        "weighted 2x) -- pass this to make ablation ADE/ATE/"
+                        "CTE directly comparable to the main results table, "
+                        "which is always produced with --use_tta on. "
+                        "Without this flag, ablation numbers reflect a "
+                        "single unscaled pass only (previous behavior, "
+                        "unchanged) and are NOT directly comparable to a "
+                        "--use_tta main table.")
+    p.add_argument("--n_tta", type=int, default=5,
+                   help="Number of TTA scales to use (max 5); only "
+                        "relevant when --use_tta is set. Same default as "
+                        "evaluate_multi_model.py.")
+    p.add_argument("--use_curvature_score", action="store_true", default=False,
+                   help="FM-only, --mode multi_seed only. Enables the 5th "
+                        "physics-score re-ranking component (whole-path "
+                        "turning-rate match) in model.sample() -- pure "
+                        "inference-time change, no retraining needed. Same "
+                        "flag/default as evaluate_multi_model.py.")
+    p.add_argument("--ddim_steps", type=int, default=None,
+                   help="FM-only, --mode multi_seed only. Overrides the "
+                        "number of ODE integration steps at inference. "
+                        "None (default) defers to each checkpoint's own "
+                        "trained n_inference_steps, matching previous "
+                        "behavior. Same flag/default as "
+                        "evaluate_multi_model.py.")
     p.add_argument("--variant",           type=str, default="full",
                    choices=list(ABLATION_VARIANTS.keys()))
     p.add_argument("--output_dir",        type=str, default="ablations")
@@ -980,8 +1072,18 @@ def main():
     if args.mode == "multi_seed":
         if args.checkpoint_pattern is None:
             print("  ERROR: --checkpoint_pattern required"); return
+        # [ADD-TTA] Pass through --use_tta/--n_tta/--use_curvature_score/
+        # --ddim_steps to run_multi_seed(), for exact parity with
+        # evaluate_multi_model.py's evaluate_one_model() -- see that
+        # function's call site (main()'s use_tta=args.use_tta, ...) and
+        # run_multi_seed()'s own docstring above for the full rationale.
+        # All four default to the previous (TTA-off) behavior, so
+        # existing invocations without these flags are unaffected.
         result = run_multi_seed(args.checkpoint_pattern, args.seeds,
-                                 loader, device, args.n_ensemble)
+                                 loader, device, args.n_ensemble,
+                                 use_tta=args.use_tta, n_tta=args.n_tta,
+                                 use_curvature_score=args.use_curvature_score,
+                                 ddim_steps=args.ddim_steps)
         out_path = os.path.join(args.output_dir, "multi_seed_results.json")
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
