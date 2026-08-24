@@ -945,8 +945,34 @@ def main():
         print("  ERROR: --dataset_root required"); return
 
     import argparse as _ap
+    # [FIX obs_len AttributeError] The Namespace built here previously had
+    # ONLY dataset_root set (see the old one-liner this replaces), so
+    # data_loader()'s internal `args.obs_len` access raised
+    # "AttributeError: 'Namespace' object has no attribute 'obs_len'" for
+    # EVERY --mode multi_seed run (this is exactly the failure seen in
+    # summarize_ablations_multiseed.py's "Lệnh thất bại" output for all
+    # 10/10 ablations -- checkpoints and the sweep logic itself were never
+    # the problem, only this one Namespace was incomplete). The correct,
+    # complete field list is already used correctly elsewhere in this
+    # same file (see run_ode_steps_sweep_multi_seed()'s _loader_args a
+    # few hundred lines above, and evaluate_full.py's
+    # run_ensemble_ablation_multi_seed(), which this mirrors exactly) --
+    # this was simply not applied to this second call site. No retraining
+    # or checkpoint changes are needed; this is purely a data-loading
+    # Namespace bug.
+    _loader_args = _ap.Namespace(
+        dataset_root = args.dataset_root,
+        obs_len      = 8,
+        pred_len     = 12,
+        batch_size   = 64,
+        num_workers  = 2,
+        test_year    = getattr(args, "test_year", None),
+        skip         = getattr(args, "skip", 1),
+        min_ped      = getattr(args, "min_ped", 1),
+        threshold    = getattr(args, "threshold", 0.002),
+    )
     _, loader = data_loader(
-        _ap.Namespace(dataset_root=args.dataset_root),
+        _loader_args,
         {"root": args.dataset_root, "type": args.split}, test=True)
     print(f"  Data: {len(loader)} batches ({args.split})")
 
