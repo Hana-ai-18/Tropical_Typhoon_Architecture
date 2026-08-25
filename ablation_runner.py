@@ -447,6 +447,19 @@ def ode_steps_sweep(model, loader, device,
         by_lt_spread = defaultdict(list)
         t_start = time.time()
         tta_scales = [0.875, 0.9375, 1.0, 1.0625, 1.125][:n_tta]
+        # [FIX-OBSERVABILITY] Truoc patch nay, KHONG CO dong print nao
+        # xac nhan use_tta/use_curvature_score dang duoc dung that trong
+        # ham nay -- nguoi goi (dung CLI --use_tta) khong co cach nao tu
+        # log biet duoc gia tri nay co thuc su toi day hay khong, phai
+        # doc code moi biet. In ro rang MOT LAN duy nhat (chi o N dau
+        # tien trong steps_list, tranh spam) de xac nhan cau hinh that
+        # dang chay, dung kieu evaluate_full.py's k_n_joint_sweep() da
+        # lam ("k_n_joint_sweep config: use_tta=...").
+        if n_steps == steps_list[0]:
+            print(f"    ode_steps_sweep config: use_tta={use_tta} "
+                  f"(n_tta={n_tta})  use_curvature_score={use_curvature_score}  "
+                  f"n_ensemble={n_ensemble}")
+        n_batches_tta_failed = 0
 
         for batch in loader:
             bl = [x.to(device) if torch.is_tensor(x) else x for x in batch]
@@ -469,6 +482,7 @@ def ode_steps_sweep(model, loader, device,
                     obs = bl[0]
                     anchor = obs[-1:, :, :2].detach()
                     preds_t, weights_t, all_t = [], [], None
+                    tta_errs = []
                     for sc in tta_scales:
                         obs_s = obs.clone()
                         obs_s[..., :2] = anchor + (obs[..., :2] - anchor) * sc
@@ -480,9 +494,23 @@ def ode_steps_sweep(model, loader, device,
                             weights_t.append(2.0 if abs(sc - 1.0) < 1e-6 else 1.0)
                             if abs(sc - 1.0) < 1e-6:
                                 all_t = at
-                        except Exception:
+                        except Exception as e_sc:
+                            # [FIX-OBSERVABILITY] Truoc patch, loi o day
+                            # bi NUOT HOAN TOAN (except: continue, khong
+                            # print) -- neu loi xay ra o MOI scale cua
+                            # MOI batch, toan bo sweep van "chay xong"
+                            # khong bao loi gi, chi la ket qua sai/rong,
+                            # dung dieu ban da quan sat ("ket qua van
+                            # nhu cu"). Gio luu lai loi de bao cao it
+                            # nhat 1 lan neu no thuc su xay ra.
+                            tta_errs.append(str(e_sc))
                             continue
                     if not preds_t:
+                        n_batches_tta_failed += 1
+                        if n_batches_tta_failed <= 3:
+                            print(f"    ⚠ TTA thất bại ở TOÀN BỘ {len(tta_scales)} scale "
+                                  f"cho 1 batch (N={n_steps}). Lỗi mẫu: "
+                                  f"{tta_errs[0] if tta_errs else '(không rõ)'}")
                         raw.n_inference_steps = orig_steps
                         continue
                     tw = sum(weights_t)
@@ -543,6 +571,19 @@ def ode_steps_sweep(model, loader, device,
                         by_lt_spread[step0 + 1].append(float(dab.mean()))
 
         elapsed = time.time() - t_start
+        # [FIX-OBSERVABILITY] Bao cao ro rang neu TTA bi fail o nhieu
+        # batch -- neu n_batches_tta_failed == tong so batch, nghia la
+        # KET QUA N NAY RONG/SAI HOAN TOAN va nguoi dung se thay ADE/ATE/
+        # CTE toan NaN hoac gia tri cu (n/a) o output cuoi, dung dieu
+        # "van nhu cu" da quan sat -- truoc patch nay khong co dong nao
+        # canh bao dieu do, chi lang le tra ve list rong.
+        if use_tta and n_batches_tta_failed > 0:
+            print(f"    ⚠ N={n_steps}: TTA thất bại hoàn toàn ở "
+                  f"{n_batches_tta_failed} batch (trong tổng batch của "
+                  f"loader). Nếu số này bằng đúng tổng số batch, ADE/ATE/"
+                  f"CTE của N={n_steps} SẼ RỖNG hoặc NaN -- kiểm tra "
+                  f"model.sample() có nhận đúng use_curvature_score và "
+                  f"cấu trúc bl_s (list, obs ở index 0) không.")
         by_lead_time = {}
         all_lts = sorted(set(by_lt_ade.keys()) | set(by_lt_ate.keys())
                          | set(by_lt_cte.keys()) | set(by_lt_spread.keys()))
