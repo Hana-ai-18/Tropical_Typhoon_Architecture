@@ -691,11 +691,33 @@ def run_ode_steps_sweep_multi_seed(checkpoints: List[str], dataset_root: str,
 
         if not getattr(args, "no_ema", False) and ck.get("ema"):
             try:
-                ema = EMAModel(model)
+                # [FIX EMA NEVER APPLIED — CRITICAL BUG] Truoc patch nay,
+                # code chi copy trong so EMA vao EMAModel(model).shadow
+                # (mot dict RIENG, tach biet hoan toan khoi model that),
+                # roi KHONG BAO GIO goi ema.apply_to(model) de day no vao
+                # model.state_dict() that -- xem EMAModel class trong
+                # flow_matching_model.py: __init__ chi tao self.shadow,
+                # apply_to() moi la buoc THAT SU ghi de trong so vao model.
+                # Hau qua: model VAN CHAY VOI TRONG SO RAW (chua qua EMA)
+                # o moi noi dung EMAModel kieu nay trong ablation_runner.py,
+                # trong khi evaluate_multi_model.py/analyze_attention_xai.py
+                # (da dung dung tu dau) copy THANG vao model.state_dict(),
+                # khong qua EMAModel class nao ca. Day chinh la nguyen nhan
+                # seed2 (checkpoint EMA, khong phai SWA) luon lech nang nhat
+                # so voi evaluate_multi_model.py (~7-8km ADE), trong khi
+                # seed0/seed1 (checkpoint SWA, khong can buoc EMA nao) gan
+                # nhu khop hoan toan -- da xac nhan qua so lieu that. Sua
+                # theo dung cach evaluate_multi_model.py's load_fm() lam:
+                # copy TRUC TIEP vao model.state_dict(), KHONG dung
+                # EMAModel class.
+                sd = model.state_dict()
+                applied = 0
                 for k, v in ck["ema"].items():
-                    if k in ema.shadow:
-                        ema.shadow[k].copy_(v.to(device))
-                print(f"  EMA loaded ({len(ema.shadow)} params)")
+                    if k in sd:
+                        sd[k].copy_(v.to(device))
+                        applied += 1
+                print(f"  ✓ Applied EMA shadow weights ({applied} tensors) — "
+                      f"matches training-time eval convention.")
             except Exception as e:
                 print(f"  ⚠ EMA failed: {e}")
         elif ck.get("is_swa", False):
@@ -919,11 +941,22 @@ def run_multi_seed(checkpoint_pattern: str,
         # day, giong het 2 noi kia, de dam bao seed2 duoc load dung.
         if ck.get("ema") and not ck.get("is_swa", False):
             try:
-                ema = EMAModel(model)
+                # [FIX EMA NEVER APPLIED — CRITICAL BUG, same root cause as
+                # run_ode_steps_sweep_multi_seed() above] EMAModel(model).shadow
+                # is a dict SEPARATE from model.state_dict() -- copying
+                # checkpoint weights into .shadow without ever calling
+                # ema.apply_to(model) means the model keeps running on its
+                # RAW (pre-EMA) weights. Fixed to copy directly into
+                # model.state_dict(), matching evaluate_multi_model.py's
+                # load_fm() exactly (no EMAModel class involved there).
+                sd = model.state_dict()
+                applied = 0
                 for k, v in ck["ema"].items():
-                    if k in ema.shadow:
-                        ema.shadow[k].copy_(v.to(device))
-                print(f"    EMA loaded ({len(ema.shadow)} params) for seed {seed}")
+                    if k in sd:
+                        sd[k].copy_(v.to(device))
+                        applied += 1
+                print(f"    ✓ Applied EMA shadow weights ({applied} tensors) for seed {seed} — "
+                      f"matches training-time eval convention.")
             except Exception as e:
                 print(f"    ⚠ EMA failed for seed {seed}: {e}")
         elif ck.get("is_swa", False):
