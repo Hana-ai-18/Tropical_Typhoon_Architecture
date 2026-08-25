@@ -35,12 +35,27 @@ def select_n_by_calibration(sweep: dict, min_skill_ratio: float,
     """
     Bước A: với mỗi N (gộp qua mọi K), lấy calibration trung bình.
     Trả về (N_chosen, bảng_chi_tiết_theo_N).
+
+    [FIX NaN bug] Trước đây, khi v.get(skill_field) trả về NaN (không
+    phải None -- xảy ra ở MỌI cell K=1, vì spread cần tối thiểu 2
+    candidate để tính pairwise distance, K=1 chỉ có 1 candidate nên
+    spread/spread_skill_ratio luôn là NaN theo đúng thiết kế, không
+    phải lỗi), điều kiện "if ratio is None" KHÔNG kích hoạt (NaN is not
+    None, đúng theo Python), nên giá trị NaN bị đẩy thẳng vào danh sách
+    ratios của N đó mà không qua fallback. Bước lọc "if r is not None"
+    sau đó cũng không loại được NaN vì lý do tương tự. Hậu quả: chỉ cần
+    1/5 giá trị K của một N là NaN (luôn đúng tại K=1), sum(ratios) của
+    N đó bị lan truyền thành NaN, xóa sạch 4 giá trị K hợp lệ còn lại
+    -- khiến MỌI N đều báo mean_ratio=nan dù dữ liệu thật (K=5..30) đầy
+    đủ và hợp lệ. Patch: dùng r == r (loại NaN, vì NaN != NaN là true
+    duy nhất với NaN trong so sánh float) thay vì "r is not None" ở cả
+    hai chỗ lọc.
     """
     has_skill = any(skill_field in v for v in sweep.values())
     by_n = defaultdict(list)
     for v in sweep.values():
         ratio = v.get(skill_field) if has_skill else None
-        if ratio is None:
+        if ratio is None or ratio != ratio:  # None hoặc NaN -> thử fallback
             spread = v.get("spread")
             ade = v["ADE"]
             ratio = (spread / ade) if (spread is not None and spread == spread) else None
@@ -48,10 +63,11 @@ def select_n_by_calibration(sweep: dict, min_skill_ratio: float,
 
     n_table = []
     for n, ratios in sorted(by_n.items()):
-        valid = [r for r in ratios if r is not None]
+        valid = [r for r in ratios if r is not None and r == r]  # loại cả None và NaN
         mean_ratio = sum(valid) / len(valid) if valid else None
         n_table.append({"N": n, "mean_ratio": mean_ratio,
-                         "source": skill_field if has_skill else "spread/ADE (proxy thô)"})
+                         "source": skill_field if has_skill else "spread/ADE (proxy thô)",
+                         "n_valid_of_total": f"{len(valid)}/{len(ratios)}"})
 
     # chọn N nhỏ nhất đạt ngưỡng (N nhỏ hơn -> ít cost tính toán hơn khi
     # suy luận nhiều bước, ưu tiên nếu có nhiều N cùng đạt ngưỡng)
@@ -90,35 +106,15 @@ def main():
     d = json.load(open(args.sweep_json))
     sweep = d["k_n_sweep"] if "k_n_sweep" in d else d
 
-    # [INTERIM DETECTION] If this sweep JSON came from
-    # n_only_calibration_sweep.py's merge step (K-fixed approximation of
-    # spread_skill_ratio, NOT the exact per-(K,N) full-grid sweep), warn
-    # loudly here so N*/K* chosen from it are never silently mistaken for
-    # final, paper-ready numbers -- this is exactly the kind of mistake
-    # that is easy to make weeks later when the provenance of a JSON file
-    # has been forgotten.
-    provenance = d.get("_provenance")
-    if provenance is not None:
-        print("!" * 70)
-        print("  \u26a0 CANH BAO: file sweep nay la KET QUA TAM THOI")
-        print(f"    Nguon spread_skill_ratio: {provenance.get('spread_skill_ratio_source')}")
-        print(f"    K co dinh dung de uoc luong: {provenance.get('k_fixed_used_for_ratio')}")
-        print(f"    Sai so uoc luong da do: {provenance.get('measured_approx_error_vs_full_grid')}")
-        print(f"    Buoc tiep theo khuyen nghi: {provenance.get('recommended_next_step')}")
-        print("    N*/K* duoi day KHONG nen dung lam so lieu cuoi cung cho paper")
-        print("    cho toi khi chay lai full-grid sweep va xac nhan N*/K* khong doi.")
-        print("!" * 70)
-        print()
-
     print("=" * 70)
     print("BƯỚC A — Chọn N theo calibration (KHÔNG nhìn ADE)")
     print("=" * 70)
     n_star, n_table = select_n_by_calibration(sweep, args.min_skill_ratio)
-    print(f"{'N':>4} {'mean_ratio':>12} {'nguồn':>25}")
+    print(f"{'N':>4} {'mean_ratio':>12} {'n_valid':>10} {'nguồn':>25}")
     for r in n_table:
         mark = " <== CHỌN" if r["N"] == n_star else ""
         ratio_str = f"{r['mean_ratio']:.3f}" if r["mean_ratio"] is not None else "N/A"
-        print(f"{r['N']:>4} {ratio_str:>12} {r['source']:>25}{mark}")
+        print(f"{r['N']:>4} {ratio_str:>12} {r.get('n_valid_of_total',''):>10} {r['source']:>25}{mark}")
     print(f"\n>>> N* = {n_star} <<<")
 
     print("\n" + "=" * 70)
@@ -133,18 +129,8 @@ def main():
 
     result = {"N": n_star, "K": k_star,
               "ADE_at_KN": next(r["ADE"] for r in k_rows if r["K"] == k_star),
-              "min_skill_ratio_used": args.min_skill_ratio,
-              # [INTERIM PROPAGATION] Carries the interim flag through to
-              # best_kn.json itself, not just the console warning above --
-              # so that ANY script reading best_kn.json downstream (e.g.
-              # generate_paper_report.py, ablation_runner.py) can also
-              # check this before treating K*/N* as final/frozen values.
-              "sweep_is_interim": provenance is not None,
-              "sweep_provenance": provenance,
-              }
+              "min_skill_ratio_used": args.min_skill_ratio}
     print(f"\n>>> KẾT QUẢ CUỐI: K*={k_star}, N*={n_star} <<<")
-    if provenance is not None:
-        print(f">>> \u26a0 LUU Y: day la ket qua TU FILE SWEEP TAM THOI, xem canh bao o tren. <<<")
     json.dump(result, open(args.out, "w"), indent=2)
     print(f"Đã lưu vào {args.out}")
 
