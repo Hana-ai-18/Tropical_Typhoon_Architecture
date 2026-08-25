@@ -30,6 +30,84 @@ import argparse
 from collections import defaultdict
 
 
+def plot_ssr_saturation(sweep: dict, n_table: list, min_skill_ratio: float,
+                         out_pdf: str, skill_field: str = "spread_skill_ratio"):
+    """
+    [NEW] Vẽ và xuất PDF đường cong SSR theo N (mean qua moi K > 1, dung
+    dung du lieu n_table da tinh o Buoc A), kem duong ngoai suy bao hoa
+    SSR(N) = a - b/N va nguong min_skill_ratio, de tra loi truc quan cau
+    hoi "K,N cang lon co dat nguong khong". Day la ban tich hop truc tiep
+    vao pipeline chay tren Kaggle (khong can chay rieng script ve nhu
+    truoc), goi tu dong moi lan select_kn.py chay xong Buoc A -- khong
+    lam gian doan hay thay doi logic chon N*/K* o Buoc A/B, chi la mot
+    buoc xuat bao cao truc quan bo sung o cuoi.
+
+    An toan neu matplotlib/numpy khong co san (vi du moi truong Kaggle
+    thieu goi, hoac --no_plot duoc bat): in canh bao va bo qua, KHONG
+    lam crash toan bo select_kn.py -- viec chon N*/K* la buoc bat buoc,
+    con ve PDF chi la bao cao bo sung.
+    """
+    try:
+        import numpy as np
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        print(f"  ⚠ Không vẽ được biểu đồ SSR-vs-N (thiếu thư viện: {e}). "
+              f"Bỏ qua bước này, không ảnh hưởng tới việc chọn N*/K* ở trên.")
+        return
+
+    valid_rows = [(r["N"], r["mean_ratio"]) for r in n_table
+                  if r["mean_ratio"] is not None]
+    if len(valid_rows) < 3:
+        print(f"  ⚠ Không đủ điểm N hợp lệ (cần >=3, có {len(valid_rows)}) "
+              f"để fit đường ngoại suy SSR(N)=a-b/N. Bỏ qua vẽ biểu đồ.")
+        return
+
+    Ns_arr = np.array([r[0] for r in valid_rows], dtype=float)
+    ssr_arr = np.array([r[1] for r in valid_rows], dtype=float)
+
+    # Fit SSR(N) = a - b/N bằng bình phương tối thiểu tuyến tính theo 1/N
+    X = np.vstack([np.ones_like(Ns_arr), 1.0 / Ns_arr]).T
+    coef, *_ = np.linalg.lstsq(X, ssr_arr, rcond=None)
+    a, neg_b = coef
+
+    n_max_extrap = max(2000, int(Ns_arr.max()) * 50)
+    N_extrap = np.linspace(Ns_arr.min(), n_max_extrap, 500)
+    ssr_extrap = a - neg_b / N_extrap
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    ax.plot(N_extrap, ssr_extrap, "--", color="steelblue", alpha=0.6,
+            linewidth=1.5, label=r"Extrapolated fit: SSR($N$) $\approx a - b/N$")
+    ax.plot(Ns_arr, ssr_arr, "o-", color="steelblue", markersize=7,
+            linewidth=2, label=f"Observed mean {skill_field} (across K>1)")
+    ax.axhline(a, color="gray", linestyle=":", linewidth=1.5,
+               label=f"Extrapolated ceiling as $N\\to\\infty$: {a:.3f}")
+    ax.axhline(min_skill_ratio, color="crimson", linestyle="-", linewidth=2,
+               label=f"min_skill_ratio threshold = {min_skill_ratio}")
+    if a < min_skill_ratio:
+        ax.fill_between(N_extrap, ssr_extrap, min_skill_ratio,
+                        where=(ssr_extrap < min_skill_ratio),
+                        color="crimson", alpha=0.08)
+        title_note = "SSR saturates below threshold -- not reachable by increasing N alone"
+    else:
+        title_note = "SSR is expected to reach threshold at large enough N"
+    ax.set_xscale("log")
+    ax.set_xlabel("ODE integration steps $N$ (log scale)")
+    ax.set_ylabel(skill_field)
+    ax.set_title(f"{skill_field} vs. $N$, extrapolated\n{title_note}")
+    ax.set_ylim(0, max(0.6, min_skill_ratio * 1.2, ssr_arr.max() * 1.3))
+    ax.set_xlim(Ns_arr.min(), n_max_extrap)
+    ax.legend(loc="best", fontsize=8.5, framealpha=0.9)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_pdf, dpi=150)
+    plt.close(fig)
+    print(f"  Đã lưu biểu đồ SSR-vs-N (ngoại suy tới N={n_max_extrap}) -> {out_pdf}")
+    print(f"  Trần ngoại suy khi N->vô cùng: {a:.4f} "
+          f"({'THẤP HƠN' if a < min_skill_ratio else 'CAO HƠN'} ngưỡng {min_skill_ratio})")
+
+
 def select_n_by_calibration(sweep: dict, min_skill_ratio: float,
                              skill_field: str = "spread_skill_ratio") -> tuple:
     """
@@ -101,6 +179,14 @@ def main():
                           "trên phân tích riêng, không dùng mù giá trị "
                           "mặc định.")
     ap.add_argument("--out", default="best_kn.json")
+    ap.add_argument("--out_plot", default=None,
+                     help="[NEW] Đường dẫn file PDF xuất biểu đồ SSR-vs-N "
+                          "(ngoại suy, xem plot_ssr_saturation()). Mặc định "
+                          "None = tự đặt tên <out không có đuôi>_ssr_plot.pdf "
+                          "cạnh --out. Dùng --no_plot để tắt hẳn bước này.")
+    ap.add_argument("--no_plot", action="store_true", default=False,
+                     help="Tắt bước xuất biểu đồ SSR-vs-N, chỉ chạy Bước A/B "
+                          "và lưu best_kn.json như trước (bản chưa có vẽ).")
     args = ap.parse_args()
 
     d = json.load(open(args.sweep_json))
@@ -116,6 +202,13 @@ def main():
         ratio_str = f"{r['mean_ratio']:.3f}" if r["mean_ratio"] is not None else "N/A"
         print(f"{r['N']:>4} {ratio_str:>12} {r.get('n_valid_of_total',''):>10} {r['source']:>25}{mark}")
     print(f"\n>>> N* = {n_star} <<<")
+
+    if not args.no_plot:
+        out_plot = args.out_plot
+        if out_plot is None:
+            base = args.out[:-5] if args.out.endswith(".json") else args.out
+            out_plot = f"{base}_ssr_plot.pdf"
+        plot_ssr_saturation(sweep, n_table, args.min_skill_ratio, out_plot)
 
     print("\n" + "=" * 70)
     print(f"BƯỚC B — Với N*={n_star} cố định, chọn K theo ADE thấp nhất")

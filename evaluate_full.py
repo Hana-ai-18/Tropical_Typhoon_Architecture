@@ -1028,6 +1028,29 @@ def k_n_joint_sweep(model, loader, device,
     numbers is actually the jointly-optimal point rather than a
     reasonable-looking pair of independently-chosen defaults.
 
+    [DELIBERATE DESIGN CHOICE, NOT AN OVERSIGHT] Each (K,N) cell below
+    calls model.sample(bl, num_ensemble=k, ...) INDEPENDENTLY -- it does
+    NOT reuse a single K=max(k_values) call and then subset the first k
+    candidates to save compute for smaller K. This was considered and
+    rejected: sample()'s internal re-ranking (top-3 by physics score,
+    softmax-temperature-weighted average -- see TCFlowMatching.sample()'s
+    own docstring) depends on the FULL candidate pool passed to it, so a
+    "subset of a K=30 call" does not reproduce the same top-3 selection,
+    scores, or weighted average as an actual sample(num_ensemble=k) call
+    at that k would -- the two are only approximately equal, with an
+    approximation error that would need separate verification at every
+    K, N pair to bound. Given that this sweep's numbers may end up
+    reported in the paper (used to freeze K*, N* for every other table),
+    the ~5x slower but numerically EXACT per-cell independent-sampling
+    approach here is preferred over a faster approximation whose error
+    has not been characterized. If a faster PRELIMINARY sweep is needed
+    (e.g. to get a first N* estimate before committing to a multi-hour
+    full run), use n_only_calibration_sweep.py instead, which is
+    explicitly labeled as a K-fixed approximation for exactly this
+    reason -- see that script's own docstring for its measured
+    approximation error (<0.8% on spread, verified from an earlier
+    K,N sweep's raw output before being adopted as the interim method).
+
     [BUG FOUND AND FIXED] The first version of this function called
     model.sample(bl, num_ensemble=k) with NEITHER test-time augmentation
     NOR use_curvature_score=True -- both of which the project's main
@@ -1067,8 +1090,13 @@ def k_n_joint_sweep(model, loader, device,
     Compute cost is O(len(k_values) x len(n_values) x len(loader) x
     (n_tta if use_tta else 1)) -- with the default 5x7=35 cells and
     use_tta=True (5x), expect roughly 175x a single ensemble_size_eval()
-    call's runtime. Print progress per cell so a long-running sweep's
-    status is visible.
+    call's runtime. With the paper's actual 5x9=45-cell grid (measured
+    on real hardware, see KXN_SWEEP.txt), a single seed took ~2.5-4.5
+    hours depending on K,N (per-cell time_s ranges from ~55s at K=1,N=1
+    to ~1100s at K=30,N=30, growing roughly linearly in K*N); across 3
+    seeds this is the multi-hour run that motivated the interim,
+    K-fixed n_only_calibration_sweep.py approach above. Print progress
+    per cell so a long-running sweep's status is visible.
     """
     model.eval()
     raw = _unwrap(model)
@@ -1322,6 +1350,13 @@ def run_k_n_joint_sweep_multi_seed(checkpoints: List[str], dataset_root: str,
                 print(f"  EMA loaded ({len(ema.shadow)} params)")
             except Exception as e:
                 print(f"  ⚠ EMA failed: {e}")
+        elif resolved_type == "fm" and ck.get("is_swa", False):
+            # [FIX SWA-vs-EMA mismatch] xem giai thich chi tiet trong
+            # run_k_n_joint_sweep_multi_seed() (ham dau tien duoc patch);
+            # nhanh nay chi bo sung log minh bach, khong doi logic load
+            # trong so (da dung tu state_dict() o tren).
+            print(f"  ℹ Checkpoint is an SWA average (is_swa=True) — "
+                  f"ck['model'] IS the SWA running average, no separate EMA applied.")
 
         seed = _infer_seed_local(ckpt_path, ck)
         print(f"  seed={seed}  epoch={ck.get('epoch', '?')}  model_type={resolved_type}")
@@ -1465,6 +1500,13 @@ def run_ensemble_ablation_multi_seed(checkpoints: List[str], dataset_root: str,
                 print(f"  EMA loaded ({len(ema.shadow)} params)")
             except Exception as e:
                 print(f"  ⚠ EMA failed: {e}")
+        elif resolved_type == "fm" and ck.get("is_swa", False):
+            # [FIX SWA-vs-EMA mismatch] xem giai thich chi tiet trong
+            # run_k_n_joint_sweep_multi_seed() (ham dau tien duoc patch);
+            # nhanh nay chi bo sung log minh bach, khong doi logic load
+            # trong so (da dung tu state_dict() o tren).
+            print(f"  ℹ Checkpoint is an SWA average (is_swa=True) — "
+                  f"ck['model'] IS the SWA running average, no separate EMA applied.")
 
         seed = _infer_seed_local(ckpt_path, ck)
         print(f"  seed={seed}  epoch={ck.get('epoch', '?')}  model_type={resolved_type}")
@@ -1894,6 +1936,13 @@ def main():
             print(f"  EMA loaded ({len(ema.shadow)} params)")
         except Exception as e:
             print(f"  ⚠ EMA failed: {e}"); ema = None
+    elif resolved_type == "fm" and ck.get("is_swa", False):
+        # [FIX SWA-vs-EMA mismatch] xem giải thích chi tiết trong
+        # run_k_n_joint_sweep_multi_seed(); nhánh này chỉ bổ sung log
+        # minh bạch, không đổi logic load trọng số (đã đúng từ
+        # state_dict() ở trên).
+        print(f"  ℹ Checkpoint is an SWA average (is_swa=True) — "
+              f"ck['model'] IS the SWA running average, no separate EMA applied.")
 
     # ── Data ───────────────────────────────────────────────────────────────
     import argparse as _ap
