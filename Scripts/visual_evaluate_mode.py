@@ -57,13 +57,25 @@ STYLE = dict(
     grid_alpha    = 0.5,
     error_color   = "#B8860B",   # dark goldenrod — đọc được trên nền trắng
     title_pad     = 14,
-    cone_50_fill  = "#D62728",
-    cone_90_fill  = "#1F77B4",
-    cone_50_alpha = 0.18,
-    cone_90_alpha = 0.10,
-    cone_edge_lw  = 1.2,
+    # [RESTYLE — NCHMF cone colors] Đổi từ đỏ/xanh dương (dễ nhầm với
+    # pred_color/gt_color đang dùng đúng 2 màu này cho TRACK, gây trùng
+    # màu track/cone) sang đúng tông tím/xanh lá của bản đồ "TIN BAO
+    # KHAN CAP" chuẩn NCHMF: vùng ngoài (90%, "gió mạnh có thể xảy ra")
+    # màu tím nhạt, vùng trong (50%, "tâm bão/ATNĐ có thể đi qua") màu
+    # xanh lá -- đúng thứ tự lồng nhau (90% bao ngoài 50%) như ảnh mẫu.
+    cone_50_fill  = "#5FA85F",   # xanh lá — vùng tâm bão/ATNĐ có thể qua (50%)
+    cone_90_fill  = "#B08FD0",   # tím nhạt — vùng có thể có gió mạnh (90%)
+    cone_50_alpha = 0.45,
+    cone_90_alpha = 0.35,
+    cone_edge_lw  = 0.0,         # [RESTYLE] bỏ viền đứt nét quanh cone --
+                                  # ảnh mẫu NCHMF dùng vùng tô mượt, không
+                                  # có đường biên rời rạc; viền đứt nét
+                                  # trước đây là nguồn gây "rối mắt" đã
+                                  # phản hồi, nay bỏ luôn cả 2 lớp 50%/90%.
     text_color    = "#000000",
     panel_edge    = "#888888",
+    info_box_edge = "#2C4A7C",   # [NEW] viền khung info box kiểu NCHMF
+    info_box_title_bg = "#EAF0F8",  # [NEW] nền dòng tiêu đề info box
 )
 
 # Màu riêng cho từng model khi vẽ nhiều model trên cùng bản đồ
@@ -397,13 +409,14 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
 
     l90, r90 = _cone_edges(_CHI2_90)
     _fill(np.vstack([l90, r90[::-1]]), STYLE["cone_90_fill"], STYLE["cone_90_alpha"], 3)
-    _line(l90[:, 0], l90[:, 1], STYLE["cone_90_fill"], 0.35, STYLE["cone_edge_lw"],        4, "--")
-    _line(r90[:, 0], r90[:, 1], STYLE["cone_90_fill"], 0.35, STYLE["cone_edge_lw"],        4, "--")
+    # [RESTYLE — NCHMF smooth fill] Bỏ hẳn 2 dòng viền đứt nét
+    # (_line(...,"--")) từng vẽ ở đây -- ảnh mẫu NCHMF chỉ tô vùng mượt,
+    # không viền rời rạc; giữ code _line() ở trên (không xóa hàm) để
+    # dễ khôi phục nếu cần, chỉ bỏ lời gọi.
 
     l50, r50 = _cone_edges(_CHI2_50)
     _fill(np.vstack([l50, r50[::-1]]), STYLE["cone_50_fill"], STYLE["cone_50_alpha"], 5)
-    _line(l50[:, 0], l50[:, 1], STYLE["cone_50_fill"], 0.6, STYLE["cone_edge_lw"] * 1.3, 6)
-    _line(r50[:, 0], r50[:, 1], STYLE["cone_50_fill"], 0.6, STYLE["cone_edge_lw"] * 1.3, 6)
+    # [RESTYLE — NCHMF smooth fill] Tương tự, bỏ viền đứt nét cho vùng 50%.
 
     # [FIX-16] Trước đây vẽ THÊM từng ensemble member riêng lẻ (S đường
     # mờ, alpha=0.05) đè lên cone — đây chính là nguồn "rối" đã phản
@@ -717,55 +730,86 @@ def _plot_on_ax(
              s=350, marker="*", color="#FFD700",
              edgecolors="black", linewidths=1.5, zorder=20)
 
-    # 9. Error summary box
+    # 9. [RESTYLE — NCHMF-style info box] Thay hoàn toàn text box cũ
+    # (monospace, góc dưới trái, chỉ có ADE+spread rời rạc) bằng bảng
+    # dạng ax.table() ở góc phải trên, giống bố cục "TIN BAO KHAN CAP"
+    # trong ảnh mẫu NCHMF: mỗi hàng = 1 lead time, các cột = lat/lon dự
+    # báo, lat/lon thực tế, ADE. KHÔNG có cột cấp gió/Vmax/Pmin -- bài
+    # này chỉ dự báo track, không dự báo cường độ, nên cố tình bỏ các
+    # cột đó thay vì để trống/N-A gây hiểu lầm là có nhưng thiếu dữ
+    # liệu. Toàn bộ nhãn bằng tiếng Anh theo yêu cầu.
     if errors_km is not None:
-        n     = len(errors_km)
-        lines = [f"Mean ADE: {errors_km.mean():.0f} km"]
-        for si, lh in [(3, 24), (7, 48), (11, 72)]:
-            if si < n:
-                lines.append(f" {lh}h: {errors_km[si]:.0f} km")
+        n = len(errors_km)
+        lead_times = [(0, "NOW"), (3, "+24h"), (7, "+48h"), (11, "+72h")]
+        table_rows = []
+        for si, lbl in lead_times:
+            if si == 0:
+                plat, plon = cur_pos[1], cur_pos[0]
+                glat, glon = cur_pos[1], cur_pos[0]
+                ade_str = "--"
+            elif si - 1 < len(pred_deg) and si - 1 < len(gt_deg):
+                plat, plon = pred_deg[si - 1, 1], pred_deg[si - 1, 0]
+                glat, glon = gt_deg[si - 1, 1], gt_deg[si - 1, 0]
+                ade_str = f"{errors_km[si - 1]:.0f}" if si - 1 < n else "--"
+            else:
+                continue
+            table_rows.append([lbl, f"{plat:.1f}N", f"{plon:.1f}E",
+                               f"{glat:.1f}N", f"{glon:.1f}E", ade_str])
 
-        # [BỔ SUNG, quan trọng] Spread (km) tại các mốc — in TRỰC TIẾP
-        # lên map thay vì chỉ dựa vào việc nhìn cone bằng mắt (dễ đánh
-        # lừa vì cone thật ~30km trông rất mảnh trên khung map rộng
-        # hàng trăm-nghìn km khi track dài). Đây là bằng chứng ĐỊNH
-        # LƯỢNG rằng ensemble không co cụm, không phụ thuộc vào cách
-        # margin/zoom vẽ map. Tính bằng std khoảng cách Haversine giữa
-        # từng ensemble member và mean tại đúng lead-time đó — cùng đơn
-        # vị/ý nghĩa với "Ensemble spread (1σ)" đã dùng ở
-        # plot_spread_over_time() trước khi panel đó bị bỏ.
+        col_labels = ["Time", "Pred.\nLat", "Pred.\nLon",
+                     "Actual\nLat", "Actual\nLon", "ADE\n(km)"]
+
+        tbl = ax.table(
+            cellText=table_rows, colLabels=col_labels,
+            cellLoc="center", colLoc="center",
+            bbox=[0.60, 0.72, 0.39, 0.26],   # [x0, y0, width, height] trong axes-fraction, góc phải trên
+            zorder=25,
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(6.5)
+        for (row, col), cell in tbl.get_celld().items():
+            cell.set_edgecolor(STYLE["info_box_edge"])
+            cell.set_linewidth(0.6)
+            if row == 0:
+                cell.set_facecolor(STYLE["info_box_title_bg"])
+                cell.set_text_props(fontweight="bold", color=STYLE["info_box_edge"])
+            else:
+                cell.set_facecolor("white")
+
+        # Dòng tiêu đề phía trên bảng, kiểu "TIN BAO KHAN CAP" nhưng
+        # tiếng Anh và mô tả đúng nội dung (track forecast, không phải
+        # bulletin thời tiết thật) để không gây hiểu lầm đây là sản
+        # phẩm vận hành chính thức.
+        ax.text(
+            0.60, 0.985, f"Track Forecast Summary — {title}" if title else "Track Forecast Summary",
+            transform=ax.transAxes, fontsize=7.5, fontweight="bold",
+            color=STYLE["info_box_edge"], ha="left", va="top", zorder=26,
+            path_effects=outline,
+        )
+
+        # [GIỮ LẠI] Ensemble spread (1σ) tại 24/48/72h -- vẫn là bằng
+        # chứng định lượng quan trọng rằng ensemble không co cụm, đặt
+        # thành 1 dòng nhỏ ngay dưới bảng thay vì text box riêng như
+        # trước, để không chiếm quá nhiều diện tích map.
         if all_trajs_deg is not None and all_trajs_deg.shape[0] >= 3:
-            lines.append("")
-            lines.append("Spread (1σ):")
+            spread_parts = []
             for si, lh in [(3, 24), (7, 48), (11, 72)]:
                 if si < all_trajs_deg.shape[1]:
-                    members_at_t = all_trajs_deg[:, si, :]           # [K, 2]
-                    mean_at_t    = members_at_t.mean(axis=0, keepdims=True)
-                    d_to_mean    = haversine_km(members_at_t, np.repeat(mean_at_t, members_at_t.shape[0], axis=0))
-                    this_spread  = d_to_mean.std()
-                    # [BỔ SUNG, optional] Nếu có ref_spread_km (đọc từ
-                    # Table 4/5 — trung bình toàn test set ~420 storm-
-                    # window), in kèm để đối chiếu "spread của RITA cụ
-                    # thể này" vs "spread trung bình toàn test set".
-                    # KHÔNG thay thế số 1-storm bằng số tổng hợp — chỉ
-                    # thêm bên cạnh để biết RITA có bất thường
-                    # (cao/thấp hẳn so với trung bình) hay không. 2 con
-                    # số dùng KHÁC công thức (std-to-mean vs pairwise
-                    # mean) nên không so sánh tuyệt đối 1:1 được, chỉ
-                    # mang tính tham khảo mức độ (order of magnitude).
+                    members_at_t = all_trajs_deg[:, si, :]
+                    mean_at_t = members_at_t.mean(axis=0, keepdims=True)
+                    d_to_mean = haversine_km(members_at_t, np.repeat(mean_at_t, members_at_t.shape[0], axis=0))
+                    this_spread = d_to_mean.std()
                     ref_str = ""
                     if ref_spread_km and lh in ref_spread_km:
-                        ref_str = f" (ref: {ref_spread_km[lh]:.0f})"
-                    lines.append(f" {lh}h: {this_spread:.0f} km{ref_str}")
-
-        ax.text(
-            0.02, 0.03, "\n".join(lines),
-            transform=ax.transAxes, fontsize=8, va="bottom",
-            color=STYLE["text_color"], family="monospace",
-            bbox=dict(boxstyle="round,pad=0.4", fc="white",
-                      alpha=0.9, ec=STYLE["panel_edge"], lw=0.8),
-            zorder=16,
-        )
+                        ref_str = f"/{ref_spread_km[lh]:.0f}"
+                    spread_parts.append(f"{lh}h: {this_spread:.0f}{ref_str}km")
+            if spread_parts:
+                ax.text(
+                    0.60, 0.685, "Ensemble spread (1σ, [ref: test-set mean]): "
+                    + "  ".join(spread_parts),
+                    transform=ax.transAxes, fontsize=6, color=STYLE["text_color"],
+                    ha="left", va="top", zorder=26, path_effects=outline,
+                )
 
     # 10. Legends
     track_handles = [
@@ -773,28 +817,35 @@ def _plot_on_ax(
         Line2D([0], [0], color=STYLE["gt_color"],   lw=2,   label="Ground truth"),
         Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label=f"Predicted ({pred_label})"),
         mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
-                       label="50% prob. cone"),
+                       label="50% prob. cone (center track)"),
         mpatches.Patch(facecolor=STYLE["cone_90_fill"], alpha=0.35,
-                       label="90% prob. cone"),
+                       label="90% prob. cone (strong-wind area)"),
     ]
     ax.legend(handles=track_handles, loc="lower right", fontsize=7.5,
               facecolor="white", edgecolor=STYLE["panel_edge"],
-              labelcolor=STYLE["text_color"], framealpha=0.92)
+              labelcolor=STYLE["text_color"], framealpha=0.92,
+              title="Legend", title_fontsize=8)
 
-    wind_handles = [
-        Line2D([0], [0], marker="o", color="none",
-               markerfacecolor=c, markersize=7,
-               markeredgecolor="black", markeredgewidth=0.5,
-               label=f"{nm} ({lo}–{hi}kt)")
-        for lo, hi, nm, c in INTENSITY
-    ]
-    leg2 = ax.legend(
-        handles=wind_handles, loc="upper right", fontsize=6.5,
-        facecolor="white", edgecolor=STYLE["panel_edge"],
-        labelcolor=STYLE["text_color"], title="Wind (kt)",
-        title_fontsize=7, ncol=2, framealpha=0.92,
-    )
-    ax.add_artist(leg2)
+    # [RESTYLE] Wind-intensity legend chỉ hiện khi thực sự có wind
+    # marker được vẽ (pred_Me_deg is not None) -- trước đây luôn vẽ dù
+    # không có marker nào, gây khung "Wind (kt)" trống vô nghĩa. Đồng
+    # thời dời sang "lower left" thay vì "upper right" để không đè lên
+    # bảng thông tin NCHMF-style mới đặt ở góc phải trên.
+    if pred_Me_deg is not None:
+        wind_handles = [
+            Line2D([0], [0], marker="o", color="none",
+                   markerfacecolor=c, markersize=7,
+                   markeredgecolor="black", markeredgewidth=0.5,
+                   label=f"{nm} ({lo}–{hi}kt)")
+            for lo, hi, nm, c in INTENSITY
+        ]
+        leg2 = ax.legend(
+            handles=wind_handles, loc="lower left", fontsize=6.5,
+            facecolor="white", edgecolor=STYLE["panel_edge"],
+            labelcolor=STYLE["text_color"], title="Wind intensity (kt)",
+            title_fontsize=7, ncol=2, framealpha=0.92,
+        )
+        ax.add_artist(leg2)
 
     ax.set_title(
         f"{title}\n{dt_str}", color=STYLE["text_color"], fontsize=10,

@@ -601,6 +601,23 @@ def run_ode_steps_sweep_multi_seed(checkpoints: List[str], dataset_root: str,
                 print(f"  EMA loaded ({len(ema.shadow)} params)")
             except Exception as e:
                 print(f"  ⚠ EMA failed: {e}")
+        elif ck.get("is_swa", False):
+            # [FIX SWA-vs-EMA mismatch, ODE-sweep path] Cung loai loi da
+            # tim va va trong evaluate_full.py's k_n_joint_sweep -- nhanh
+            # nay TRUOC PATCH KHONG TON TAI, khien log khong bao gio xac
+            # nhan checkpoint co phai SWA average hay khong. Day chinh la
+            # nguyen nhan seed0/seed1 (is_swa=True theo log cua
+            # analyze_attention_xai.py doc CUNG 3 checkpoint nay) khong
+            # in ra dong xac nhan nao trong log ode_steps_sweep, khien
+            # nguoi doc (dung) nghi ngo lieu trong so co duoc load dung
+            # khong. Trong so VAN duoc load dung tu state_dict() o tren
+            # (vi is_swa=True nghia la ck["model"] DA LA SWA average),
+            # nhung thieu dong log nay la ly do khong the xac nhan chac
+            # chan tu chinh log ode_steps_sweep ma phai doi chieu voi
+            # log XAI rieng. Them nhanh nay CHI de log ro rang, khong doi
+            # logic load trong so.
+            print(f"  ℹ Checkpoint is an SWA average (is_swa=True) — "
+                  f"ck['model'] IS the SWA running average, no separate EMA applied.")
 
         seed = _infer_seed_local(ckpt_path, ck)
         print(f"  seed={seed}  epoch={ck.get('epoch', '?')}")
