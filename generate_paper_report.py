@@ -164,6 +164,23 @@ def build_main_table(records: List[Dict], models: List[str]) -> List[Dict]:
     gần, dễ dự báo hơn). Cùng cách tính seed-mean-rồi-mean/std như cột
     overall, chỉ lọc thêm điều kiện lead_time == 72h trước khi gộp theo
     seed.
+
+    [BỔ SUNG RMSE] Thêm cột RMSE (root-mean-square error) theo yêu cầu
+    bổ sung vào Main Table -- KHÁC hẳn cách tính ADE/ATE/CTE (trung
+    bình trị TUYỆT ĐỐI, "d.mean()" mỗi record đã là 1 khoảng cách
+    haversine không âm) vì RMSE cần bình phương lỗi TRƯỚC KHI trung
+    bình rồi mới lấy căn bậc hai -- 2 phép tính không giao hoán với
+    nhau (mean(sqrt(x^2)) != sqrt(mean(x^2)) trừ phi mọi x giống hệt
+    nhau), nên KHÔNG thể suy RMSE từ ade_mean đã có sẵn, phải tính
+    riêng từ record thô (mỗi record["ade"] CHÍNH LÀ khoảng cách
+    haversine tại 1 (storm, window, lead_time), giá trị không âm, nên
+    RMSE = sqrt(mean(ade^2)) là định nghĩa đúng và duy nhất hợp lý ở
+    đây -- không có "RMSE có dấu" vì haversine distance vốn luôn >= 0).
+    Dùng đúng cùng logic seed-mean-rồi-mean/std như ADE/ATE/CTE để nhất
+    quán trong toàn bảng: RMSE tính cho TỪNG SEED trước (sqrt(mean của
+    ade^2 trong đúng seed đó)), rồi mean±std của 3 giá trị RMSE-theo-seed
+    đó -- không phải sqrt(mean(ade^2)) gộp thẳng qua mọi seed cùng lúc
+    (2 cách này cũng KHÁC nhau, cùng lý do non-giao-hoán ở trên).
     """
     final_lt = HORIZON_LEAD_TIMES.get("72h")
     rows = []
@@ -184,16 +201,22 @@ def build_main_table(records: List[Dict], models: List[str]) -> List[Dict]:
 
         seed_means = {"ade": [], "ate": [], "cte": []}
         seed_means_final = {"ade": [], "ate": [], "cte": []}
+        seed_rmse = []        # [NEW] RMSE tính riêng theo seed (overall)
+        seed_rmse_final = []  # [NEW] RMSE tính riêng theo seed (chỉ 72h)
         n_seeds = 0
         for seed, vals in sorted(by_seed.items()):
             n_seeds += 1
             for m in ("ade", "ate", "cte"):
                 if vals[m]:
                     seed_means[m].append(float(np.mean(vals[m])))
+            if vals["ade"]:
+                seed_rmse.append(float(np.sqrt(np.mean(np.square(vals["ade"])))))
         for seed, vals in sorted(by_seed_final.items()):
             for m in ("ade", "ate", "cte"):
                 if vals[m]:
                     seed_means_final[m].append(float(np.mean(vals[m])))
+            if vals["ade"]:
+                seed_rmse_final.append(float(np.sqrt(np.mean(np.square(vals["ade"])))))
 
         row = {"model": model, "n_seeds": n_seeds,
                "n_records": len(model_recs)}
@@ -206,6 +229,17 @@ def build_main_table(records: List[Dict], models: List[str]) -> List[Dict]:
             vals_f = seed_means_final[m]
             row[f"{m}_final_mean"] = float(np.mean(vals_f)) if vals_f else float("nan")
             row[f"{m}_final_std"]  = float(np.std(vals_f))  if vals_f else float("nan")
+
+        # [NEW] RMSE columns, cùng quy ước tên field "{metric}_mean"/"_std"
+        # như ADE/ATE/CTE ở trên để plot_ablation_bars() và các hàm khác
+        # đọc field theo pattern có thể tái sử dụng nếu cần mà không phải
+        # sửa logic đọc field riêng cho RMSE.
+        row["rmse_mean"] = float(np.mean(seed_rmse)) if seed_rmse else float("nan")
+        row["rmse_std"]  = float(np.std(seed_rmse))  if seed_rmse else float("nan")
+        row["rmse_per_seed"] = seed_rmse
+        row["rmse_final_mean"] = float(np.mean(seed_rmse_final)) if seed_rmse_final else float("nan")
+        row["rmse_final_std"]  = float(np.std(seed_rmse_final))  if seed_rmse_final else float("nan")
+
         rows.append(row)
     return rows
 
@@ -216,6 +250,7 @@ def print_main_table(rows: List[Dict]):
     print(f"  {'='*140}")
     print(f"  {'Model':<12} {'#seeds':>7} "
           f"{'ADE overall':>16} {'ADE@72h':>16} "
+          f"{'RMSE overall':>16} {'RMSE@72h':>16} "
           f"{'ATE overall':>16} {'ATE@72h':>16} "
           f"{'CTE overall':>16} {'CTE@72h':>16}")
     print(f"  {'-'*140}")
@@ -223,25 +258,30 @@ def print_main_table(rows: List[Dict]):
         print(f"  {r['model']:<12} {r['n_seeds']:>7} "
               f"{r['ade_mean']:>9.2f}±{r['ade_std']:<5.2f} "
               f"{r['ade_final_mean']:>9.2f}±{r['ade_final_std']:<5.2f} "
+              f"{r['rmse_mean']:>9.2f}±{r['rmse_std']:<5.2f} "
+              f"{r['rmse_final_mean']:>9.2f}±{r['rmse_final_std']:<5.2f} "
               f"{r['ate_mean']:>9.2f}±{r['ate_std']:<5.2f} "
               f"{r['ate_final_mean']:>9.2f}±{r['ate_final_std']:<5.2f} "
               f"{r['cte_mean']:>9.2f}±{r['cte_std']:<5.2f} "
               f"{r['cte_final_mean']:>9.2f}±{r['cte_final_std']:<5.2f}")
     print(f"  {'='*140}")
     print(f"  'overall' = mean qua mọi lead_time (6h-72h) | '@72h' = chỉ final step "
-          f"(horizon dự báo xa nhất, thường dùng làm tiêu chí so sánh chính)\n")
+          f"(horizon dự báo xa nhất, thường dùng làm tiêu chí so sánh chính)")
+    print(f"  RMSE = sqrt(mean(ADE^2)), tính riêng theo TỪNG SEED rồi mean±std qua seed "
+          f"(KHÔNG suy từ ADE_mean -- xem docstring build_main_table())\n")
 
 
 def print_main_table_latex(rows: List[Dict]):
     print(r"  \begin{table}")
-    print(r"  \caption{Main results: ADE/ATE/CTE (km), mean $\pm$ std across seeds.}")
-    print(r"  \begin{tabular}{lccc}")
+    print(r"  \caption{Main results: ADE/RMSE/ATE/CTE (km), mean $\pm$ std across seeds.}")
+    print(r"  \begin{tabular}{lcccc}")
     print(r"  \hline")
-    print(r"  Model & ADE (km) & ATE (km) & CTE (km) \\")
+    print(r"  Model & ADE (km) & RMSE (km) & ATE (km) & CTE (km) \\")
     print(r"  \hline")
     for r in rows:
         print(f"  {r['model']} & "
               f"{r['ade_mean']:.2f} $\\pm$ {r['ade_std']:.2f} & "
+              f"{r['rmse_mean']:.2f} $\\pm$ {r['rmse_std']:.2f} & "
               f"{r['ate_mean']:.2f} $\\pm$ {r['ate_std']:.2f} & "
               f"{r['cte_mean']:.2f} $\\pm$ {r['cte_std']:.2f} \\\\")
     print(r"  \hline")
@@ -665,6 +705,15 @@ def build_per_horizon_table(records: List[Dict], models: List[str],
     ATE/CTE là None ở lead_time=1 (6h, xem evaluate_multi_model.py's
     docstring) — bị lọc ra trước khi tính mean/std, is not None cho mỗi
     (model, seed, horizon, metric) riêng biệt.
+
+    [BỔ SUNG RMSE] Cùng lý do và cùng cách tính (sqrt(mean(ade^2)) theo
+    TỪNG SEED rồi mean±std qua seed -- xem build_main_table()'s
+    docstring cho giải thích đầy đủ vì sao không thể suy RMSE từ
+    ade_mean) như Table 1, áp dụng riêng cho từng horizon ở đây. Chỉ
+    tính RMSE cho ADE (không có "RMSE của ATE/CTE" -- ATE/CTE vốn đã có
+    dấu (signed), bình phương rồi căn bậc hai sẽ đổi ý nghĩa thành
+    "magnitude trung bình" chứ không còn là phần bổ sung cho MAE như
+    RMSE-của-ADE, nên cố tình không thêm để tránh gây hiểu lầm).
     """
     offset = -1 if zero_indexed else 0
     rows = []
@@ -682,17 +731,22 @@ def build_per_horizon_table(records: List[Dict], models: List[str],
                         by_seed[s][m].append(r[m])
 
             seed_means = {"ade": [], "ate": [], "cte": []}
+            seed_rmse = []  # [NEW]
             n_seeds = 0
             for seed, vals in sorted(by_seed.items()):
                 n_seeds += 1
                 for m in ("ade", "ate", "cte"):
                     if vals[m]:
                         seed_means[m].append(float(np.mean(vals[m])))
+                if vals["ade"]:
+                    seed_rmse.append(float(np.sqrt(np.mean(np.square(vals["ade"])))))
 
             for m in ("ade", "ate", "cte"):
                 vals = seed_means[m]
                 row[f"{model}_{m}_mean"] = float(np.mean(vals)) if vals else float("nan")
                 row[f"{model}_{m}_std"]  = float(np.std(vals))  if vals else float("nan")
+            row[f"{model}_rmse_mean"] = float(np.mean(seed_rmse)) if seed_rmse else float("nan")  # [NEW]
+            row[f"{model}_rmse_std"]  = float(np.std(seed_rmse))  if seed_rmse else float("nan")  # [NEW]
             row[f"{model}_n_seeds"] = n_seeds
         rows.append(row)
     return rows
@@ -1922,7 +1976,19 @@ def main():
 
         horizon_rows = build_per_horizon_table(
             records, models_for_main, zero_indexed=args.lead_time_zero_indexed)
-        for metric in args.metrics:
+        # [FIX RMSE scope] Cố tình dùng list RIÊNG (args.metrics + ["rmse"])
+        # cho per-horizon table, KHÔNG sửa args.metrics dùng chung với
+        # build_significance_table() ở trên -- "RMSE significance" không
+        # phải khái niệm chuẩn cho paired Wilcoxon/t-test per-record (RMSE
+        # là 1 số tổng hợp toàn tập, không phải giá trị per-record để so
+        # cặp), nên KHÔNG tự động thêm rmse vào phần significance chỉ vì
+        # thêm vào đây. Nếu muốn rmse cũng chạy qua significance test,
+        # cần quyết định phương pháp luận riêng trước, không phải patch
+        # ngầm bằng cách đổi args.metrics mặc định.
+        per_horizon_metrics = list(args.metrics)
+        if "rmse" not in per_horizon_metrics:
+            per_horizon_metrics.append("rmse")
+        for metric in per_horizon_metrics:
             print_per_horizon_table(horizon_rows, models_for_main, metric=metric)
 
         ode_n_rows = []
