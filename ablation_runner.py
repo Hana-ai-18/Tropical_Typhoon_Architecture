@@ -799,6 +799,33 @@ def run_multi_seed(checkpoint_pattern: str,
         cfg = ck.get("model_cfg", {})
         model = TCFlowMatching(**cfg).to(device)
         model.load_state_dict(ck.get("model", ck), strict=False)
+        # [FIX EMA/SWA hoan toan thieu trong run_multi_seed()] Truoc patch
+        # nay, ham nay CHUA TUNG goi EMAModel hay kiem tra ck.get("ema")/
+        # ck.get("is_swa") -- khac han voi run_ode_steps_sweep_multi_seed()
+        # va evaluate_full.py's run_k_n_joint_sweep_multi_seed(), ca 2 deu
+        # co logic nay. Voi checkpoint la SWA average (ck["model"] DA LA
+        # SWA average san), load thang nhu tren la DUNG, khong can them gi.
+        # Nhung voi checkpoint EMA (vd seed2 trong du an nay, xac nhan qua
+        # log "EMA loaded (284 params)" o ca 2 pipeline khac), ck["model"]
+        # co the la trong so HUAN LUYEN THO (chua qua lam muot), con EMA
+        # THAT nam rieng trong ck["ema"] -- neu vay, ham nay truoc patch
+        # se AM THAM dung sai trong so cho seed2 (bo qua EMA hoan toan),
+        # gay ket qua ablation cua seed2 khac he thong so voi seed0/seed1,
+        # dung nhu do lech ~11-14km da xac nhan o ODE-steps sweep (cung 3
+        # checkpoint nay, khac ham sweep). Them dung logic EMA/is_swa o
+        # day, giong het 2 noi kia, de dam bao seed2 duoc load dung.
+        if ck.get("ema") and not ck.get("is_swa", False):
+            try:
+                ema = EMAModel(model)
+                for k, v in ck["ema"].items():
+                    if k in ema.shadow:
+                        ema.shadow[k].copy_(v.to(device))
+                print(f"    EMA loaded ({len(ema.shadow)} params) for seed {seed}")
+            except Exception as e:
+                print(f"    ⚠ EMA failed for seed {seed}: {e}")
+        elif ck.get("is_swa", False):
+            print(f"    ℹ Checkpoint is an SWA average (is_swa=True) for seed {seed} — "
+                  f"ck['model'] IS the SWA running average, no separate EMA applied.")
         model.eval()
 
         all_ade, all_ate, all_cte = [], [], []
