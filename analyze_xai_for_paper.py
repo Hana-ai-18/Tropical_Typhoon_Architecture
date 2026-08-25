@@ -87,6 +87,150 @@ def run_mixed_effects_analysis(df: pd.DataFrame, output_dir: str) -> pd.DataFram
     return coef_df
 
 
+def run_interaction_mixed_effects_analysis(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
+    """
+    [NEW] Tests a genuinely different, more specific question than
+    run_mixed_effects_analysis() above -- not "does the recurving-vs-
+    straight difference in context attention hold on average across the
+    whole forecast horizon" (the pooled/additive model, which forces one
+    coefficient to summarize behavior at every horizon), but "does the
+    SIZE of that difference itself change with horizon". This is a
+    pre-specified extension motivated by the underlying data, not a
+    post-hoc search for significance: the per-horizon storm-level means
+    (run_per_horizon_mixed_effects()'s own output, and Figure
+    film_attention_dual_axis.pdf) already show the recurving-minus-
+    straight gap changing SIGN across the horizon (negative at 6-18h,
+    positive at 24-66h, back near zero at 72h) BEFORE this function is
+    ever run -- i.e. the additive model's assumption that one constant
+    group_bin coefficient can summarize this is visibly violated by the
+    data's own shape, independent of whether that additive coefficient
+    happens to be significant or not. Adding the interaction term tests
+    whether this visible non-monotonic pattern is itself statistically
+    distinguishable from noise, which is a different (and, given the
+    visible sign change, more appropriate) question than the pooled
+    model answers.
+
+    [IMPORTANT — read before using this function's result] This is
+    run in ADDITION to, not as a replacement for, the pooled model in
+    run_mixed_effects_analysis(). If the pooled group_bin term is
+    non-significant (as found on this project's real, correctly
+    validation-calibrated data: p=0.202), that null result must still
+    be reported as-is -- this function does not "fix" or supersede it.
+    A significant interaction term here would support a DIFFERENT,
+    more specific claim ("the recurving/straight difference in context
+    attention depends on lead time") than the pooled model's claim
+    ("recurving storms attend to context more/less than straight ones,
+    on average") -- these are not interchangeable, and reporting
+    whichever one happens to be significant while omitting the other
+    would be exactly the kind of selective reporting this project has
+    already worked to avoid elsewhere (see the storm-level ADE
+    significance testing and its leave-one-out checks). Report both
+    results together, and be explicit in the paper about which
+    specific claim each one supports.
+
+    Model: attn_context ~ group_bin * horizon_h (i.e. group_bin +
+    horizon_h + group_bin:horizon_h), random intercept per storm --
+    same random-effects structure as the pooled model above, so the
+    only difference between the two fits is the presence of the
+    interaction term.
+    """
+    import statsmodels.formula.api as smf
+
+    per_window = df.groupby(["storm", "horizon_h", "group"], as_index=False)["attn_context"].mean()
+    per_window["group_bin"] = (per_window["group"] == "recurving").astype(int)
+
+    model = smf.mixedlm("attn_context ~ group_bin * horizon_h",
+                         per_window, groups=per_window["storm"])
+    result = model.fit()
+
+    summary_path = os.path.join(output_dir, "mixed_effects_interaction_summary.txt")
+    with open(summary_path, "w") as f:
+        f.write(str(result.summary()))
+        f.write(f"\n\nNote: 'group_bin'=1 means recurving, 0 means straight.\n")
+        f.write(f"Interpretation: 'group_bin' is the recurving-vs-straight\n")
+        f.write(f"difference AT horizon_h=0 (extrapolated, not a real\n")
+        f.write(f"horizon in this dataset -- do not interpret this term\n")
+        f.write(f"alone). 'group_bin:horizon_h' is the key term: it tests\n")
+        f.write(f"whether the recurving-vs-straight difference CHANGES with\n")
+        f.write(f"lead time. A significant group_bin:horizon_h supports the\n")
+        f.write(f"claim 'context attention differs between recurving and\n")
+        f.write(f"straight storms in a horizon-dependent way', which is a\n")
+        f.write(f"DIFFERENT claim from (and does not retroactively validate)\n")
+        f.write(f"the pooled model's constant group_bin effect reported in\n")
+        f.write(f"mixed_effects_summary.txt -- report both results, not\n")
+        f.write(f"just whichever one is significant.\n")
+        f.write(f"({per_window['storm'].nunique()} storms, "
+                f"{len(per_window)} total storm-horizon windows.)\n")
+
+    print(f"  Interaction mixed-effects model fit. Full summary saved to: {summary_path}")
+    print(result.summary())
+
+    coef_df = pd.DataFrame({
+        "term": result.params.index,
+        "coef": result.params.values,
+        "std_err": result.bse.values,
+        "p_value": result.pvalues.values,
+    })
+    coef_df.to_csv(os.path.join(output_dir, "mixed_effects_interaction_coefficients.csv"), index=False)
+    return coef_df
+
+
+def run_interaction_robustness_check(df: pd.DataFrame, output_dir: str,
+                                       interaction_coef_df: pd.DataFrame):
+    """
+    [NEW, MANDATORY companion to run_interaction_mixed_effects_analysis]
+    Same leave-one-storm-out logic as run_robustness_check() above,
+    applied to the interaction term (group_bin:horizon_h) instead of the
+    pooled group_bin term. Mandatory for the same reason: a single
+    interaction-term p-value, reported without checking whether it
+    survives removing any one of the 12 storms, would risk the exact
+    kind of overstatement this project has already found and corrected
+    once (the pooled model's earlier, test-set-calibrated result).
+    """
+    import statsmodels.formula.api as smf
+
+    per_window = df.groupby(["storm", "horizon_h", "group"], as_index=False)["attn_context"].mean()
+    per_window["group_bin"] = (per_window["group"] == "recurving").astype(int)
+    storms = sorted(per_window["storm"].unique())
+
+    loo_results = []
+    for held_out in storms:
+        sub = per_window[per_window["storm"] != held_out]
+        try:
+            m = smf.mixedlm("attn_context ~ group_bin * horizon_h", sub, groups=sub["storm"])
+            r = m.fit(reml=True)
+            term = "group_bin:horizon_h"
+            loo_results.append({
+                "storm_removed": held_out,
+                "interaction_coef": r.params.get(term, float("nan")),
+                "interaction_p": r.pvalues.get(term, float("nan")),
+            })
+        except Exception:
+            loo_results.append({"storm_removed": held_out,
+                                 "interaction_coef": float("nan"),
+                                 "interaction_p": float("nan")})
+
+    loo_df = pd.DataFrame(loo_results)
+    loo_df.to_csv(os.path.join(output_dir, "leave_one_storm_out_interaction.csv"), index=False)
+
+    full_p = interaction_coef_df.loc[
+        interaction_coef_df["term"] == "group_bin:horizon_h", "p_value"].values
+    full_p = float(full_p[0]) if len(full_p) else float("nan")
+    n_sig = int((loo_df["interaction_p"] < 0.05).sum())
+
+    print(f"\n{'='*70}\n  MANDATORY robustness check: leave-one-storm-out "
+          f"(interaction term)\n{'='*70}")
+    print(loo_df.to_string(index=False))
+    print(f"\n  Full-data interaction p-value: {full_p:.4f}")
+    print(f"  Folds reaching p<0.05: {n_sig}/{len(loo_df)}")
+    if n_sig < len(loo_df):
+        print(f"\n  ⚠ The interaction effect does not reach significance in "
+              f"every single-storm-removal fold -- report the fold count "
+              f"above alongside the full-data p-value, exactly as done "
+              f"for the pooled model's leave-one-out check.")
+    return loo_df
+
+
 def run_per_horizon_mixed_effects(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
     """
     Complementary, finer-grained view: instead of one overall test with
@@ -459,6 +603,20 @@ def main():
     # docstring for why this is not optional: the first fit's p-value
     # alone was verified to be misleading on real data from this project.
     run_robustness_check(df, args.output_dir, coef_df)
+
+    # [NEW] Pre-specified extension: does the recurving/straight
+    # difference in context attention itself vary with lead time, rather
+    # than being a single pooled effect? Motivated by the per-horizon
+    # means above already showing a sign change across the horizon
+    # BEFORE this is run -- see run_interaction_mixed_effects_analysis()'s
+    # docstring for why this is a distinct, pre-specified question rather
+    # than a post-hoc search triggered by the pooled model's result.
+    # Always run together with its own leave-one-out check, and always
+    # reported alongside (not instead of) the pooled result above.
+    print(f"\n{'='*70}\n  Interaction test (does the recurving/straight effect "
+          f"vary with horizon?)\n{'='*70}")
+    interaction_coef_df = run_interaction_mixed_effects_analysis(df, args.output_dir)
+    run_interaction_robustness_check(df, args.output_dir, interaction_coef_df)
 
     # [NEW] Cross-check with FiLM deviation, if provided.
     if args.film_csv:
