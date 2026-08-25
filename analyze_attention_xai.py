@@ -513,20 +513,52 @@ def main():
     p.add_argument("--threshold", type=float, default=0.002)
     p.add_argument("--filter_region", action="store_true", default=False)
     p.add_argument("--min_pct_in_scs", type=float, default=15.0)
-    p.add_argument("--turn_threshold_deg", type=float, default=240.0,
+    p.add_argument("--turn_threshold_deg", type=float, default=None,
                     help="Recurving-vs-straight cutoff, in degrees of "
                          "total accumulated heading change over the "
-                         "obs+pred window. Default 240 = the observed "
-                         "MEDIAN of a real 449-storm test-set run "
-                         "(min=71.7, 25th=175.3, median=238.9, "
-                         "75th=350.6, max=973.2 degrees) -- chosen to "
-                         "guarantee a genuine ~50/50 split by "
-                         "construction. Run with --skip_ade_eval "
-                         "--skip_attention first to see this "
-                         "distribution printed for YOUR dataset before "
-                         "trusting this default, since it depends on "
-                         "obs_len/pred_len and the specific storms in "
-                         "your test split.")
+                         "obs+pred window. Default None = compute "
+                         "automatically as the median accumulated turn "
+                         "on --turn_threshold_split (val by default, "
+                         "NEVER test -- see that argument's help and "
+                         "the [FIX test-set leakage] note on the loader "
+                         "construction below). A prior run mistakenly "
+                         "computed this median on the TEST set itself "
+                         "(240 degrees, from a real 449-storm test-set "
+                         "run: min=71.7, 25th=175.3, median=238.9, "
+                         "75th=350.6, max=973.2) and then applied it "
+                         "back to that same test set for the "
+                         "recurving/straight grouping used in the "
+                         "mixed-effects and leave-one-storm-out XAI "
+                         "analysis -- not a severe leakage (the "
+                         "threshold depends only on ground-truth "
+                         "geometry, never on any model's predictions "
+                         "or accuracy), but still a violation of "
+                         "test-set independence, since the cutoff was "
+                         "tuned to this specific 12-storm test set's "
+                         "own turn-angle distribution rather than fixed "
+                         "in advance. Pass an explicit value here (e.g. "
+                         "the old 240) only if you specifically want to "
+                         "reproduce that prior, non-independent run for "
+                         "comparison -- for any result meant to go in "
+                         "the paper, leave this at None and let it be "
+                         "computed from --turn_threshold_split instead.")
+    p.add_argument("--turn_threshold_split", default="val",
+                    choices=["val", "train", "test"],
+                    help="[FIX test-set leakage] Which split's ground-truth "
+                         "trajectories to use for computing the automatic "
+                         "--turn_threshold_deg median (only used when "
+                         "--turn_threshold_deg is not explicitly set). "
+                         "Defaults to 'val', NOT 'test' -- a prior version "
+                         "of this script hard-coded the loader used for "
+                         "print_turn_distribution() to always load "
+                         "{'type': 'test'} regardless of any split "
+                         "argument, so the recurving/straight cutoff "
+                         "ended up calibrated on the same 12 storms it "
+                         "was then applied to. 'test' is offered here "
+                         "only to intentionally reproduce that old "
+                         "(non-independent) behavior for comparison; it "
+                         "should not be used for the threshold that "
+                         "feeds into any reported XAI result.")
     p.add_argument("--skip_attention", action="store_true", default=False,
                     help="Skip cross-attention analysis (slow, needs full "
                          "test-set pass). FiLM deviation always runs "
@@ -594,20 +626,66 @@ def main():
 
     loader = None
     if not args.skip_attention or not args.skip_ade_eval:
+        # [FIX test-set leakage] This loader is for the ATTENTION/ADE
+        # evaluation itself -- it correctly stays on the test set, since
+        # that evaluation's whole purpose is to characterize test-set
+        # performance. This is NOT the loader used to calibrate the
+        # recurving/straight threshold below; see that block for the
+        # separate, val-by-default loader.
         _, loader = data_loader(args, {"root": args.dataset_root, "type": "test"}, test=True)
         print(f"  Test data: {len(loader)} batches")
 
-    # [THRESHOLD RE-CALIBRATED] Run once before any per-seed processing --
-    # turn angle only depends on ground-truth trajectories, independent
-    # of which checkpoint is loaded. Prints the actual distribution and
-    # how many storms each candidate threshold would label "recurving",
-    # so --turn_threshold_deg can be picked from real data instead of a
-    # guess. Only runs if the attention analysis (the only consumer of
-    # the recurving/straight label) is actually going to run.
-    if not args.skip_attention and loader is not None:
-        print_turn_distribution(loader, device,
-                                 thresholds_to_test=[25.0, 35.0, 45.0, 55.0, 65.0],
-                                 output_dir=args.output_dir)
+    # [FIX test-set leakage] Turn-angle threshold calibration now runs on
+    # args.turn_threshold_split (default "val"), a SEPARATE data_loader
+    # call from the "loader" above -- previously this block reused the
+    # same test-set loader that print_turn_distribution() was called on
+    # (hard-coded {"type": "test"} regardless of any argument), so the
+    # median threshold ended up tuned to the exact 12 test storms it was
+    # then applied back to for the mixed-effects/leave-one-out grouping.
+    # Only computed automatically when --turn_threshold_deg is not
+    # explicitly passed; an explicit value always takes precedence and
+    # skips this block entirely (e.g. to intentionally reproduce the old
+    # test-calibrated 240-degree run for comparison).
+    turn_threshold_deg = args.turn_threshold_deg
+    if turn_threshold_deg is None and not args.skip_attention:
+        print(f"\n  --turn_threshold_deg not set: computing it automatically "
+              f"from the '{args.turn_threshold_split}' split "
+              f"(--turn_threshold_split), independent of the test set "
+              f"used for attention/ADE evaluation.")
+        _, threshold_loader = data_loader(
+            args, {"root": args.dataset_root, "type": args.turn_threshold_split},
+            test=(args.turn_threshold_split != "train"))
+        print(f"  Threshold-calibration data ({args.turn_threshold_split}): "
+              f"{len(threshold_loader)} batches")
+        turn_dist_df = print_turn_distribution(
+            threshold_loader, device,
+            thresholds_to_test=[25.0, 35.0, 45.0, 55.0, 65.0, 175.0, 240.0, 350.0],
+            output_dir=args.output_dir)
+        turn_threshold_deg = float(np.median(turn_dist_df["total_turn_deg"].values))
+        print(f"\n  >>> Auto-selected turn_threshold_deg = {turn_threshold_deg:.1f} "
+              f"(median accumulated turn on '{args.turn_threshold_split}' split, "
+              f"{len(turn_dist_df)} windows) <<<")
+        print(f"  This value -- NOT one computed on the test set -- is what "
+              f"will be used below to label test-set storms as "
+              f"recurving/straight for the attention analysis.\n")
+    elif turn_threshold_deg is not None:
+        print(f"\n  Using explicitly-provided --turn_threshold_deg="
+              f"{turn_threshold_deg:.1f} (skipping automatic calibration). "
+              f"If this value was computed on the test set in a prior run, "
+              f"see this argument's help text before using it for any "
+              f"result meant to go in the paper.")
+    args.turn_threshold_deg = turn_threshold_deg
+
+    # [GHI CHÚ TẠM] Phần dưới đây vẫn dùng đúng "loader" (test set, cho
+    # attention/ADE eval) và "args.turn_threshold_deg" (giờ đã lấy từ
+    # val theo mặc định, hoặc giá trị bạn tự truyền) -- KHÔNG cần sửa gì
+    # thêm ở các hàm collect_attention_records/evaluate_ade_by_horizon
+    # phía dưới, vì chúng đã nhận turn_threshold_deg làm tham số, không
+    # tự ý load lại data. Sau khi bạn chạy lại và có ngưỡng mới từ val,
+    # thay các con số 240°/238.9° còn hard-code trong phần diễn giải kết
+    # quả (paper Section 5, các câu trích median=238.9 ở lượt trước) cho
+    # khớp với ngưỡng mới -- các con số đó SẼ ĐỔI vì val (203 storm) có
+    # phân phối turn-angle khác 12 storm test.
 
     all_film = []
     all_attn = []
