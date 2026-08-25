@@ -386,7 +386,10 @@ class AblationModel(TCFlowMatching):
 def ode_steps_sweep(model, loader, device,
                      steps_list: List[int] = [1, 4, 8, 10, 12, 16, 20],
                      n_ensemble: int = 20,
-                     collect_spread: bool = True) -> Dict:
+                     collect_spread: bool = True,
+                     use_tta: bool = False,
+                     n_tta: int = 5,
+                     use_curvature_score: bool = False) -> Dict:
     """
     Evaluate model with different numbers of ODE integration (N)
     steps. Reports ADE/ATE/CTE (not just ADE, as the earlier version
@@ -411,6 +414,24 @@ def ode_steps_sweep(model, loader, device,
     "spread_mean" tổng thể (chỉ bước cuối) VẪN GIỮ NGUYÊN không đổi —
     tương thích ngược 100% với print_ode_sweep/plot_ode_n_sweep, chỉ
     thêm dữ liệu mới vào by_lead_time.
+
+    [FIX: --use_tta bị nuốt mất, KHÔNG BÁO LỖI] Trước patch này, hàm
+    này KHÔNG có tham số use_tta/n_tta/use_curvature_score, dù CLI's
+    --use_tta (dùng chung giữa --mode multi_seed và --mode ode_steps)
+    parse thành công và args.use_tta=True không hề báo lỗi -- 2 chỗ gọi
+    hàm này (run_ode_steps_sweep_multi_seed() và main()'s single-seed
+    path) chỉ truyền steps_list/n_ensemble, ÂM THẦM bỏ qua use_tta dù
+    người dùng đã bật cờ trên dòng lệnh. Đây khác với quyết định "TTA
+    disabled" có chủ đích được paper mô tả cho bảng chính thức
+    (Table tab:ode_sweep, chạy KHÔNG có --use_tta) -- vấn đề ở đây là
+    khi người dùng CHỦ ĐỘNG truyền --use_tta để chạy một cấu hình khác
+    (ví dụ để đối chiếu trực tiếp với evaluate_multi_model.py's Table
+    chính, vốn luôn dùng TTA), lá cờ đó không hề có tác dụng, khiến kết
+    quả trông như "TTA đã bật" nhưng thực ra vẫn là TTA-off -- chênh
+    lệch quan sát được (~11-14km, nhất quán ở mọi N cho seed2) khớp
+    đúng độ lớn hiệu ứng TTA đã ghi nhận ở evaluate_full.py's
+    k_n_joint_sweep() (~3-4km) cộng dồn với chênh lệch n_ensemble=30
+    (lệnh Image 1) vs n_ensemble=20 mặc định của evaluate_multi_model.py.
     """
     model.eval()
     results = {}
@@ -425,6 +446,7 @@ def ode_steps_sweep(model, loader, device,
         by_lt_cte = defaultdict(list)
         by_lt_spread = defaultdict(list)
         t_start = time.time()
+        tta_scales = [0.875, 0.9375, 1.0, 1.0625, 1.125][:n_tta]
 
         for batch in loader:
             bl = [x.to(device) if torch.is_tensor(x) else x for x in batch]
@@ -433,7 +455,41 @@ def ode_steps_sweep(model, loader, device,
             try:
                 orig_steps = getattr(raw, "n_inference_steps", 1)
                 raw.n_inference_steps = n_steps
-                pred, _, all_t = model.sample(bl, num_ensemble=n_ensemble)
+                # [FIX --use_tta bi nuot mat] Truoc patch, dong nay luon
+                # goi model.sample(bl, num_ensemble=n_ensemble) THO, du
+                # --use_tta duoc truyen o CLI. Gio them dung nhanh TTA,
+                # sao chep tu run_multi_seed() (da proven dung, giai
+                # thich chi tiet trong docstring cua ham nay). all_t
+                # (dung de tinh spread ben duoi) lay tu pass KHONG scale
+                # (sc=1.0) khi TTA bat, giong het cach k_n_joint_sweep()
+                # trong evaluate_full.py da lam -- KHONG trung binh
+                # all_t qua cac scale, chi trung binh pred (diem uoc
+                # luong cuoi).
+                if use_tta:
+                    obs = bl[0]
+                    anchor = obs[-1:, :, :2].detach()
+                    preds_t, weights_t, all_t = [], [], None
+                    for sc in tta_scales:
+                        obs_s = obs.clone()
+                        obs_s[..., :2] = anchor + (obs[..., :2] - anchor) * sc
+                        bl_s = list(bl); bl_s[0] = obs_s
+                        try:
+                            p, _, at = model.sample(bl_s, num_ensemble=n_ensemble,
+                                                     use_curvature_score=use_curvature_score)
+                            preds_t.append(p)
+                            weights_t.append(2.0 if abs(sc - 1.0) < 1e-6 else 1.0)
+                            if abs(sc - 1.0) < 1e-6:
+                                all_t = at
+                        except Exception:
+                            continue
+                    if not preds_t:
+                        raw.n_inference_steps = orig_steps
+                        continue
+                    tw = sum(weights_t)
+                    pred = sum(w / tw * p for w, p in zip(weights_t, preds_t))
+                else:
+                    pred, _, all_t = model.sample(bl, num_ensemble=n_ensemble,
+                                                   use_curvature_score=use_curvature_score)
                 raw.n_inference_steps = orig_steps
             except Exception as e:
                 print(f"    Error: {e}"); continue
@@ -642,8 +698,14 @@ def run_ode_steps_sweep_multi_seed(checkpoints: List[str], dataset_root: str,
         print(f"  Data: {len(loader)} batches")
 
         model.eval()
+        # [FIX --use_tta bi nuot mat] Them use_tta/n_tta/use_curvature_score
+        # (doc tu args, giong het cach run_multi_seed() da lam dung),
+        # truoc patch chi truyen steps_list/n_ensemble.
         results = ode_steps_sweep(model, loader, device, steps_list=steps_list,
-                                   n_ensemble=getattr(args, "n_ensemble", 20))
+                                   n_ensemble=getattr(args, "n_ensemble", 20),
+                                   use_tta=getattr(args, "use_tta", False),
+                                   n_tta=getattr(args, "n_tta", 5),
+                                   use_curvature_score=getattr(args, "use_curvature_score", False))
         per_seed_results[seed] = results
 
         del model
@@ -1145,9 +1207,16 @@ def main():
         model = TCFlowMatching(**cfg).to(device)
         model.load_state_dict(ck.get("model", ck), strict=False)
         steps_list = args.ode_steps_list
+        # [FIX --use_tta bi nuot mat] Xem giai thich chi tiet trong
+        # ode_steps_sweep()'s docstring va o chu goi single-seed phia
+        # tren; day la chu goi single-checkpoint (khong --checkpoints
+        # nhieu file) cua cung mode, cung thieu 3 tham so nay truoc patch.
         results = ode_steps_sweep(model, loader, device,
                                    steps_list=steps_list,
-                                   n_ensemble=args.n_ensemble)
+                                   n_ensemble=args.n_ensemble,
+                                   use_tta=getattr(args, "use_tta", False),
+                                   n_tta=getattr(args, "n_tta", 5),
+                                   use_curvature_score=getattr(args, "use_curvature_score", False))
         print_ode_sweep(results)
         out_path = os.path.join(args.output_dir, "ode_steps_sweep.json")
         with open(out_path, "w") as f:
