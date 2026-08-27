@@ -13,6 +13,13 @@ from typing import Optional
 import numpy as np
 from scipy.stats import chi2
 
+try:
+    from shapely.geometry import Point, Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
+    HAS_SHAPELY = True
+except ImportError:
+    HAS_SHAPELY = False
+
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, project_root)
 
@@ -358,37 +365,88 @@ def _gaussian_cone_boundary(pts_deg, chi2_thresh):
 
 
 def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
+    """
+    [RESTYLE — NCHMF-style rounded cone] Thay hoàn toàn cách vẽ cone cũ
+    (nối 2 đường biên trái/phải của ellipse tại mỗi mốc thời gian, tạo
+    hình thuôn nhọn ở đầu NOW và cuối 72h) bằng cách hợp nhất (union)
+    TOÀN BỘ ellipse xác suất tại từng mốc thời gian thành một vùng mượt
+    duy nhất -- đúng kiểu "TIN BAO KHAN CAP" của NCHMF (ảnh mẫu): mỗi
+    mốc là một hình tròn/ellipse riêng, và vùng tô là hợp bao mượt của
+    tất cả các hình tròn liên tiếp đó. Vì bản thân mỗi ellipse đã tròn,
+    vùng hợp nhất tự động tròn ở đầu (quanh NOW) và tròn ở cuối (quanh
+    72h) mà không cần xử lý riêng — khác hẳn cách nối trái/phải cũ vốn
+    luôn cho ra đầu nhọn tại hai đầu mút.
+
+    Cần thư viện `shapely` để union nhiều ellipse thành 1 polygon mượt.
+    Nếu môi trường không có shapely (HAS_SHAPELY=False), lùi về đúng
+    cách vẽ cũ (nối trái/phải) để không làm hỏng toàn bộ script.
+    """
     S, T, _ = ens_deg.shape
     if S < 3:
         return
 
-    def _fill(verts, color, alpha, zo):
-        v  = np.vstack([verts, verts[0]])
+    def _fill_polygon(poly, color, alpha, zo):
+        """Vẽ 1 shapely Polygon (có thể có lỗ trong, hoặc là MultiPolygon)
+        lên ax, kèm 1 viền TRẮNG mảnh quanh biên ngoài -- đúng chi tiết
+        "đường viền trắng" thấy trong ảnh mẫu NCHMF, giúp vùng màu nổi
+        bật, tách bạch khỏi nền bản đồ thay vì tô liền không viền."""
+        polys = poly.geoms if poly.geom_type == "MultiPolygon" else [poly]
+        for p in polys:
+            xs, ys = p.exterior.xy
+            kw = dict(color=color, alpha=alpha, zorder=zo, linewidth=0)
+            if HAS_CARTOPY and transform is not None:
+                ax.fill(xs, ys, transform=transform, **kw)
+                ax.plot(xs, ys, color="white", linewidth=1.1, alpha=0.9,
+                        zorder=zo + 0.5, transform=transform)
+            else:
+                ax.fill(xs, ys, **kw)
+                ax.plot(xs, ys, color="white", linewidth=1.1, alpha=0.9,
+                        zorder=zo + 0.5)
+
+    def _fill_legacy(verts, color, alpha, zo):
+        v = np.vstack([verts, verts[0]])
         kw = dict(color=color, alpha=alpha, zorder=zo, linewidth=0)
         if HAS_CARTOPY and transform is not None:
             ax.fill(v[:, 0], v[:, 1], transform=transform, **kw)
         else:
             ax.fill(v[:, 0], v[:, 1], **kw)
 
-    def _line(xs, ys, color, alpha, lw, zo, ls="-"):
-        kw = dict(color=color, alpha=alpha, linewidth=lw, zorder=zo, linestyle=ls)
-        if HAS_CARTOPY and transform is not None:
-            ax.plot(xs, ys, transform=transform, **kw)
-        else:
-            ax.plot(xs, ys, **kw)
+    def _cone_union(chi2_thresh):
+        """Trả về 1 shapely (Multi)Polygon = union của ellipse xác suất
+        tại từng mốc thời gian (bao gồm cả mốc NOW, xem như 1 điểm/
+        ellipse suy biến rất nhỏ, để vùng cone bắt đầu đúng từ vị trí
+        hiện tại của bão thay vì chỉ từ mốc dự báo đầu tiên)."""
+        ellipses = [Point(*cur_pos_deg).buffer(1e-3, resolution=32)]
+        for t in range(T):
+            b = _gaussian_cone_boundary(ens_deg[:, t, :], chi2_thresh)
+            if b is None:
+                continue
+            # Đóng vòng và loại điểm trùng lặp nếu có, để shapely không lỗi
+            ring = np.vstack([b, b[0]])
+            try:
+                poly = ShapelyPolygon(ring)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)  # tự sửa polygon tự cắt (self-intersect)
+                ellipses.append(poly)
+            except Exception:
+                continue
+        if len(ellipses) < 2:
+            return None
+        return unary_union(ellipses)
 
-    means     = np.array([ens_deg[:, t, :].mean(axis=0) for t in range(T)])
-    track_pts = np.vstack([cur_pos_deg, means])
+    def _cone_edges_legacy(chi2_thresh):
+        """Cách vẽ cũ (nối trái/phải) — chỉ dùng khi thiếu shapely."""
+        means     = np.array([ens_deg[:, t, :].mean(axis=0) for t in range(T)])
+        track_pts = np.vstack([cur_pos_deg, means])
 
-    def _perp(p1, p2):
-        d = p2 - p1
-        n = np.linalg.norm(d)
-        if n < 1e-10:
-            return np.array([0.0, 1.0])
-        d /= n
-        return np.array([-d[1], d[0]])
+        def _perp(p1, p2):
+            d = p2 - p1
+            n = np.linalg.norm(d)
+            if n < 1e-10:
+                return np.array([0.0, 1.0])
+            d /= n
+            return np.array([-d[1], d[0]])
 
-    def _cone_edges(chi2_thresh):
         left  = [cur_pos_deg.copy()]
         right = [cur_pos_deg.copy()]
         for t in range(T):
@@ -407,16 +465,18 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
             right.append(b[proj.argmin()])
         return np.array(left), np.array(right)
 
-    l90, r90 = _cone_edges(_CHI2_90)
-    _fill(np.vstack([l90, r90[::-1]]), STYLE["cone_90_fill"], STYLE["cone_90_alpha"], 3)
-    # [RESTYLE — NCHMF smooth fill] Bỏ hẳn 2 dòng viền đứt nét
-    # (_line(...,"--")) từng vẽ ở đây -- ảnh mẫu NCHMF chỉ tô vùng mượt,
-    # không viền rời rạc; giữ code _line() ở trên (không xóa hàm) để
-    # dễ khôi phục nếu cần, chỉ bỏ lời gọi.
-
-    l50, r50 = _cone_edges(_CHI2_50)
-    _fill(np.vstack([l50, r50[::-1]]), STYLE["cone_50_fill"], STYLE["cone_50_alpha"], 5)
-    # [RESTYLE — NCHMF smooth fill] Tương tự, bỏ viền đứt nét cho vùng 50%.
+    if HAS_SHAPELY:
+        u90 = _cone_union(_CHI2_90)
+        if u90 is not None:
+            _fill_polygon(u90, STYLE["cone_90_fill"], STYLE["cone_90_alpha"], 3)
+        u50 = _cone_union(_CHI2_50)
+        if u50 is not None:
+            _fill_polygon(u50, STYLE["cone_50_fill"], STYLE["cone_50_alpha"], 5)
+    else:
+        l90, r90 = _cone_edges_legacy(_CHI2_90)
+        _fill_legacy(np.vstack([l90, r90[::-1]]), STYLE["cone_90_fill"], STYLE["cone_90_alpha"], 3)
+        l50, r50 = _cone_edges_legacy(_CHI2_50)
+        _fill_legacy(np.vstack([l50, r50[::-1]]), STYLE["cone_50_fill"], STYLE["cone_50_alpha"], 5)
 
     # [FIX-16] Trước đây vẽ THÊM từng ensemble member riêng lẻ (S đường
     # mờ, alpha=0.05) đè lên cone — đây chính là nguồn "rối" đã phản
@@ -740,17 +800,27 @@ def _plot_on_ax(
     # liệu. Toàn bộ nhãn bằng tiếng Anh theo yêu cầu.
     if errors_km is not None:
         n = len(errors_km)
-        lead_times = [(0, "NOW"), (3, "+24h"), (7, "+48h"), (11, "+72h")]
+        # [UPDATE] Bổ sung +6h và +12h để bảng đủ mọi mốc chuẩn (6/12/24/48/72h),
+        # không chỉ 24/48/72h như trước.
+        # [FIX] Sửa lỗi lệch 1 bước có sẵn trong code gốc: bảng cũ dùng
+        # pred_deg[si-1] trong khi si đã được đặt tên theo đúng mốc giờ
+        # thật (si=3 nghĩ là "+24h" nhưng pred_deg[2] thực chất là 18h,
+        # do pred_deg là 0-based với index 0 = bước 6h đầu tiên). Ở đây
+        # đổi sang index 0-based trực tiếp (0=6h, 1=12h, 3=24h, 7=48h,
+        # 11=72h), khớp đúng với "Error connectors" (mục 6 phía trên,
+        # dùng gt_deg[si]/pred_deg[si] không trừ 1) để 2 nơi nhất quán.
+        lead_times = [(0, "NOW"), (0, "+6h"), (1, "+12h"),
+                      (3, "+24h"), (7, "+48h"), (11, "+72h")]
         table_rows = []
         for si, lbl in lead_times:
-            if si == 0:
+            if lbl == "NOW":
                 plat, plon = cur_pos[1], cur_pos[0]
                 glat, glon = cur_pos[1], cur_pos[0]
-                ade_str = "--"
-            elif si - 1 < len(pred_deg) and si - 1 < len(gt_deg):
-                plat, plon = pred_deg[si - 1, 1], pred_deg[si - 1, 0]
-                glat, glon = gt_deg[si - 1, 1], gt_deg[si - 1, 0]
-                ade_str = f"{errors_km[si - 1]:.0f}" if si - 1 < n else "--"
+                ade_str = "-"
+            elif si < len(pred_deg) and si < len(gt_deg):
+                plat, plon = pred_deg[si, 1], pred_deg[si, 0]
+                glat, glon = gt_deg[si, 1], gt_deg[si, 0]
+                ade_str = f"{errors_km[si]:.0f}" if si < n else "-"
             else:
                 continue
             table_rows.append([lbl, f"{plat:.1f}N", f"{plon:.1f}E",
@@ -759,57 +829,29 @@ def _plot_on_ax(
         col_labels = ["Time", "Pred.\nLat", "Pred.\nLon",
                      "Actual\nLat", "Actual\nLon", "ADE\n(km)"]
 
+        # [SHRINK] Bảng thu nhỏ (bbox height 0.26->0.20, width 0.39->0.33) và
+        # đặt cao hơn (y0 0.72->0.78) để không che vùng cone/track phía dưới
+        # bên trong bản đồ; đồng thời bỏ dòng title "Track Forecast Summary"
+        # và dòng "Ensemble spread" phía trên/dưới bảng theo yêu cầu, nên bảng
+        # giờ là thành phần duy nhất trong góc phải trên, không cần chừa thêm
+        # khoảng trống cho 2 dòng text đó nữa.
         tbl = ax.table(
             cellText=table_rows, colLabels=col_labels,
             cellLoc="center", colLoc="center",
-            bbox=[0.60, 0.72, 0.39, 0.26],   # [x0, y0, width, height] trong axes-fraction, góc phải trên
+            bbox=[0.66, 0.78, 0.33, 0.20],   # [x0, y0, width, height] trong axes-fraction, góc phải trên
             zorder=25,
         )
         tbl.auto_set_font_size(False)
-        tbl.set_fontsize(6.5)
+        tbl.set_fontsize(5.5)
         for (row, col), cell in tbl.get_celld().items():
             cell.set_edgecolor(STYLE["info_box_edge"])
-            cell.set_linewidth(0.6)
+            cell.set_linewidth(0.5)
             if row == 0:
                 cell.set_facecolor(STYLE["info_box_title_bg"])
                 cell.set_text_props(fontweight="bold", color=STYLE["info_box_edge"])
             else:
                 cell.set_facecolor("white")
 
-        # Dòng tiêu đề phía trên bảng, kiểu "TIN BAO KHAN CAP" nhưng
-        # tiếng Anh và mô tả đúng nội dung (track forecast, không phải
-        # bulletin thời tiết thật) để không gây hiểu lầm đây là sản
-        # phẩm vận hành chính thức.
-        ax.text(
-            0.60, 0.985, f"Track Forecast Summary — {title}" if title else "Track Forecast Summary",
-            transform=ax.transAxes, fontsize=7.5, fontweight="bold",
-            color=STYLE["info_box_edge"], ha="left", va="top", zorder=26,
-            path_effects=outline,
-        )
-
-        # [GIỮ LẠI] Ensemble spread (1σ) tại 24/48/72h -- vẫn là bằng
-        # chứng định lượng quan trọng rằng ensemble không co cụm, đặt
-        # thành 1 dòng nhỏ ngay dưới bảng thay vì text box riêng như
-        # trước, để không chiếm quá nhiều diện tích map.
-        if all_trajs_deg is not None and all_trajs_deg.shape[0] >= 3:
-            spread_parts = []
-            for si, lh in [(3, 24), (7, 48), (11, 72)]:
-                if si < all_trajs_deg.shape[1]:
-                    members_at_t = all_trajs_deg[:, si, :]
-                    mean_at_t = members_at_t.mean(axis=0, keepdims=True)
-                    d_to_mean = haversine_km(members_at_t, np.repeat(mean_at_t, members_at_t.shape[0], axis=0))
-                    this_spread = d_to_mean.std()
-                    ref_str = ""
-                    if ref_spread_km and lh in ref_spread_km:
-                        ref_str = f"/{ref_spread_km[lh]:.0f}"
-                    spread_parts.append(f"{lh}h: {this_spread:.0f}{ref_str}km")
-            if spread_parts:
-                ax.text(
-                    0.60, 0.685, "Ensemble spread (1σ, [ref: test-set mean]): "
-                    + "  ".join(spread_parts),
-                    transform=ax.transAxes, fontsize=6, color=STYLE["text_color"],
-                    ha="left", va="top", zorder=26, path_effects=outline,
-                )
 
     # 10. Legends
     track_handles = [
