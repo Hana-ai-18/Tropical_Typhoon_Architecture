@@ -364,7 +364,7 @@ def _gaussian_cone_boundary(pts_deg, chi2_thresh):
     return ell @ eigvecs.T + mu
 
 
-def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
+def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None, pred_deg=None):
     """
     [RESTYLE — NCHMF-style rounded cone] Thay hoàn toàn cách vẽ cone cũ
     (nối 2 đường biên trái/phải của ellipse tại mỗi mốc thời gian, tạo
@@ -434,13 +434,23 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
 
         # Thu thập tham số ellipse (mu, a, b, eigvecs) tại từng mốc T,
         # cộng thêm mốc "NOW" suy biến rất nhỏ ở đầu.
+        # [FIX — đối xứng quanh track đỏ] mu ở đây LUÔN lấy đúng điểm
+        # trên đường dự báo trung bình (pred_deg[t], chính là đường đỏ
+        # đang vẽ), KHÔNG lấy lại mean riêng của ensemble tại mốc đó.
+        # Trước đây "mu = pts.mean(axis=0)" có thể lệch khỏi pred_deg[t]
+        # do sai số làm tròn / cách tính mean khác nhau giữa 2 nơi, khiến
+        # tâm ellipse xê dịch khỏi đường đỏ -> cone nhìn "lệch tâm". Giờ
+        # ellipse luôn tâm đúng tại điểm trên đường đỏ, hình dạng (a, b,
+        # eigvecs) vẫn phản ánh độ phân tán thật của ensemble quanh điểm
+        # đó, nhưng vị trí tâm thì khớp 100% với track đỏ.
         params = [(cur_pos_deg, 1e-3, 1e-3, np.eye(2))]
         for t in range(T):
             pts = ens_deg[:, t, :]
             if len(pts) < 3:
                 continue
-            mu = pts.mean(axis=0)
-            cov = np.cov(pts.T)
+            mu_pred = pred_deg[t] if pred_deg is not None else pts.mean(axis=0)
+            mu_ens = pts.mean(axis=0)
+            cov = np.cov((pts - mu_ens).T)  # lệch tâm quanh mean ensemble thật
             if cov.ndim < 2:
                 continue
             cov = cov + np.eye(2) * 1e-8
@@ -448,7 +458,7 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
             eigvals = np.maximum(eigvals, 1e-8)
             a = np.sqrt(chi2_thresh * eigvals[-1])
             b = np.sqrt(chi2_thresh * eigvals[0])
-            params.append((mu, a, b, eigvecs))
+            params.append((mu_pred, a, b, eigvecs))
 
         if len(params) < 2:
             return None
@@ -816,7 +826,7 @@ def _plot_on_ax(
 
     # 1. Probability cone
     if all_trajs_deg is not None and all_trajs_deg.shape[0] >= 3:
-        draw_smooth_cone(ax, all_trajs_deg, cur_pos, transform)
+        draw_smooth_cone(ax, all_trajs_deg, cur_pos, transform, pred_deg=pred_deg)
 
     # 1b. Geographic reference labels (English): Ha Noi, Ho Chi Minh City,
     # Paracel/Spratly Islands, East Sea — drawn under the track so the
@@ -844,28 +854,6 @@ def _plot_on_ax(
     # line itself.
     pred_lon = np.concatenate([[cur_pos[0]], pred_deg[:, 0]])
     pred_lat = np.concatenate([[cur_pos[1]], pred_deg[:, 1]])
-
-    # 4a. [NCHMF-style] White-ring "uncertainty" circle centered on each
-    # predicted point, growing linearly with lead time (small near NOW,
-    # largest at +72h) — matches the reference image's nested white-outlined
-    # circles centered on the red track dots. Drawn UNDER the track line/
-    # markers (lower zorder) so the red line + dots stay perfectly centered
-    # inside each ring.
-    n_pred = len(pred_lon)
-    if n_pred > 1:
-        r_min_deg, r_max_deg = 0.12, 0.55  # degrees, tuned for typical extents
-        for i in range(n_pred):
-            frac = i / (n_pred - 1)  # 0 at NOW -> 1 at last lead time (72h)
-            radius = r_min_deg + frac * (r_max_deg - r_min_deg)
-            circ_kw = dict(facecolor="none", edgecolor="white",
-                           linewidth=1.6, zorder=6, alpha=0.95)
-            if HAS_CARTOPY:
-                circ = mpatches.Circle((pred_lon[i], pred_lat[i]), radius,
-                                        transform=transform, **circ_kw)
-            else:
-                circ = mpatches.Circle((pred_lon[i], pred_lat[i]), radius,
-                                        **circ_kw)
-            ax.add_patch(circ)
 
     _plot(pred_lon, pred_lat, fmt="o-",
           color=STYLE["pred_color"], linewidth=STYLE["lw_main"],
@@ -1089,7 +1077,8 @@ def _plot_multi_seed_on_ax(
     # (không gộp cả 3 seed nữa — xem giải thích trong docstring).
     all_trajs_deg = all_trajs_by_seed.get(best_seed_label) if all_trajs_by_seed else None
     if all_trajs_deg is not None and all_trajs_deg.shape[0] >= 3:
-        draw_smooth_cone(ax, all_trajs_deg, cur_pos, transform)
+        draw_smooth_cone(ax, all_trajs_deg, cur_pos, transform,
+                          pred_deg=preds_by_seed.get(best_seed_label))
 
     # 2. Observed track
     _plot(obs_deg[:, 0], obs_deg[:, 1], fmt="o-",
