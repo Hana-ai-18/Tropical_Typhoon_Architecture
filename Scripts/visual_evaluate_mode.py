@@ -415,24 +415,74 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
         """Trả về 1 shapely (Multi)Polygon = union của ellipse xác suất
         tại từng mốc thời gian (bao gồm cả mốc NOW, xem như 1 điểm/
         ellipse suy biến rất nhỏ, để vùng cone bắt đầu đúng từ vị trí
-        hiện tại của bão thay vì chỉ từ mốc dự báo đầu tiên)."""
-        ellipses = [Point(*cur_pos_deg).buffer(1e-3, resolution=32)]
+        hiện tại của bão thay vì chỉ từ mốc dự báo đầu tiên).
+
+        [FIX — vùng liền mạch] Nếu khoảng cách tâm giữa 2 mốc liên tiếp
+        lớn hơn tổng bán kính "hiệu dụng" của 2 ellipse đó, 2 hình tròn
+        sẽ KHÔNG chạm nhau và union() cho ra nhiều mảnh rời rạc (khác
+        ảnh mẫu NCHMF, luôn là 1 dải liền từ NOW tới 72h). Để đảm bảo
+        liền mạch, chèn thêm các ellipse nội suy TUYẾN TÍNH (tâm + kích
+        thước) giữa mỗi cặp mốc liên tiếp, đủ dày để hình tròn kế cận
+        luôn overlap nhau bất kể ensemble spread giãn nhanh cỡ nào.
+        """
+        def _ellipse_at(mu, a, b, theta_vec=None, eigvecs=None):
+            theta = np.linspace(0, 2 * np.pi, 48)
+            ell = np.stack([a * np.cos(theta), b * np.sin(theta)], axis=1)
+            if eigvecs is not None:
+                ell = ell @ eigvecs.T
+            return ell + mu
+
+        # Thu thập tham số ellipse (mu, a, b, eigvecs) tại từng mốc T,
+        # cộng thêm mốc "NOW" suy biến rất nhỏ ở đầu.
+        params = [(cur_pos_deg, 1e-3, 1e-3, np.eye(2))]
         for t in range(T):
-            b = _gaussian_cone_boundary(ens_deg[:, t, :], chi2_thresh)
-            if b is None:
+            pts = ens_deg[:, t, :]
+            if len(pts) < 3:
                 continue
-            # Đóng vòng và loại điểm trùng lặp nếu có, để shapely không lỗi
-            ring = np.vstack([b, b[0]])
-            try:
-                poly = ShapelyPolygon(ring)
-                if not poly.is_valid:
-                    poly = poly.buffer(0)  # tự sửa polygon tự cắt (self-intersect)
-                ellipses.append(poly)
-            except Exception:
+            mu = pts.mean(axis=0)
+            cov = np.cov(pts.T)
+            if cov.ndim < 2:
                 continue
-        if len(ellipses) < 2:
+            cov = cov + np.eye(2) * 1e-8
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            eigvals = np.maximum(eigvals, 1e-8)
+            a = np.sqrt(chi2_thresh * eigvals[-1])
+            b = np.sqrt(chi2_thresh * eigvals[0])
+            params.append((mu, a, b, eigvecs))
+
+        if len(params) < 2:
             return None
-        return unary_union(ellipses)
+
+        polys = []
+        N_INTERP = 6  # số bước nội suy chèn giữa mỗi cặp mốc liên tiếp
+        for k in range(len(params) - 1):
+            mu0, a0, b0, ev0 = params[k]
+            mu1, a1, b1, ev1 = params[k + 1]
+            for s in range(N_INTERP + 1):
+                f = s / N_INTERP
+                mu = mu0 * (1 - f) + mu1 * f
+                a = a0 * (1 - f) + a1 * f
+                b = b0 * (1 - f) + b1 * f
+                ev = ev0 if f < 0.5 else ev1  # tránh nội suy ma trận xoay phức tạp
+                ring = _ellipse_at(mu, max(a, 1e-3), max(b, 1e-3), eigvecs=ev)
+                ring = np.vstack([ring, ring[0]])
+                try:
+                    poly = ShapelyPolygon(ring)
+                    if not poly.is_valid:
+                        poly = poly.buffer(0)
+                    polys.append(poly)
+                except Exception:
+                    continue
+
+        if len(polys) < 2:
+            return None
+        merged = unary_union(polys)
+        # An toàn: nếu vẫn còn bị tách mảnh (trường hợp cực hiếm), lấy
+        # bao lồi tổng hợp của tất cả polygon để đảm bảo 1 khối liền —
+        # đúng tinh thần "cone liền mạch" của ảnh mẫu NCHMF.
+        if merged.geom_type == "MultiPolygon" and len(merged.geoms) > 1:
+            merged = merged.convex_hull
+        return merged
 
     def _cone_edges_legacy(chi2_thresh):
         """Cách vẽ cũ (nối trái/phải) — chỉ dùng khi thiếu shapely."""
@@ -680,6 +730,57 @@ def _inset_range(pred_deg, ens_deg):
     return lon_range, lat_range
 
 
+# [NEW] Nhãn địa lý cố định (tiếng Anh) kiểu bản đồ NCHMF: thành phố mốc
+# + quần đảo + tên biển. (lon, lat, label, style) — style "city" = chấm
+# nhỏ + tên; style "sea" = chữ nghiêng lớn không có chấm (tên vùng biển).
+GEO_LABELS = [
+    (105.85, 21.03, "Ha Noi",      "city"),
+    (106.70, 10.78, "Ho Chi Minh City", "city"),
+    (111.9,  16.5,  "Hoang Sa", "sea_small"),   # Hoàng Sa
+    (114.3,  10.5,  "Truong Sa", "sea_small"),   # Trường Sa
+    (112.5,  14.5,  "East Sea",    "sea"),          # Biển Đông
+]
+
+
+def _draw_geo_labels(ax, lon_range, lat_range, transform):
+    """Vẽ các nhãn địa lý cố định (thành phố, quần đảo, tên biển) bằng
+    tiếng Anh nếu tọa độ nằm trong phạm vi hiện tại của bản đồ — tránh
+    in nhãn ngoài khung khi zoom hẹp (ví dụ inset track dự báo)."""
+    outline = [pe.withStroke(linewidth=2.2, foreground="white")]
+    for lon, lat, label, kind in GEO_LABELS:
+        if not (lon_range[0] <= lon <= lon_range[1] and
+                lat_range[0] <= lat <= lat_range[1]):
+            continue
+        if kind == "city":
+            kw = dict(color="#222222", fontsize=8, fontweight="bold",
+                      ha="left", va="center", zorder=15, path_effects=outline)
+            if HAS_CARTOPY:
+                ax.plot(lon, lat, marker="o", markersize=4,
+                        markerfacecolor="black", markeredgecolor="white",
+                        markeredgewidth=0.6, transform=transform, zorder=15)
+                ax.text(lon + 0.15, lat, label, transform=transform, **kw)
+            else:
+                ax.plot(lon, lat, marker="o", markersize=4,
+                        markerfacecolor="black", markeredgecolor="white",
+                        markeredgewidth=0.6, zorder=15)
+                ax.text(lon + 0.15, lat, label, **kw)
+        elif kind == "sea":
+            kw = dict(color="#3B6EA5", fontsize=11, fontstyle="italic",
+                      fontweight="bold", ha="center", va="center",
+                      alpha=0.85, zorder=4, path_effects=outline)
+            if HAS_CARTOPY:
+                ax.text(lon, lat, label, transform=transform, **kw)
+            else:
+                ax.text(lon, lat, label, **kw)
+        else:  # sea_small — quần đảo
+            kw = dict(color="#555555", fontsize=7.5, fontstyle="italic",
+                      ha="center", va="center", zorder=4, path_effects=outline)
+            if HAS_CARTOPY:
+                ax.text(lon, lat, label, transform=transform, **kw)
+            else:
+                ax.text(lon, lat, label, **kw)
+
+
 def _plot_on_ax(
     ax, lon_range, lat_range,
     obs_deg, gt_deg, pred_deg, pred_Me_deg,
@@ -717,6 +818,11 @@ def _plot_on_ax(
     if all_trajs_deg is not None and all_trajs_deg.shape[0] >= 3:
         draw_smooth_cone(ax, all_trajs_deg, cur_pos, transform)
 
+    # 1b. Geographic reference labels (English): Ha Noi, Ho Chi Minh City,
+    # Paracel/Spratly Islands, East Sea — drawn under the track so the
+    # red/blue/black lines and dots stay clearly on top.
+    _draw_geo_labels(ax, lon_range, lat_range, transform)
+
     # 2. Observed track
     _plot(obs_deg[:, 0], obs_deg[:, 1], fmt="o-",
           color=STYLE["obs_color"], linewidth=STYLE["lw_thin"], markersize=5,
@@ -732,9 +838,35 @@ def _plot_on_ax(
           markeredgecolor="white", markeredgewidth=1.2,
           zorder=8, path_effects=outline)
 
-    # 4. Predicted track (ensemble mean)
+    # 4. Predicted track (ensemble mean) — red line stays exactly centered
+    # through every forecast dot (NCHMF style): the growing white-ringed
+    # circles below are drawn AROUND each red dot, never offsetting the
+    # line itself.
     pred_lon = np.concatenate([[cur_pos[0]], pred_deg[:, 0]])
     pred_lat = np.concatenate([[cur_pos[1]], pred_deg[:, 1]])
+
+    # 4a. [NCHMF-style] White-ring "uncertainty" circle centered on each
+    # predicted point, growing linearly with lead time (small near NOW,
+    # largest at +72h) — matches the reference image's nested white-outlined
+    # circles centered on the red track dots. Drawn UNDER the track line/
+    # markers (lower zorder) so the red line + dots stay perfectly centered
+    # inside each ring.
+    n_pred = len(pred_lon)
+    if n_pred > 1:
+        r_min_deg, r_max_deg = 0.12, 0.55  # degrees, tuned for typical extents
+        for i in range(n_pred):
+            frac = i / (n_pred - 1)  # 0 at NOW -> 1 at last lead time (72h)
+            radius = r_min_deg + frac * (r_max_deg - r_min_deg)
+            circ_kw = dict(facecolor="none", edgecolor="white",
+                           linewidth=1.6, zorder=6, alpha=0.95)
+            if HAS_CARTOPY:
+                circ = mpatches.Circle((pred_lon[i], pred_lat[i]), radius,
+                                        transform=transform, **circ_kw)
+            else:
+                circ = mpatches.Circle((pred_lon[i], pred_lat[i]), radius,
+                                        **circ_kw)
+            ax.add_patch(circ)
+
     _plot(pred_lon, pred_lat, fmt="o-",
           color=STYLE["pred_color"], linewidth=STYLE["lw_main"],
           markersize=STYLE["marker_size"],
