@@ -875,54 +875,39 @@ def _plot_on_ax(
              s=350, marker="*", color="#FFD700",
              edgecolors="black", linewidths=1.5, zorder=20)
 
-    # 9. [RESTYLE — NCHMF-style info box] Thay hoàn toàn text box cũ
-    # (monospace, góc dưới trái, chỉ có ADE+spread rời rạc) bằng bảng
-    # dạng ax.table() ở góc phải trên, giống bố cục "TIN BAO KHAN CAP"
-    # trong ảnh mẫu NCHMF: mỗi hàng = 1 lead time, các cột = lat/lon dự
-    # báo, lat/lon thực tế, ADE. KHÔNG có cột cấp gió/Vmax/Pmin -- bài
-    # này chỉ dự báo track, không dự báo cường độ, nên cố tình bỏ các
-    # cột đó thay vì để trống/N-A gây hiểu lầm là có nhưng thiếu dữ
-    # liệu. Toàn bộ nhãn bằng tiếng Anh theo yêu cầu.
-    if True:
-        # [NO-GT VARIANT] Bảng chỉ còn Time + Pred. Lat/Lon — cột
-        # Actual Lat/Lon và ADE (km) đã bỏ hoàn toàn vì không còn vẽ
-        # Ground Truth, nên không có gì để so sánh/tính sai số.
-        lead_times = [(0, "NOW"), (0, "+6h"), (1, "+12h"),
-                      (3, "+24h"), (7, "+48h"), (11, "+72h")]
-        table_rows = []
-        for si, lbl in lead_times:
-            if lbl == "NOW":
-                plat, plon = cur_pos[1], cur_pos[0]
-            elif si < len(pred_deg):
-                plat, plon = pred_deg[si, 1], pred_deg[si, 0]
-            else:
-                continue
-            table_rows.append([lbl, f"{plat:.1f}N", f"{plon:.1f}E"])
+    # 9. Prediction-location info table (top-right corner). Mỗi hàng = 1
+    # lead time, 2 cột = vĩ độ/kinh độ dự báo tại mốc đó. Không có Ground
+    # Truth/ADE vì đây là biến thể no-GT.
+    lead_times = [(0, "NOW"), (0, "+6h"), (1, "+12h"),
+                  (3, "+24h"), (7, "+48h"), (11, "+72h")]
+    table_rows = []
+    for si, lbl in lead_times:
+        if lbl == "NOW":
+            plat, plon = cur_pos[1], cur_pos[0]
+        elif si < len(pred_deg):
+            plat, plon = pred_deg[si, 1], pred_deg[si, 0]
+        else:
+            continue
+        table_rows.append([lbl, f"{plat:.1f}N", f"{plon:.1f}E"])
 
-        col_labels = ["Time", "Pred.\nLat", "Pred.\nLon"]
+    col_labels = ["Time", "Pred.\nLat", "Pred.\nLon"]
 
-        # [SHRINK] Bảng thu nhỏ (bbox height 0.26->0.20, width 0.39->0.33) và
-        # đặt cao hơn (y0 0.72->0.78) để không che vùng cone/track phía dưới
-        # bên trong bản đồ; đồng thời bỏ dòng title "Track Forecast Summary"
-        # và dòng "Ensemble spread" phía trên/dưới bảng theo yêu cầu, nên bảng
-        # giờ là thành phần duy nhất trong góc phải trên, không cần chừa thêm
-        # khoảng trống cho 2 dòng text đó nữa.
-        tbl = ax.table(
-            cellText=table_rows, colLabels=col_labels,
-            cellLoc="center", colLoc="center",
-            bbox=[0.72, 0.78, 0.22, 0.20],   # thu hẹp width (0.33->0.22): chỉ còn 3 cột thay vì 6
-            zorder=25,
-        )
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(5.5)
-        for (row, col), cell in tbl.get_celld().items():
-            cell.set_edgecolor(STYLE["info_box_edge"])
-            cell.set_linewidth(0.5)
-            if row == 0:
-                cell.set_facecolor(STYLE["info_box_title_bg"])
-                cell.set_text_props(fontweight="bold", color=STYLE["info_box_edge"])
-            else:
-                cell.set_facecolor("white")
+    tbl = ax.table(
+        cellText=table_rows, colLabels=col_labels,
+        cellLoc="center", colLoc="center",
+        bbox=[0.72, 0.78, 0.22, 0.20],   # [x0, y0, width, height], góc phải trên của axes
+        zorder=30,
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(6.0)
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_edgecolor(STYLE["info_box_edge"])
+        cell.set_linewidth(0.7)
+        if row == 0:
+            cell.set_facecolor(STYLE["info_box_title_bg"])
+            cell.set_text_props(fontweight="bold", color=STYLE["info_box_edge"])
+        else:
+            cell.set_facecolor("white")
 
 
     # 10. Legends
