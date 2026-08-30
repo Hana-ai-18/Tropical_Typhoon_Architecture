@@ -581,7 +581,7 @@ def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
     ax_twin = ax.twinx()
     ax_twin.set_facecolor(STYLE["bg_color"])
     ax_twin.plot(lead_h, errors_km, "o-", color=STYLE["pred_color"],
-                 lw=2.5, ms=5, label="mean DPE", zorder=6)
+                 lw=2.5, ms=5, label="FM ADE", zorder=6)
     # [FIX-5] Use ax_twin (not ax) so the fill is scaled to the error Y-axis
     ax_twin.fill_between(lead_h, 0, errors_km, alpha=0.10, color=STYLE["pred_color"])
 
@@ -911,10 +911,10 @@ def _plot_on_ax(
              edgecolors="black", linewidths=1.5, zorder=20)
 
     # 9. [RESTYLE — NCHMF-style info box] Thay hoàn toàn text box cũ
-    # (monospace, góc dưới trái, chỉ có Mean DPE+spread rời rạc) bằng bảng
+    # (monospace, góc dưới trái, chỉ có ADE+spread rời rạc) bằng bảng
     # dạng ax.table() ở góc phải trên, giống bố cục "TIN BAO KHAN CAP"
     # trong ảnh mẫu NCHMF: mỗi hàng = 1 lead time, các cột = lat/lon dự
-    # báo, lat/lon thực tế, Mean DPE. KHÔNG có cột cấp gió/Vmax/Pmin -- bài
+    # báo, lat/lon thực tế, ADE. KHÔNG có cột cấp gió/Vmax/Pmin -- bài
     # này chỉ dự báo track, không dự báo cường độ, nên cố tình bỏ các
     # cột đó thay vì để trống/N-A gây hiểu lầm là có nhưng thiếu dữ
     # liệu. Toàn bộ nhãn bằng tiếng Anh theo yêu cầu.
@@ -947,7 +947,7 @@ def _plot_on_ax(
                                f"{glat:.1f}N", f"{glon:.1f}E", ade_str])
 
         col_labels = ["Time", "Pred.\nLat", "Pred.\nLon",
-                     "Actual\nLat", "Actual\nLon", "Mean DPE\n(km)"]
+                     "Actual\nLat", "Actual\nLon", "ADE\n(km)"]
 
         # [SHRINK] Bảng thu nhỏ (bbox height 0.26->0.20, width 0.39->0.33) và
         # đặt cao hơn (y0 0.72->0.78) để không che vùng cone/track phía dưới
@@ -977,7 +977,7 @@ def _plot_on_ax(
     track_handles = [
         Line2D([0], [0], color=STYLE["obs_color"],  lw=2,   label="Observed"),
         Line2D([0], [0], color=STYLE["gt_color"],   lw=2,   label="Ground truth"),
-        Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label=f"Predicted ({pred_label})"),
+        Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label="Predicted"),
         mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
                        label="50% region (multiple trajectory predictions)"),
         mpatches.Patch(facecolor=STYLE["cone_90_fill"], alpha=0.35,
@@ -1032,7 +1032,7 @@ def _plot_multi_seed_on_ax(
     summary box, lead-time label, NOW star, legend track) nhưng:
       - KHÔNG có wind-intensity markers/legend (theo yêu cầu bỏ wind)
       - Predicted track giờ là NHIỀU đường (1/seed), màu theo XẾP HẠNG
-        chất lượng: seed có Mean DPE thấp nhất (tốt nhất) tô ĐẬM/dày, các
+        chất lượng: seed có ADE thấp nhất (tốt nhất) tô ĐẬM/dày, các
         seed còn lại tô NHẠT/mảnh hơn — thay vì mỗi seed 1 màu riêng
         như plot_multi_seed_comparison() cũ.
       - [FIX-14] Cone xác suất giờ vẽ TỪ ENSEMBLE CỦA SEED TỐT NHẤT
@@ -1049,7 +1049,7 @@ def _plot_multi_seed_on_ax(
     outline   = [pe.withStroke(linewidth=2.5, foreground="white")]
     cur_pos   = obs_deg[-1]
 
-    # Xếp hạng seed theo Mean DPE — tính SỚM (đầu hàm) vì cả cone (bước 1)
+    # Xếp hạng seed theo ADE — tính SỚM (đầu hàm) vì cả cone (bước 1)
     # lẫn predicted track (bước 4) đều cần biết seed nào tốt nhất.
     ranked = sorted(errors_by_seed.items(), key=lambda kv: kv[1].mean())
     best_seed_label = ranked[0][0]
@@ -1095,8 +1095,8 @@ def _plot_multi_seed_on_ax(
           markeredgecolor="white", markeredgewidth=1.2,
           zorder=8, path_effects=outline)
 
-    # 4. Predicted track — NHIỀU seed, màu/độ đậm theo xếp hạng Mean DPE.
-    # Seed tốt nhất (Mean DPE thấp nhất): pred_color đậm, nét dày, zorder cao
+    # 4. Predicted track — NHIỀU seed, màu/độ đậm theo xếp hạng ADE.
+    # Seed tốt nhất (ADE thấp nhất): pred_color đậm, nét dày, zorder cao
     # nhất (vẽ đè lên trên). Seed còn lại: cùng màu nhưng alpha thấp
     # hơn, nét mảnh hơn, zorder thấp hơn (vẽ dưới) — tạo cảm giác "mờ
     # dần" cho seed kém hơn, đúng yêu cầu "tốt nhất đậm, tệ nhạt".
@@ -1168,9 +1168,9 @@ def _plot_multi_seed_on_ax(
              s=350, marker="*", color="#FFD700",
              edgecolors="black", linewidths=1.5, zorder=20)
 
-    # 9. Error + Spread summary box — Mean DPE mỗi seed + spread gộp
+    # 9. Error + Spread summary box — ADE mỗi seed + spread gộp
     n = len(errors_km)
-    lines = ["Mean DPE by seed (km):"]
+    lines = ["ADE by seed (km):"]
     for seed_label, err in ranked:
         tag = " ★best" if seed_label == best_seed_label else ""
         lines.append(f" seed={seed_label}: {err.mean():.0f}{tag}")
@@ -1208,7 +1208,7 @@ def _plot_multi_seed_on_ax(
         Line2D([0], [0], color=STYLE["obs_color"],  lw=2,   label="Observed"),
         Line2D([0], [0], color=STYLE["gt_color"],   lw=2,   label="Ground truth"),
         Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, alpha=1.0,
-               label=f"Predicted (seed={best_seed_label}, best)"),
+               label="Predicted (best)"),
         Line2D([0], [0], color=STYLE["pred_color"], lw=1.5, alpha=0.5,
                label="Predicted (other seeds)"),
         mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
@@ -1507,7 +1507,7 @@ def plot_multi_model_comparison(obs_deg, gt_deg, preds_by_model, errors_by_model
     """
     [MERGE, từ plot_track_paper_style.py] Vẽ nhiều model (FM + baselines)
     trên CÙNG 1 bản đồ, so với 1 ground truth chung — mỗi model 1 màu
-    (MODEL_COLORS), legend ghi kèm Mean DPE của từng model. Dùng make_map_ax
+    (MODEL_COLORS), legend ghi kèm ADE của từng model. Dùng make_map_ax
     (đã đổi sang style trắng ở trên) để bản đồ nhất quán với single/
     case_study mode.
     """
@@ -1565,7 +1565,7 @@ def plot_multi_model_comparison(obs_deg, gt_deg, preds_by_model, errors_by_model
               markersize=STYLE["marker_size"] - 1, zorder=9, alpha=0.9)
         ade = errors_by_model[model_name].mean()
         handles.append(Line2D([0], [0], color=color, marker="o", lw=1.6,
-                              label=f"{model_name} (Mean DPE={ade:.0f}km)"))
+                              label=f"{model_name} (ADE={ade:.0f}km)"))
 
     ax.set_title(f"{t_name} — Model Comparison", fontsize=13,
                 fontweight="bold", color=STYLE["text_color"])
@@ -1599,7 +1599,7 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
     """
     Vẽ nhiều SEED của CÙNG 1 kiến trúc (mặc định FM, nhưng tổng quát cho
     bất kỳ model nào truyền vào) trên cùng 1 bản đồ, so với 1 ground
-    truth chung — mỗi seed 1 màu (SEED_COLORS), legend ghi kèm Mean DPE từng
+    truth chung — mỗi seed 1 màu (SEED_COLORS), legend ghi kèm ADE từng
     seed. Khác plot_multi_model_comparison() ở chỗ trục "nhiều đường" là
     SEED thay vì MODEL — dùng để minh hoạ độ ổn định của 1 kiến trúc qua
     random init, không phải so sánh kiến trúc với nhau.
@@ -1687,7 +1687,7 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
               markersize=STYLE["marker_size"] - 1, zorder=9, alpha=0.9)
         ade = errors_by_seed[seed_label].mean()
         handles.append(Line2D([0], [0], color=color, marker="o", lw=1.6,
-                              label=f"seed={seed_label} (Mean DPE={ade:.0f}km)"))
+                              label=f"seed={seed_label} (ADE={ade:.0f}km)"))
 
         # [BỔ SUNG] Panel wind theo lead-time, 1 đường/seed + 1 đường GT
         if has_wind:
@@ -2111,7 +2111,7 @@ def visualize_case_study(args):
 
         ade = errors_km.mean()
         e72 = errors_km[11] if len(errors_km) > 11 else float("nan")
-        print(f"  [{label}] Mean DPE={ade:.1f} km  72h={e72:.1f} km")
+        print(f"  [{label}] ADE={ade:.1f} km  72h={e72:.1f} km")
 
     os.makedirs(args.output_dir, exist_ok=True)
     out = os.path.join(args.output_dir, "case_study_grid_v13.png")
@@ -2187,7 +2187,7 @@ def visualize_multi_model(args):
         winds_pred_by_model[name] = wpred
         if wind_gt is None:
             wind_gt = wgt  # giống nhau cho mọi model (cùng ground truth)
-        print(f"    {name}: Mean DPE={err.mean():.1f}km")
+        print(f"    {name}: ADE={err.mean():.1f}km")
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -2233,7 +2233,7 @@ def visualize_batch_all_storms(args):
     """
     [MỚI] Chạy visualize cho MỌI storm x MỌI timestep có sẵn trong
     dataset x 5 model (FM/ST-Trans/LSTM/GRU/RNN). Với mỗi model, chạy
-    đủ 3 seed để XÁC ĐỊNH seed nào có Mean DPE thấp nhất (tốt nhất), nhưng
+    đủ 3 seed để XÁC ĐỊNH seed nào có ADE thấp nhất (tốt nhất), nhưng
     CHỈ VẼ seed tốt nhất đó — dùng thẳng _plot_on_ax() (giống hệt
     visualize_forecast(), full map không inset, đúng style/nền đã xác
     nhận đúng), KHÔNG còn hiển thị multi-seed đậm/nhạt như bản trước.
@@ -2342,7 +2342,7 @@ def visualize_batch_all_storms(args):
                     continue
 
                 # [FIX-17] Theo yêu cầu: KHÔNG còn hiển thị multi-seed
-                # (đậm/nhạt) nữa — chỉ chọn seed có Mean DPE thấp nhất (tốt
+                # (đậm/nhạt) nữa — chỉ chọn seed có ADE thấp nhất (tốt
                 # nhất) rồi vẽ y hệt visualize_forecast() (dùng thẳng
                 # _plot_on_ax(), full map không inset, đúng style/nền
                 # đã xác nhận đúng ở visualize_forecast()).
@@ -2493,7 +2493,7 @@ def visualize_multi_seed(args):
         winds_pred_by_seed[seed_label] = wpred
         if wind_gt is None:
             wind_gt = wgt  # giống nhau cho mọi seed (cùng ground truth)
-        print(f"    seed={seed_label}: Mean DPE={err.mean():.1f}km")
+        print(f"    seed={seed_label}: ADE={err.mean():.1f}km")
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

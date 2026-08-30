@@ -928,7 +928,7 @@ def _plot_on_ax(
     # 10. Legends
     track_handles = [
         Line2D([0], [0], color=STYLE["obs_color"],  lw=2,   label="Observed"),
-        Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label=f"Predicted ({pred_label})"),
+        Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label="Predicted"),
         mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
                        label="50% region (multiple trajectory predictions)"),
         mpatches.Patch(facecolor=STYLE["cone_90_fill"], alpha=0.35,
@@ -1155,7 +1155,7 @@ def _plot_multi_seed_on_ax(
         Line2D([0], [0], color=STYLE["obs_color"],  lw=2,   label="Observed"),
         Line2D([0], [0], color=STYLE["gt_color"],   lw=2,   label="Ground truth"),
         Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, alpha=1.0,
-               label=f"Predicted (seed={best_seed_label}, best)"),
+               label="Predicted (best)"),
         Line2D([0], [0], color=STYLE["pred_color"], lw=1.5, alpha=0.5,
                label="Predicted (other seeds)"),
         mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
