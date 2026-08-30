@@ -195,27 +195,6 @@ class SWAHandler:
         self.start_ep  = None
         self.n_updates = 0
         self.avg_state = {}
-        # [SWA-STAGNATION-COUNTER] Root cause this addresses: once SWA
-        # activates, patience_cnt is frozen at 0 for as long as swa.active
-        # is True (see the training loop's "No improve X/40 [SWA active
-        # -- patience frozen]" branch) -- this was the deliberate fix for
-        # a DIFFERENT problem (SWA being early-stopped before it had a
-        # fair chance, confirmed in prior logs: activated ep90, stopped
-        # ep110). But freezing patience has no upper bound of its own: if
-        # SWA genuinely never surpasses best_score again, training now
-        # runs to the full --num_epochs budget regardless, since nothing
-        # else can trigger early stop while swa.active. Observed directly
-        # in a real run: SWA activated ep90, and by ep140 (50 epochs and
-        # ~14000 updates later) still had not beaten the pre-SWA best
-        # (best=213.29 at ep110, SWA still at 213.6-213.9 range at ep140),
-        # with val_ADE essentially flat (244.1-244.9km) the entire time --
-        # a real training-time trade-off from the earlier fix, not a bug
-        # in it. This counter tracks consecutive SWA-checkpoints that
-        # failed to beat best_score, giving the training loop a way to
-        # stop SWA-stagnation without reintroducing the original problem
-        # (a fixed, generous threshold, checked only at SWA validation
-        # points -- not on every ordinary epoch the way patience_cnt is).
-        self.stagnant_swa_checks = 0
 
     def should_activate(self, ade_history: List[float],
                          window: int = 3, threshold: float = 1.5) -> bool:
@@ -658,7 +637,7 @@ def get_args():
     p.add_argument("--no_ot",                  dest="use_ot",  action="store_false")
     p.add_argument("--ot_epsilon",             default=0.05,   type=float)
     p.add_argument("--n_ensemble",             default=20,     type=int)
-    p.add_argument("--sigma_inference",        default=0.06,   type=float)
+    p.add_argument("--sigma_inference",        default=0.04,   type=float)
     p.add_argument("--n_inference_steps",      default=10,     type=int)
   
     p.add_argument("--num_epochs",             default=250,    type=int)
@@ -699,18 +678,6 @@ def get_args():
     p.add_argument("--swa_window",             default=3,      type=int)
     p.add_argument("--swa_threshold",          default=1.5,    type=float)
     p.add_argument("--swa_min_ep",             default=50,     type=int)
-    # [SWA-STAGNATION-COUNTER] See SWAHandler.stagnant_swa_checks'
-    # __init__ comment: once SWA activates, patience_cnt freezes at 0 for
-    # the entire SWA phase, so nothing else can trigger early stop -- this
-    # is a SEPARATE, coarser patience checked only at SWA validation
-    # points (every val_freq epochs), not every ordinary epoch. Default
-    # 12 checks * val_freq=5 = ~60 epochs of SWA stagnation tolerated
-    # before stopping -- generous enough that SWA still gets a fair shot
-    # (confirmed against real logs: prior early-stopping at only ~20
-    # epochs post-activation was too aggressive), but bounded so a run
-    # doesn't silently consume the full --num_epochs budget once SWA has
-    # genuinely plateaued.
-    p.add_argument("--swa_patience",           default=12,     type=int)
     # Test
     p.add_argument("--tta_test",               default=True,   action="store_true")
     p.add_argument("--n_tta",                  default=5,      type=int)
@@ -736,24 +703,6 @@ def get_args():
     p.add_argument("--disable_hard_reg",       action="store_true", default=False,
                    help="Ablation: disable hard_score_weight_logits uniform "
                         "regularizer (same as --lambda_hard_reg 0.0)")
-    p.add_argument("--disable_film",           action="store_true", default=False,
-                   help="Ablation: disable HORIZON-FILM (freeze "
-                        "velocity.film_gamma at 1.0 and velocity.film_beta "
-                        "at 0.0 throughout training, so horizon_ctx = "
-                        "1.0*cond_vec + 0.0 = cond_vec, identical to the "
-                        "pre-FiLM baseline where every horizon receives the "
-                        "SAME unmodulated context). Since film_gamma/beta "
-                        "are initialized to exactly this identity transform "
-                        "(nn.init.ones_/zeros_, see flow_matching_model.py's "
-                        "VelocityTransformer.__init__), freezing them at "
-                        "their own init values -- rather than removing the "
-                        "parameters or changing the architecture -- is the "
-                        "correct way to ablate FiLM: it isolates whether "
-                        "LEARNING a horizon-specific context modulation "
-                        "helps, with everything else (parameter count, "
-                        "forward-pass structure, gradient flow through the "
-                        "rest of the network) held identical to the full "
-                        "model.")
     p.add_argument("--ablation_name",          type=str, default="")
     return p.parse_args()
 
@@ -863,28 +812,6 @@ def main(args):
         sigma_inference=args.sigma_inference,
         use_curvature_score_train=args.use_curvature_score_train,
     ).to(device)
-
-    if args.disable_film:
-        # [ABLATION: --disable_film] film_gamma/film_beta are initialized
-        # to exactly the identity transform (gamma=1, beta=0 -- see
-        # VelocityTransformer.__init__ in flow_matching_model.py), so
-        # freezing them at those init values here reproduces the pre-FiLM
-        # baseline exactly: horizon_ctx = 1.0*cond_vec + 0.0 = cond_vec,
-        # identical for every horizon, same as before HORIZON-FILM was
-        # added. requires_grad_(False) stops gradient updates without
-        # removing the parameters or changing the forward-pass structure,
-        # so this isolates the effect of LEARNING horizon-specific context
-        # modulation while keeping parameter count, architecture, and
-        # gradient flow through the rest of the network identical to the
-        # full model -- the correct way to ablate a zero-impact-at-init
-        # mechanism (verified for FiLM's init values via
-        # nn.init.ones_/zeros_, matching every other LEARN-* mechanism's
-        # own zero-impact-at-init convention in this file).
-        model.velocity.film_gamma.weight.requires_grad_(False)
-        model.velocity.film_beta.weight.requires_grad_(False)
-        print("  [ABLATION] --disable_film: film_gamma/beta frozen at "
-              "identity (1.0/0.0) — model behaves as if HORIZON-FILM was "
-              "never added.")
 
     model_cfg = dict(
         pred_len=args.pred_len,        obs_len=args.obs_len,
@@ -1244,25 +1171,12 @@ def main(args):
               f"  t={time.perf_counter()-t0_ep:.0f}s"
               f"{sanitize_s}")
 
-        # [PATCH-SEED-IN-CKPT] Seed trước đây chỉ được ghi vào
-        # footprint.json/auto_eval_summary.json (file JSON riêng, cùng
-        # thư mục output_dir), KHÔNG có trong chính file .pth. Nếu 2 file
-        # JSON đó bị mất/không giữ lại (ví dụ chỉ copy .pth ra khỏi
-        # Kaggle), seed của checkpoint không thể khôi phục được -- đã xảy
-        # ra thực tế với 7/9 ablation checkpoint ban đầu (evaluate script
-        # phải in "seed=unknown"). Vá: thêm "seed" và "ablation_name"
-        # trực tiếp vào payload .pth qua tham số `extra` sẵn có của
-        # _save() (không đụng vào model_cfg, vì model_cfg được dùng để
-        # TCFlowMatching(**model_cfg) tái tạo kiến trúc -- thêm seed vào
-        # đó sẽ làm vỡ lời gọi constructor ở nơi khác).
-        _ckpt_id_extra = {"seed": args.seed,
-                           "ablation_name": args.ablation_name or "full"}
         _save(last_ckpt, ep, model, opt, sched, best_score, ema, scaler,
-              extra=_ckpt_id_extra, model_cfg=model_cfg)
+              model_cfg=model_cfg)
         if ep % 5 == 0:
             ep_ckpt = os.path.join(args.output_dir, f"ckpt_ep{ep:03d}.pth")
             _save(ep_ckpt, ep, model, opt, sched, best_score, ema, scaler,
-                  extra=_ckpt_id_extra, model_cfg=model_cfg)
+                  model_cfg=model_cfg)
             print(f"  💾 {ep_ckpt}")
         if rel_ep % args.val_freq == 0:
             run_xai_this = (rel_ep % 10 == 0)
@@ -1289,8 +1203,7 @@ def main(args):
                 best_score = score; patience_cnt = 0
                 _save(best_ckpt, ep, model, opt, sched, best_score, ema, scaler,
                       extra={"val_ade": r["ADE"], "val_ate": r["ATE"],
-                             "val_cte": r["CTE"], "patience_cnt": 0,
-                             **_ckpt_id_extra},
+                             "val_cte": r["CTE"], "patience_cnt": 0},
                       model_cfg=model_cfg)
                 print(f"  ✅ Best! score={best_score:.2f}"
                       f"  ADE={r['ADE']:.1f} ATE={r['ATE']:.1f} CTE={r['CTE']:.1f}")
@@ -1335,8 +1248,7 @@ def main(args):
             if r_h["combined_score"] < best_hard and r_h["n_hard"] >= 10:
                 best_hard = r_h["combined_score"]
                 _save(hard_best_ckpt, ep, model, opt, sched, best_hard, ema, scaler,
-                      extra={"hard_val_ade": r_h["ADE"], "selection_criterion": "hard_val",
-                             **_ckpt_id_extra},
+                      extra={"hard_val_ade": r_h["ADE"], "selection_criterion": "hard_val"},
                       model_cfg=model_cfg)
                 print(f"  💎 Hard-best! score={best_hard:.2f} ADE={r_h['ADE']:.1f}")
 
@@ -1355,34 +1267,13 @@ def main(args):
             print(f"  [SWA] score={swa_score:.2f} ({swa.n_updates} updates) vs best={best_score:.2f}")
             if swa_score < best_score:
                 best_score = swa_score; patience_cnt = 0
-                swa.stagnant_swa_checks = 0
                 swa.save_avg_state(swa_ckpt, ep, best_score,
                                    extra={"val_ade": r_swa["ADE"],
                                           "val_ate": r_swa["ATE"],
-                                          "val_cte": r_swa["CTE"],
-                                          **_ckpt_id_extra},
+                                          "val_cte": r_swa["CTE"]},
                                    model_cfg=model_cfg)
                 import shutil; shutil.copy(swa_ckpt, best_ckpt)
                 print(f"  ✅ SWA best! score={best_score:.2f} ADE={r_swa['ADE']:.1f}")
-            else:
-                # [SWA-STAGNATION STOP] See SWAHandler.stagnant_swa_checks'
-                # __init__ comment for the full rationale: patience_cnt is
-                # frozen at 0 while swa.active, so nothing else in this
-                # loop can trigger early stop once SWA starts -- without
-                # this counter, a SWA phase that genuinely stopped
-                # improving would run to the full --num_epochs budget.
-                # args.swa_patience is checked only here, at SWA
-                # validation points (every val_freq epochs), not on every
-                # ordinary training epoch -- a deliberately coarser signal
-                # than patience_cnt, matching how infrequently SWA's own
-                # averaged weights actually change enough to matter.
-                swa.stagnant_swa_checks += 1
-                print(f"  [SWA] stagnant {swa.stagnant_swa_checks}/{args.swa_patience} "
-                      f"SWA-checks since last SWA improvement")
-                if swa.stagnant_swa_checks >= args.swa_patience:
-                    print(f"  ⛔ Early stop @ ep{ep} (SWA stagnant for "
-                          f"{swa.stagnant_swa_checks} consecutive checks)")
-                    break
 
     _wall_total = time.time() - _wall_start
     print(f"\n  Training wall-clock: {_wall_total/3600:.2f}h ({_wall_total:.0f}s)")
