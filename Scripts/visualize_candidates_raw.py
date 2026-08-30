@@ -127,17 +127,17 @@ def run_inference_raw_candidates(model, target, device, ode_steps, num_candidate
     return obs_deg, gt_deg, ens_deg, errors_per_candidate
 
 
-def plot_raw_candidates(ax, lon_range, lat_range, obs_deg, gt_deg, cand_deg,
-                          title="", dt_str=""):
+def plot_raw_candidates(ax, lon_range, lat_range, obs_deg, gt_deg, cand_deg_1,
+                          cand_idx=0, cand_color=None, title="", dt_str=""):
     """
-    Vẽ obs (đen), ground truth (đường chính, nổi bật), và cand_deg.shape[0]
-    candidate riêng lẻ (mỗi đường 1 màu, mảnh hơn GT, KHÔNG có cone/vùng
-    tô — đây là điểm khác biệt chính so với _plot_on_ax của file gốc, vốn
-    chỉ vẽ pred_mean + cone tổng hợp).
+    Vẽ obs (đen), ground truth (đường chính, nổi bật), và ĐÚNG 1 candidate
+    riêng lẻ (cand_deg_1, shape [T, 2]) — mỗi lần gọi hàm này ứng với ĐÚNG
+    1 file ảnh output, không gộp nhiều candidate vào cùng 1 hình.
     """
     transform = ccrs.PlateCarree() if HAS_CARTOPY else None
     outline   = [pe.withStroke(linewidth=2.5, foreground="white")]
     cur_pos   = obs_deg[-1]
+    color     = cand_color or CANDIDATE_COLORS[cand_idx % len(CANDIDATE_COLORS)]
 
     def _plot(x, y, fmt=None, **kw):
         args_ = [x, y] + ([fmt] if fmt is not None else [])
@@ -169,19 +169,12 @@ def plot_raw_candidates(ax, lon_range, lat_range, obs_deg, gt_deg, cand_deg,
           markeredgecolor="white", markeredgewidth=1.2,
           zorder=8, path_effects=outline)
 
-    # K raw candidates — mỗi đường 1 màu riêng, mảnh, không markers dày
-    # để không che lẫn nhau; alpha<1 để đường chồng lấn vẫn phân biệt được.
-    K = cand_deg.shape[0]
-    candidate_handles = []
-    for k in range(K):
-        color = CANDIDATE_COLORS[k % len(CANDIDATE_COLORS)]
-        c_lon = np.concatenate([[cur_pos[0]], cand_deg[k, :, 0]])
-        c_lat = np.concatenate([[cur_pos[1]], cand_deg[k, :, 1]])
-        _plot(c_lon, c_lat, fmt="o-", color=color, linewidth=1.6,
-              markersize=3.5, alpha=0.85, zorder=9 + k,
-              markeredgecolor="white", markeredgewidth=0.5)
-        candidate_handles.append(
-            Line2D([0], [0], color=color, lw=1.8, label=f"Candidate {k+1}"))
+    # Đúng 1 candidate
+    c_lon = np.concatenate([[cur_pos[0]], cand_deg_1[:, 0]])
+    c_lat = np.concatenate([[cur_pos[1]], cand_deg_1[:, 1]])
+    _plot(c_lon, c_lat, fmt="o-", color=color, linewidth=2.2,
+          markersize=STYLE["marker_size"], zorder=9,
+          markeredgecolor="white", markeredgewidth=0.8, path_effects=outline)
 
     # NOW star
     _scatter([cur_pos[0]], [cur_pos[1]],
@@ -192,11 +185,12 @@ def plot_raw_candidates(ax, lon_range, lat_range, obs_deg, gt_deg, cand_deg,
     track_handles = [
         Line2D([0], [0], color=STYLE["obs_color"], lw=2, label="Observed"),
         Line2D([0], [0], color=STYLE["gt_color"],  lw=2, label="Ground truth"),
-    ] + candidate_handles
+        Line2D([0], [0], color=color, lw=2.2, label=f"Candidate {cand_idx+1}"),
+    ]
     ax.legend(handles=track_handles, loc="lower right", fontsize=7.5,
               facecolor="white", edgecolor=STYLE["panel_edge"],
               labelcolor=STYLE["text_color"], framealpha=0.92,
-              title=f"Legend ({K} raw candidates, pre-selection)",
+              title="Legend (pre-selection candidate)",
               title_fontsize=8)
 
     ax.set_title(
@@ -272,22 +266,33 @@ def visualize_candidates(args):
         extra = (wanted_lat_span - lat_span_cur) / 2.0
         lat_range = (lat_range[0] - extra, lat_range[1] + extra)
 
-    fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor=STYLE["bg_color"])
-    gs  = fig.add_gridspec(1, 1)
-    ax_map = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
-
     dt_str = datetime.strptime(t_date, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
     fh     = cand_deg.shape[1] * 6
 
-    plot_raw_candidates(ax_map, lon_range, lat_range, obs_deg, gt_deg, cand_deg,
-                          title=t_name, dt_str=dt_str)
-
+    # Mỗi candidate -> 1 figure riêng, 1 file PNG riêng (không gộp chung
+    # 1 hình như trước). lon_range/lat_range dùng CHUNG cho mọi candidate
+    # (tính từ toàn bộ K candidate ở trên) để các file có cùng khung nhìn,
+    # dễ so sánh trực quan cạnh nhau dù mở riêng từng ảnh.
     os.makedirs(args.output_dir, exist_ok=True)
-    out = os.path.join(args.output_dir,
-                        f"candidates_{fh}h_{t_name}_{t_date}.png")
-    plt.savefig(out, dpi=200, bbox_inches="tight", facecolor=STYLE["bg_color"])
-    plt.close()
-    print(f"  Saved → {out}\n")
+    K = cand_deg.shape[0]
+    for k in range(K):
+        fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor=STYLE["bg_color"])
+        gs  = fig.add_gridspec(1, 1)
+        ax_map = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
+
+        plot_raw_candidates(
+            ax_map, lon_range, lat_range, obs_deg, gt_deg, cand_deg[k],
+            cand_idx=k, title=t_name, dt_str=dt_str,
+        )
+
+        out = os.path.join(
+            args.output_dir,
+            f"candidates_{fh}h_{t_name}_{t_date}_cand{k+1}.png",
+        )
+        plt.savefig(out, dpi=200, bbox_inches="tight", facecolor=STYLE["bg_color"])
+        plt.close()
+        print(f"  Saved → {out}")
+    print()
 
 
 def get_args():
