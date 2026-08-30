@@ -1,0 +1,125 @@
+{
+  "DANAS_2019071612": {
+    "forecast_time": "2019-07-16 12:00",
+    "points": [
+      {
+        "hour": 0,
+        "lat": 17.2,
+        "lon": 123.7,
+        "intensity_kt": 30
+      },
+      {
+        "hour": 12,
+        "lat": 18.2,
+        "lon": 122.6,
+        "intensity_kt": 30
+      },
+      {
+        "hour": 24,
+        "lat": 19.7,
+        "lon": 122.1,
+        "intensity_kt": 35
+      },
+      {
+        "hour": 36,
+        "lat": 21.6,
+        "lon": 121.8,
+        "intensity_kt": 40
+      },
+      {
+        "hour": 48,
+        "lat": 23.9,
+        "lon": 121.7,
+        "intensity_kt": 40
+      },
+      {
+        "hour": 72,
+        "lat": 28.2,
+        "lon": 121.4,
+        "intensity_kt": 45
+      },
+      {
+        "hour": 96,
+        "lat": 32.3,
+        "lon": 122.2,
+        "intensity_kt": 40
+      },
+      {
+        "hour": 120,
+        "lat": 36.5,
+        "lon": 123.8,
+        "intensity_kt": 35
+      }
+    ]
+  },
+  "LINFA_2009061818": {
+    "forecast_time": "2009-06-18 12:00",
+    "points": [
+      {
+        "hour": 0,
+        "lat": 17.5,
+        "lon": 116.4
+      },
+      {
+        "hour": 12,
+        "lat": 17.9,
+        "lon": 116.9
+      },
+      {
+        "hour": 24,
+        "lat": 18.6,
+        "lon": 117.8
+      },
+      {
+        "hour": 36,
+        "lat": 19.6,
+        "lon": 118.8
+      },
+      {
+        "hour": 48,
+        "lat": 20.7,
+        "lon": 119.8
+      },
+      {
+        "hour": 72,
+        "lat": 23.6,
+        "lon": 121.9
+      }
+    ]
+  },
+  "EWINIAR_2024052506": {
+    "forecast_time": "2024-05-25 06:00",
+    "points": [
+      {
+        "hour": 0,
+        "lat": 12.8,
+        "lon": 123.0
+      },
+      {
+        "hour": 12,
+        "lat": 13.9,
+        "lon": 121.7
+      },
+      {
+        "hour": 24,
+        "lat": 14.8,
+        "lon": 121.5
+      },
+      {
+        "hour": 36,
+        "lat": 15.6,
+        "lon": 122.2
+      },
+      {
+        "hour": 48,
+        "lat": 16.6,
+        "lon": 123.3
+      },
+      {
+        "hour": 72,
+        "lat": 19.4,
+        "lon": 126.2
+      }
+    ]
+  }
+}
