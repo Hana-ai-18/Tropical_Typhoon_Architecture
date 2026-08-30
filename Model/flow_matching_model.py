@@ -371,7 +371,7 @@ def _ot_match(x0_flat: torch.Tensor, x1_flat: torch.Tensor,
         if not torch.isfinite(s) or s < 1e-10:
             return x0_flat, x1_flat
         idx = torch.multinomial(flat / s, num_samples=B, replacement=True)
-        return x0_flat[idx // B], x1_flat
+        return x0_flat[idx // B], x1_flat[idx % B]
     except Exception:
         return x0_flat, x1_flat
 
