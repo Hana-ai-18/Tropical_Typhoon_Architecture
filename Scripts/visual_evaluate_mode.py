@@ -979,9 +979,9 @@ def _plot_on_ax(
         Line2D([0], [0], color=STYLE["gt_color"],   lw=2,   label="Ground truth"),
         Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label=f"Predicted ({pred_label})"),
         mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
-                       label="50% prob. cone (center track)"),
+                       label="50% region (multiple trajectory predictions)"),
         mpatches.Patch(facecolor=STYLE["cone_90_fill"], alpha=0.35,
-                       label="90% prob. cone (strong-wind area)"),
+                       label="90% region (multiple trajectory predictions)"),
     ]
     ax.legend(handles=track_handles, loc="lower right", fontsize=7.5,
               facecolor="white", edgecolor=STYLE["panel_edge"],
@@ -1212,9 +1212,9 @@ def _plot_multi_seed_on_ax(
         Line2D([0], [0], color=STYLE["pred_color"], lw=1.5, alpha=0.5,
                label="Predicted (other seeds)"),
         mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
-                       label="50% prob. cone"),
+                       label="50% region (multiple trajectory predictions)"),
         mpatches.Patch(facecolor=STYLE["cone_90_fill"], alpha=0.35,
-                       label="90% prob. cone"),
+                       label="90% region (multiple trajectory predictions)"),
     ]
     ax.legend(handles=track_handles, loc="lower right", fontsize=7.5,
               facecolor="white", edgecolor=STYLE["panel_edge"],
@@ -1973,68 +1973,55 @@ def visualize_forecast(args):
     lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
     lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
 
-    # [FIX] Theo yêu cầu mới nhất: bỏ panel Spread vs Error, map chiếm
-    # phần lớn width. Figure to hơn (14x13, trước là 11x12) + tỷ lệ
-    # ngang rộng hơn nhờ lon_range đã mở, theo đúng yêu cầu "kéo bề
-    # ngang to ra".
+    # [FIX, cố định khung hình] Trước đây figsize được TÍNH ĐỘNG theo tỷ
+    # lệ lon_range/lat_range thật của track (map_aspect), để tránh
+    # khoảng trắng 2 bên khi cartopy PlateCarree tự giữ đúng tỷ lệ 1:1
+    # kinh/vĩ. Nhưng cách đó khiến MỖI ảnh xuất ra có kích thước khác
+    # nhau tùy theo storm — không so sánh được cạnh nhau dễ dàng.
     #
-    # [BỔ SUNG] Inset zoom cận cảnh (subplot nhỏ bên phải map chính):
-    # khi sai số dự báo THẬT rất lớn (model lệch hướng nhiều trăm-nghìn
-    # km so với track thật), map chính buộc phải trải khung nhìn rất
-    # rộng để chứa đủ cả obs/gt/pred — khiến ensemble spread (thường
-    # chỉ vài chục km) không thể nhìn thấy rõ dù dữ liệu hoàn toàn
-    # không co cụm (đây là vấn đề TỶ LỆ, đã xác nhận qua box "Spread
-    # (1σ)" luôn có số thật != 0). Inset này zoom RIÊNG vào vùng dự
-    # báo (pred + ensemble, margin nhỏ cố định ~1.5x max spread thay vì
-    # margin theo track dài), để ensemble luôn nhìn rõ được bất kể map
-    # chính phải zoom xa cỡ nào.
-    # [FIX, quan trọng] Layout trước đây dùng figsize CỐ ĐỊNH (18,13)
-    # không tính tỷ lệ khung hình thật của map — với PlateCarree,
-    # cartopy giữ ĐÚNG tỷ lệ 1:1 độ kinh/vĩ khi vẽ. Track RITA trải dài
-    # chủ yếu theo VĨ ĐỘ (cao-hẹp), nhưng figsize (18,13) là khung
-    # RỘNG-THẤP (tỷ lệ ~1.38:1) — matplotlib tự co map lại theo chiều
-    # ngang để giữ đúng aspect ratio địa lý, để lại khoảng trắng lớn 2
-    # bên (đúng hiện tượng quan sát được trong ảnh). Giờ tính figsize
-    # ĐỘNG theo đúng tỷ lệ lon_range/lat_range thật của map chính, với
-    # 1 cột phụ hẹp cho inset (không dùng width_ratios cố định nữa vì
-    # nó không biết trước tỷ lệ khung hình thật).
-    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
-    fig_h = 11.0
-    fig_w_map = fig_h * map_aspect
-    fig_w_map = float(np.clip(fig_w_map, 5.0, 14.0))   # tránh quá hẹp/quá rộng
-    inset_lon_r, inset_lat_r = _inset_range(pred_deg, ens_deg)
-    inset_aspect = (inset_lon_r[1] - inset_lon_r[0]) / max(inset_lat_r[1] - inset_lat_r[0], 0.01)
-    fig_w_inset = float(np.clip(fig_h * inset_aspect, 3.0, 7.0))
+    # Giờ đảo ngược cách tiếp cận: CỐ ĐỊNH khung hình (figsize không đổi,
+    # chữ nhật đứng — portrait), rồi thay vào đó MỞ RỘNG lon_range (giữ
+    # nguyên lat_range, vốn đã phản ánh đúng độ dài track theo chiều
+    # dọc) sao cho tỷ lệ lon_range/lat_range KHỚP ĐÚNG tỷ lệ khung hình
+    # cố định. Nhờ vậy map luôn lấp đầy toàn bộ khung (không còn khoảng
+    # trắng 2 bên do mismatch aspect ratio), và track luôn được vẽ to
+    # hết mức có thể trong khung đó — đúng yêu cầu "phóng to/thu nhỏ
+    # để bão được vẽ lên rõ trong khung", thay vì đổi khung theo track.
+    FIG_W, FIG_H = 9.0, 12.0   # khung chữ nhật đứng cố định cho MỌI storm
+    target_aspect = FIG_W / FIG_H   # tỷ lệ lon_range/lat_range cần đạt
+    lon_span_cur  = lon_range[1] - lon_range[0]
+    lat_span_cur  = max(lat_range[1] - lat_range[0], 0.01)
+    cur_aspect    = lon_span_cur / lat_span_cur
 
-    fig = plt.figure(figsize=(fig_w_map + fig_w_inset + 1.5, fig_h),
-                     facecolor=STYLE["bg_color"])
-    gs  = fig.add_gridspec(1, 2, width_ratios=[fig_w_map, fig_w_inset], wspace=0.15)
-    ax_map   = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
-    ax_inset = make_map_ax(fig, gs[0, 1], inset_lon_r, inset_lat_r)
+    if cur_aspect < target_aspect:
+        # Track hẹp hơn khung theo chiều ngang -> mở rộng lon_range,
+        # giữ nguyên tâm và giữ nguyên lat_range.
+        wanted_lon_span = target_aspect * lat_span_cur
+        extra = (wanted_lon_span - lon_span_cur) / 2.0
+        lon_range = (lon_range[0] - extra, lon_range[1] + extra)
+    else:
+        # Track rộng hơn khung theo chiều ngang (hiếm, track gần theo
+        # hướng Đông-Tây) -> mở rộng lat_range thay vì cắt bớt lon_range,
+        # để không làm mất một phần track khỏi khung nhìn.
+        wanted_lat_span = lon_span_cur / target_aspect
+        extra = (wanted_lat_span - lat_span_cur) / 2.0
+        lat_range = (lat_range[0] - extra, lat_range[1] + extra)
+
+    fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor=STYLE["bg_color"])
+    gs  = fig.add_gridspec(1, 1)
+    ax_map = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
 
     dt_str    = datetime.strptime(t_date, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
     fh        = args.pred_len * 6
-    snap_note = f" [snapped from {args.tc_date}]" if was_snapped else ""
 
     _plot_on_ax(
         ax_map, lon_range, lat_range,
         obs_deg, gt_deg, pred_deg, pred_Me_n,
         all_trajs_deg=ens_deg if args.num_ensemble >= 3 else None,
         errors_km=errors_km,
-        title=(
-            f"{t_name}  —  {fh}h FC  |  FM"
-            f"  (ens={args.num_ensemble}, ode_steps={args.ode_steps}){snap_note}"
-        ),
+        title=t_name,
         dt_str=dt_str,
         ref_spread_km=ref_spread_km,
-    )
-    _plot_on_ax(
-        ax_inset, inset_lon_r, inset_lat_r,
-        obs_deg, gt_deg, pred_deg, pred_Me_n,
-        all_trajs_deg=ens_deg if args.num_ensemble >= 3 else None,
-        errors_km=None,   # không lặp lại error summary box trong inset — chỉ cần cone
-        title="Zoom: Predicted + Spread",
-        dt_str="",
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -2382,11 +2369,26 @@ def visualize_batch_all_storms(args):
                     lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
                     lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
 
-                    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
-                    fig_h = 11.0
-                    fig_w_map = float(np.clip(fig_h * map_aspect, 5.0, 14.0))
+                    # [FIX, cố định khung hình] Cùng cách tiếp cận đã áp
+                    # dụng ở visualize_forecast(): khung chữ nhật đứng
+                    # CỐ ĐỊNH cho MỌI storm/model (so sánh cạnh nhau dễ
+                    # dàng), mở rộng lon_range để khớp đúng tỷ lệ khung
+                    # thay vì để figsize co giãn theo từng track.
+                    FIG_W, FIG_H = 9.0, 12.0
+                    target_aspect = FIG_W / FIG_H
+                    lon_span_cur  = lon_range[1] - lon_range[0]
+                    lat_span_cur  = max(lat_range[1] - lat_range[0], 0.01)
+                    cur_aspect    = lon_span_cur / lat_span_cur
+                    if cur_aspect < target_aspect:
+                        wanted_lon_span = target_aspect * lat_span_cur
+                        extra = (wanted_lon_span - lon_span_cur) / 2.0
+                        lon_range = (lon_range[0] - extra, lon_range[1] + extra)
+                    else:
+                        wanted_lat_span = lon_span_cur / target_aspect
+                        extra = (wanted_lat_span - lat_span_cur) / 2.0
+                        lat_range = (lat_range[0] - extra, lat_range[1] + extra)
 
-                    fig = plt.figure(figsize=(fig_w_map, fig_h), facecolor=STYLE["bg_color"])
+                    fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor=STYLE["bg_color"])
                     ax_map = make_map_ax(fig, 111, lon_range, lat_range)
 
                     dt_str = datetime.strptime(fdate, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
@@ -2396,11 +2398,7 @@ def visualize_batch_all_storms(args):
                         obs_deg, gt_deg, pred_deg, None,   # pred_Me_deg=None -> không có wind marker
                         all_trajs_deg=ens_deg if (ens_deg is not None and ens_deg.shape[0] >= 3) else None,
                         errors_km=errors_km,
-                        title=(
-                            f"{storm_name}  —  {fh}h FC  |  {model_name}"
-                            f"  (ens={args.num_ensemble}, ode_steps={args.ode_steps}, "
-                            f"seed={best_seed_label})"
-                        ),
+                        title=storm_name,
                         dt_str=dt_str,
                         pred_label=f"{model_name} seed={best_seed_label}",
                     )
