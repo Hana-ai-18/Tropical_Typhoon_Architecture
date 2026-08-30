@@ -307,11 +307,15 @@ def get_args():
     # Tham số bắt buộc bởi data_loader()/load_model_and_data(), giữ đúng
     # default như visual_evaluate_mode.py để hành vi load dữ liệu nhất quán.
     p.add_argument("--test_year",            type=int, default=None)
+    p.add_argument("--batch_size",           type=int, default=1)
     p.add_argument("--num_workers",          type=int, default=0)
     p.add_argument("--delim",                default=" ")
     p.add_argument("--skip",                 type=int, default=1)
     p.add_argument("--min_ped",              type=int, default=1)
+    p.add_argument("--threshold",            type=float, default=0.002)
     p.add_argument("--other_modal",          default="gph")
+    p.add_argument("--filter_region",        action="store_true", default=False)
+    p.add_argument("--min_pct_in_scs",       type=float, default=15.0)
     return p.parse_args()
 
 
