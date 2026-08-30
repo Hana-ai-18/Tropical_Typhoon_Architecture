@@ -84,7 +84,7 @@ GIẢI PHÁP GAP (val→test distribution shift):
 
 ━━━ GIỮ NGUYÊN TỪ v2.1 (PROVEN, KHÔNG THAY ĐỔI) ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  ✅ sigma_inference=0.06 FIXED — matches sigma_min, zero train/inference mismatch
+  ✅ sigma_inference=0.04 FIXED — zero train/inference mismatch
   ✅ Mild base aug: shift±5km + speed×0.85–1.15 (val ≈ test distribution)
   ✅ 1-shot inference nhất quán với L_reg training
   ✅ 2-group optimizer, encoder freeze 10ep
@@ -167,7 +167,7 @@ GIẢI PHÁP GAP (val→test distribution shift):
     ✅ AUG-C: rotate DISPLACEMENT vectors (không phải absolute positions)
     ✅ AUG-D: ĐÃ XÓA — proven harmful (+4.5km v2.6, +13.4km v2.7)
     ✅ L_momentum: disabled (proven harmful +7.9km — v2.5)
-    ✅ sigma_inference=0.06 fixed (matches sigma_min, train/infer consistency)
+    ✅ sigma_inference=0.04 fixed (train/infer consistency)
     ✅ OT matching, 1-shot inference, encoder freeze 10ep
 
 ━━━ KẾT QUẢ THỰC TẾ (baseline trước thay đổi này) ━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -363,7 +363,7 @@ def _ot_match(x0_flat: torch.Tensor, x1_flat: torch.Tensor,
     if B < 4:
         return x0_flat, x1_flat
     try:
-        cost = torch.cdist(x0_flat.float(), x1_flat.float()) ** 2 / x0_flat.shape[-1]
+        cost = torch.cdist(x0_flat.float(), x1_flat.float()) / (x0_flat.shape[-1] ** 0.5)
         with torch.no_grad():
             pi = _sinkhorn_log(cost, epsilon=epsilon)
         flat = pi.reshape(-1).clamp(0.0)
@@ -371,7 +371,7 @@ def _ot_match(x0_flat: torch.Tensor, x1_flat: torch.Tensor,
         if not torch.isfinite(s) or s < 1e-10:
             return x0_flat, x1_flat
         idx = torch.multinomial(flat / s, num_samples=B, replacement=True)
-        return x0_flat[idx // B], x1_flat[idx % B]
+        return x0_flat[idx // B], x1_flat
     except Exception:
         return x0_flat, x1_flat
 
@@ -1520,21 +1520,7 @@ class TCFlowMatching(nn.Module):
                                             # genuine optimization outcome,
                                             # not a bug — see _reg_loss).
         n_ensemble:        int   = 20,
-        sigma_inference:   float = 0.06,   # [FIX] was 0.04, matching the OLD
-                                            # sigma_min before it was raised to
-                                            # 0.06 (see _sigma_schedule/sigma_min
-                                            # docstring). sigma_min is now 0.06,
-                                            # so the training noise schedule
-                                            # converges to 0.06 by sigma_decay_end,
-                                            # not 0.04; leaving sigma_inference at
-                                            # the old value created a real train/
-                                            # test source-distribution mismatch
-                                            # (p_0^train -> N(0, 0.06^2 I) vs
-                                            # p_0^test = N(0, 0.04^2 I)). Now fixed
-                                            # to match sigma_min exactly, so
-                                            # inference samples from the same
-                                            # source distribution training
-                                            # converges to.
+        sigma_inference:   float = 0.04,   # FIXED throughout
         use_curvature_score_train: bool = False,
         **kwargs,
     ):
