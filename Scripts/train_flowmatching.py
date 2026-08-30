@@ -658,7 +658,7 @@ def get_args():
     p.add_argument("--no_ot",                  dest="use_ot",  action="store_false")
     p.add_argument("--ot_epsilon",             default=0.05,   type=float)
     p.add_argument("--n_ensemble",             default=20,     type=int)
-    p.add_argument("--sigma_inference",        default=0.04,   type=float)
+    p.add_argument("--sigma_inference",        default=0.06,   type=float)
     p.add_argument("--n_inference_steps",      default=10,     type=int)
   
     p.add_argument("--num_epochs",             default=250,    type=int)
