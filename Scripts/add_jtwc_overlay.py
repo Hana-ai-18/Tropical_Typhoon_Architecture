@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import numpy as np
+import matplotlib.lines as mlines
 
 
 # ── Dữ liệu JTWC cho 3 storm — ĐANG CHỜ BẠN XÁC NHẬN ĐỦ CẢ 3 ────────────────
@@ -159,26 +160,45 @@ def draw_jtwc_overlay(ax, jtwc_points, transform=None, gt_deg=None,
             **({"transform": transform} if transform is not None else {}),
         )
 
-    # Nhãn nổi riêng "JTWC official forecast" — KHÔNG gộp vào ax.legend()
-    # chính, đặt cố định ở vùng trên-phải của axes (axes fraction, không
-    # phụ thuộc toạ độ geo), giống đúng vị trí trong ảnh mẫu.
-    ax.annotate(
-        "",
-        xy=(0.30, 0.865), xytext=(0.24, 0.865),
-        xycoords="axes fraction", textcoords="axes fraction",
-        arrowprops=dict(arrowstyle="-", color=JTWC_LINE_COLOR,
-                         linewidth=JTWC_LINEWIDTH, linestyle="--"),
-        zorder=23,
+    # "JTWC official forecast" giờ được thêm vào bảng Legend chính thay vì
+    # nổi giữa bản đồ (trước đây dùng ax.annotate/ax.text ở axes fraction
+    # (0.24–0.32, 0.865), tức góc trên-trái, gây đè lên track/cone). Lấy
+    # lại legend đang có sẵn trên axes (đã được _plot_on_ax() vẽ trước đó),
+    # gộp thêm 1 handle JTWC, rồi vẽ lại đúng 1 legend duy nhất — giữ
+    # nguyên vị trí/style (loc, title, fontsize...) của legend gốc.
+    jtwc_handle = mlines.Line2D(
+        [], [], color=JTWC_LINE_COLOR, linestyle="--",
+        linewidth=JTWC_LINEWIDTH, marker="^",
+        markerfacecolor=JTWC_MARKER_COLOR, markeredgecolor=JTWC_LINE_COLOR,
+        markeredgewidth=1.8, markersize=JTWC_MARKERSIZE * 0.7,
+        label="JTWC official forecast",
     )
-    ax.plot([0.27], [0.865], marker="^", color=JTWC_MARKER_COLOR,
-            markeredgecolor=JTWC_LINE_COLOR, markeredgewidth=1.8,
-            markersize=JTWC_MARKERSIZE, transform=ax.transAxes, zorder=24)
-    ax.text(
-        0.32, 0.865, "JTWC official forecast",
-        transform=ax.transAxes, fontsize=15, va="center", ha="left",
-        zorder=24,
-        bbox=dict(fc="white", alpha=0.92, ec="none", pad=4, boxstyle="round"),
+
+    existing_legend = ax.get_legend()
+    if existing_legend is not None:
+        # Ghi nhớ style của legend hiện có trước khi nó bị legend mới ghi đè
+        loc          = getattr(existing_legend, "_loc", "lower right")
+        title_obj    = existing_legend.get_title()
+        title        = title_obj.get_text() if title_obj else None
+        fontsize     = existing_legend.get_texts()[0].get_fontsize() if existing_legend.get_texts() else 7.5
+        framealpha   = existing_legend.get_frame().get_alpha()
+        handles      = [h for h in existing_legend.legend_handles] if hasattr(existing_legend, "legend_handles") \
+                       else existing_legend.legendHandles
+        labels       = [t.get_text() for t in existing_legend.get_texts()]
+        existing_legend.remove()
+    else:
+        loc, title, fontsize, framealpha = "lower right", None, 7.5, 0.92
+        handles, labels = [], []
+
+    handles = list(handles) + [jtwc_handle]
+    labels  = list(labels) + ["JTWC official forecast"]
+
+    new_legend = ax.legend(
+        handles=handles, labels=labels, loc=loc, fontsize=fontsize,
+        framealpha=framealpha if framealpha is not None else 0.92,
+        title=title, title_fontsize=8, ncol=1,
     )
+    ax.add_artist(new_legend)
 
 
 def load_jtwc_points(storm_key: str, json_path: str | None = None):
