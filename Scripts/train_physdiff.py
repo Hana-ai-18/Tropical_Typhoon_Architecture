@@ -191,10 +191,20 @@ def get_args():
                    choices=["linear", "cosine"])
     p.add_argument("--beta_start",    default=0.0001, type=float)
     p.add_argument("--beta_end",      default=0.02,   type=float)
-    p.add_argument("--sample_steps",  default=50,     type=int,
+    p.add_argument("--sample_steps",  default=25,     type=int,
                    help="DDIM-strided reverse steps used for eval/inference "
                         "only (training always uses the full random-timestep "
-                        "objective); lower = faster validation on Kaggle.")
+                        "objective); lower = faster validation on Kaggle T4. "
+                        "Table 8-style sweeps in the diffusion/CFM literature "
+                        "typically show DPE/SSR plateauing well before 40-50 "
+                        "steps for short (pred_len<=12) sequences; 25 keeps "
+                        "each validation-time sample ~2x cheaper than the "
+                        "previous default of 50 while remaining well past "
+                        "the steep early-N accuracy gain (see docstring of "
+                        "DDPMScheduler.sample_strided). Raise back to 50+ "
+                        "for the FINAL best-checkpoint test-set evaluation "
+                        "only (--test_at_end), where wall-clock no longer "
+                        "compounds over many epochs.")
 
     # Loss weights
     p.add_argument("--coord_loss_weight",      default=1.0, type=float)
@@ -254,6 +264,23 @@ def get_args():
                    help="Smaller than the other baselines' default (600) "
                         "since DDIM sampling is heavier per-sample; raise "
                         "if your GPU/time budget allows.")
+    p.add_argument("--val_loss_subset", default=0, type=int,
+                   help="If >0, the cheap per-epoch val_loss pass (no "
+                        "sampling, run every epoch) uses only this many "
+                        "sequences instead of the full validation set. On "
+                        "Kaggle T4 the full val set (~3436 sequences here) "
+                        "still runs PaperEncoder's FNO3D 3D-FFT once per "
+                        "batch every single epoch even without any DDIM "
+                        "sampling, which is the single largest recurring "
+                        "cost in this script at num_epochs=150+. This "
+                        "value is 0 (= full val set, original behavior) "
+                        "by default so nothing changes unless you opt in; "
+                        "try 600-900 to cut this cost by ~4-5x on T4 while "
+                        "keeping the val_loss curve representative enough "
+                        "for early-stopping (early-stopping/best-checkpoint "
+                        "selection itself is driven by ADE via evaluate(), "
+                        "not by this val_loss number, so subsetting it does "
+                        "not change which checkpoint gets kept as best).")
     p.add_argument("--num_workers",  default=2,          type=int)
 
     p.add_argument("--test_at_end",  action="store_true",
@@ -321,6 +348,21 @@ def main(args):
     from Model.data.trajectoriesWithMe_unet_training import seq_collate
     val_sub_loader = make_subset_loader(
         val_dataset, args.val_subset, args.batch_size, seq_collate)
+
+    # Cheap per-epoch val_loss loader: full val set by default (original
+    # behavior, args.val_loss_subset==0), or a smaller fixed subset if the
+    # user opts in via --val_loss_subset for Kaggle T4 wall-clock budgets.
+    # See --val_loss_subset help text for why this is the single largest
+    # recurring per-epoch cost independent of DDIM sampling.
+    if args.val_loss_subset > 0:
+        val_loss_loader = make_subset_loader(
+            val_dataset, args.val_loss_subset, args.batch_size, seq_collate,
+            seed=args.seed)
+        print(f"  val (loss only, per-epoch): {min(args.val_loss_subset, len(val_dataset))} seq"
+              f"  (subset of {len(val_dataset)}; full val set still used"
+              f"  nowhere else -- 'val   :' line above is the true total)")
+    else:
+        val_loss_loader = val_loader
 
     print(f"  train : {len(train_dataset)} seq  ({len(train_loader)} batches)")
     print(f"  val   : {len(val_dataset)} seq")
@@ -427,6 +469,7 @@ def main(args):
                       f"  loss={loss.item():.4f}"
                       f"  diff={bd.get('diffusion_loss', 0):.4f}"
                       f"  coord={bd.get('coord_loss', 0):.4f}"
+                      f"  ae={bd.get('autoencode_loss', 0):.4f}"
                       f"  lr={lr:.2e}")
 
         avg_train = sum_loss / len(train_loader)
@@ -436,7 +479,7 @@ def main(args):
         val_loss = 0.0
         n_val = 0
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in val_loss_loader:
                 bl_v = move(list(batch), device)
                 bd_v = model.get_loss_breakdown(bl_v)
                 val_loss += bd_v["total"].item()

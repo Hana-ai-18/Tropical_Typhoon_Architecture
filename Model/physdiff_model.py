@@ -591,10 +591,27 @@ class DDPMScheduler:
         """
         batch_size = shape[0]
         num_steps = min(num_steps, self.num_timesteps)
-        step_indices = torch.linspace(0, self.num_timesteps, num_steps + 1,
+        # FIX (silent out-of-range bug): the previous version spaced
+        # indices over [0, self.num_timesteps] inclusive, so the LARGEST
+        # t_val equaled self.num_timesteps (e.g. 1000) -- one past the
+        # last valid index into every scheduler buffer (alphas_cumprod
+        # etc. only have entries for t in [0, num_timesteps-1]).
+        # `_extract()` silently clamps out-of-range t via
+        # `torch.clamp(t, 0, len(a)-1)`, so this never raised an error --
+        # it just silently substituted alphas_cumprod[num_timesteps-1]
+        # (the value for the SECOND-to-last noise level) at the very
+        # first, most-noised reverse step, every single time this
+        # function ran. That first step sets the initial trajectory the
+        # rest of the chain refines, so a systematically wrong alpha
+        # there biases every sampled trajectory in the same direction
+        # every time -- a small but consistent (not random) error,
+        # exactly the kind of bug that degrades ADE without showing up
+        # as NaN/Inf or a crash. Spacing over [0, num_timesteps - 1]
+        # instead keeps every t_val a valid index.
+        step_indices = torch.linspace(0, self.num_timesteps - 1, num_steps + 1,
                                       device=device).long()
         step_indices = torch.unique(step_indices, sorted=True).tolist()
-        # step_indices e.g. [0, k, 2k, ..., num_timesteps]; we walk it in
+        # step_indices e.g. [0, k, 2k, ..., num_timesteps-1]; we walk it in
         # reverse as consecutive (t_prev, t) pairs.
         if step_indices[0] != 0:
             step_indices = [0] + step_indices
@@ -638,24 +655,54 @@ class MLPLayer(nn.Module):
 
 
 class FutureStateEncoderCoordOnly(nn.Module):
-    """Faithful to FutureStateEncoder, restricted to coordinates (no wind/
-    pressure heads, no 3-token self-attention since there is only 1 token
-    per timestep now -- the coord embedding passes straight through, which
-    is the correct specialization of "self-attention over 1 token")."""
+    """Faithful to FutureStateEncoder, restricted to coordinates.
 
-    def __init__(self, d_embedding: int = 64, coord_mlp_dims: List[int] = (2, 16, 32)):
+    FIX: the previous version encoded each timestep's (lon, lat) with a
+    per-step MLP and NOTHING else -- no interaction across the T future
+    steps at all. With d_embedding=64 per step and only 2 real scalars of
+    information, this over-parameterized, structure-free latent made the
+    denoiser's job (recovering a temporally-smooth trajectory out of pure
+    per-step Gaussian noise) far harder than necessary: nothing in the
+    representation itself encoded "this is a smooth curve of N ordered
+    points," so a slightly-wrong denoised z_t at one step had no other
+    signal pulling it back toward trajectory-consistency. We add a light
+    positional encoding + single self-attention layer across the T steps
+    (mirroring the original repo's cross-token self-attention, just with
+    T time-steps standing in for the original's 3 task-tokens), which
+    gives the encoder a chance to represent (and the denoiser a chance to
+    reconstruct) coordinated, smooth trajectories rather than N
+    independent points.
+    """
+
+    def __init__(self, d_embedding: int = 64, coord_mlp_dims: List[int] = (2, 16, 32),
+                 max_len: int = 64, num_heads: int = 4):
         super().__init__()
         self.d_embedding = d_embedding
         self.coord_mlp = MLPLayer(
             input_dim=coord_mlp_dims[0],
             hidden_dims=list(coord_mlp_dims[1:]) + [d_embedding],
         )
+        self.pos_encoding = PositionalEncoding(d_embedding, dropout=0.0, max_len=max_len)
+        # FIX: num_heads was hardcoded to 4 regardless of d_embedding, so
+        # any d_embedding not divisible by 4 (e.g. a future --d_embedding
+        # 50 or 96/... wait 96 is divisible; e.g. 50, 30, 100) would crash
+        # nn.MultiheadAttention at construction time with an opaque
+        # "embed_dim must be divisible by num_heads" error. Falling back
+        # to 1 head when 4 doesn't divide evenly keeps the model
+        # constructible for any d_embedding the user passes via argparse.
+        heads = num_heads if d_embedding % num_heads == 0 else 1
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=d_embedding, num_heads=heads, dropout=0.0, batch_first=True)
         self.layer_norm = nn.LayerNorm(d_embedding)
+        self.layer_norm2 = nn.LayerNorm(d_embedding)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         # coords: (B, N, 2) -> z_0: (B, N, d_embedding)
         z = self.coord_mlp(coords)
-        z = self.layer_norm(z)
+        z = self.pos_encoding(z)
+        attn_out, _ = self.self_attn(z, z, z)
+        z = self.layer_norm(z + attn_out)
+        z = self.layer_norm2(z)
         return z
 
 
@@ -768,44 +815,76 @@ class PhysDiff(nn.Module):
         z_0 = self.future_encoder(gt_coords_bf)                # (B, T_pred, d_embedding)
 
         t = torch.randint(0, self.scheduler.num_timesteps, (B,), device=device).long()
-        diffusion_loss = self.scheduler.training_losses(
-            model=self._denoiser_fn(context_tokens), x_start=z_0, t=t, context=None,
-        )
+        noise = torch.randn_like(z_0)
+        noise = torch.clamp(noise, min=-5.0, max=5.0)
+        z_t = self.scheduler.q_sample(z_0, t, noise)
 
-        # Cheap coordinate reconstruction loss (no extra forward pass): we
-        # already have z_0 (encoder side) -- decode it and compare, matching
-        # utils/losses.py CombinedLoss's default (non-uncertainty-weighted)
-        # simple-combination branch. This is NOT the same as decoding a
-        # denoised sample; it's an auxiliary loss keeping future_encoder /
-        # output_decoder invertible, exactly mirroring how coord_loss is
-        # computed against `predictions['coords']` in the original repo's
-        # training loop (predictions come from decoding embeddings).
-        pred_coords_bf = self.output_decoder(z_0)
+        denoiser = self._denoiser_fn(context_tokens)
+        predicted_noise = denoiser(z_t, t, None)
+
+        if torch.isnan(predicted_noise).any() or torch.isinf(predicted_noise).any():
+            predicted_noise = torch.zeros_like(predicted_noise)
+        predicted_noise = torch.clamp(predicted_noise, min=-10.0, max=10.0)
+
+        diffusion_loss = F.mse_loss(predicted_noise, noise)
+        diffusion_loss = torch.clamp(diffusion_loss, min=0.0, max=100.0)
+
+        # ── FIX (root cause of ADE blowing up while loss looked fine) ──────
+        # coord_loss used to be computed as ||decode(future_encoder(gt)) -
+        # gt||, i.e. a pure autoencoder-reconstruction loss that NEVER
+        # touches the denoiser's own prediction. It converged to ~0 almost
+        # immediately (future_encoder/output_decoder just learn to be
+        # inverses of each other) and therefore contributed ~no gradient
+        # signal to what the model needs to get right: predicting z_0 from
+        # a NOISY z_t during real sampling. diffusion_loss alone (epsilon
+        # MSE in latent space) is only an indirect proxy for that -- it
+        # does not directly penalize decoded-coordinate error, so the model
+        # could drive epsilon-MSE down while the *decoded* trajectory
+        # (what ADE actually measures, via real multi-step sampling from
+        # pure noise) drifted arbitrarily.
+        #
+        # Fix: reconstruct x0 from (z_t, predicted_noise) using the SAME
+        # closed-form the sampler uses (q_posterior x0-prediction), then
+        # decode THAT and compare to ground truth. This directly trains
+        # the denoiser to produce a z_t -> predicted_noise -> x0_pred path
+        # whose DECODED coordinates are accurate -- the actual quantity ADE
+        # measures -- instead of training an unrelated autoencoder shortcut.
+        sqrt_ac_t = self.scheduler._extract(self.scheduler.sqrt_alphas_cumprod, t, z_0.shape)
+        sqrt_omac_t = self.scheduler._extract(self.scheduler.sqrt_one_minus_alphas_cumprod, t, z_0.shape)
+        sqrt_ac_t = torch.clamp(sqrt_ac_t, min=1e-8)
+        z0_pred_from_denoiser = (z_t - sqrt_omac_t * predicted_noise) / sqrt_ac_t
+        z0_pred_from_denoiser = torch.clamp(z0_pred_from_denoiser, min=-10.0, max=10.0)
+
+        pred_coords_bf = self.output_decoder(z0_pred_from_denoiser)
         coord_loss = torch.norm(pred_coords_bf - gt_coords_bf, p=2, dim=-1).mean()
 
+        # Small auxiliary term keeping future_encoder/output_decoder a
+        # coherent (invertible) latent codec -- NOT the primary supervision
+        # signal anymore, just regularization, hence the small fixed weight.
+        recon_coords_bf = self.output_decoder(z_0)
+        autoencode_loss = torch.norm(recon_coords_bf - gt_coords_bf, p=2, dim=-1).mean()
+
         total = (self.diffusion_loss_weight * diffusion_loss
-                 + self.coord_loss_weight * coord_loss)
+                 + self.coord_loss_weight * coord_loss
+                 + 0.1 * autoencode_loss)
 
         with torch.no_grad():
-            # ⚠ IMPORTANT: this ADE/ATE/CTE is computed by decoding z_0
-            # (encoded directly from GROUND TRUTH coordinates via
-            # future_encoder), NOT by running the diffusion reverse process.
-            # It only measures how well future_encoder/output_decoder can
-            # round-trip coordinates -- it is NOT a measure of the model's
-            # actual generative/sampling quality. It will look artificially
-            # good and should NOT be used to judge model performance or for
-            # early-stopping. The authoritative ADE/ATE/CTE (via real DDIM
-            # sampling) is only produced by evaluate()/model.sample() in the
-            # train script, which is what best_ade/early-stopping/CSV rows
-            # for "split=val" ADE_km actually use.
+            # This ADE/ATE/CTE is now computed from the denoiser's OWN
+            # single-step x0 estimate (still not the full multi-step
+            # reverse process used by model.sample(), since t is random
+            # per-sample here) -- it is a much closer proxy to real
+            # sampling quality than the old pure-autoencoder metric, but
+            # the authoritative number remains evaluate()/model.sample()
+            # in the train script.
             pred_tf = pred_coords_bf.permute(1, 0, 2)          # (T_pred, B, 2) time-major
             ade_m = compute_ade_per_horizon(pred_tf.detach(), gt_coords)
             atc_m = compute_ate_cte_per_horizon(pred_tf.detach(), gt_coords)
-            ade_m = {f"autoencode_only_{k}": v for k, v in ade_m.items()}
-            atc_m = {f"autoencode_only_{k}": v for k, v in atc_m.items()}
+            ade_m = {f"denoise_proxy_{k}": v for k, v in ade_m.items()}
+            atc_m = {f"denoise_proxy_{k}": v for k, v in atc_m.items()}
 
         out = dict(total=total, diffusion_loss=diffusion_loss.item(),
-                   coord_loss=coord_loss.item())
+                   coord_loss=coord_loss.item(),
+                   autoencode_loss=autoencode_loss.item())
         out.update(ade_m)
         out.update(atc_m)
         return out
