@@ -211,7 +211,7 @@ def get_args():
     p.add_argument("--diffusion_loss_weight",  default=1.0, type=float)
 
     # Training infra (epoch framework matching the other three baselines)
-    p.add_argument("--num_epochs",   default=150,        type=int,
+    p.add_argument("--num_epochs",   default=250,        type=int,
                    help="Original repo's own default (30) was tuned for a "
                         "much larger ERA5/FengWu dataset; this project's "
                         "dataset converges much faster (observed: val_loss "
