@@ -237,9 +237,9 @@ def get_args():
     p.add_argument("--grad_clip",    default=0.1,        type=float,
                    help="Matches configs/config.yaml training.gradient_clip=0.1 "
                         "(the original repo clips very aggressively).")
-    p.add_argument("--patience",     default=30,         type=int,
-                   help="With val_freq=5, patience=30 tolerates 6 "
-                        "consecutive non-improving validations (~30 epochs) "
+    p.add_argument("--patience",     default=50,         type=int,
+                   help="With val_freq=5, patience=50 tolerates 10 "
+                        "consecutive non-improving validations (~50 epochs) "
                         "before stopping -- enough to ride out normal noise "
                         "but short enough to not waste most of the training "
                         "budget once the model has clearly started "
