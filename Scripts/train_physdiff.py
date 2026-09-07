@@ -292,6 +292,13 @@ def get_args():
     p.add_argument("--seed",         default=42,  type=int,
                    help="Random seed. Run 3-5 seeds for ESWA mean±std reporting, "
                         "same convention as train_flowmatching.py.")
+    p.add_argument("--resume_ckpt",  default=None, type=str,
+                   help="Đường dẫn tới 1 checkpoint đầy đủ (model+optimizer+"
+                        "scheduler+RNG state, dạng do _save_full_checkpoint tạo "
+                        "ra) để resume, bất kể tên file/thư mục. Nếu set, ưu "
+                        "tiên hơn last_ckpt.pth mặc định trong output_dir. Dùng "
+                        "khi checkpoint nằm trong /kaggle/input (read-only) và "
+                        "không muốn cp/rename thủ công trước khi chạy.")
 
     # DataLoader compat (same as the other train scripts)
     p.add_argument("--delim",        default=" ")
@@ -401,9 +408,19 @@ def main(args):
     start_epoch  = 0
 
     last_ckpt_path = os.path.join(args.output_dir, "last_ckpt.pth")
-    if os.path.exists(last_ckpt_path):
-        print(f"  🔄 Found {last_ckpt_path} — resuming training")
-        ckpt = torch.load(last_ckpt_path, map_location=device, weights_only=False)
+
+    # --resume_ckpt cho phép trỏ thẳng tới 1 checkpoint bất kỳ (ví dụ nằm
+    # trong /kaggle/input, read-only) mà không cần cp/rename thành
+    # last_ckpt.pth trong output_dir trước. Nếu không truyền, hành vi mặc
+    # định (tự tìm last_ckpt.pth trong output_dir) giữ nguyên như cũ.
+    resume_from = args.resume_ckpt if args.resume_ckpt else last_ckpt_path
+    if args.resume_ckpt and not os.path.exists(args.resume_ckpt):
+        raise FileNotFoundError(
+            f"--resume_ckpt được set nhưng không tìm thấy file: {args.resume_ckpt}")
+
+    if os.path.exists(resume_from):
+        print(f"  🔄 Found {resume_from} — resuming training")
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
